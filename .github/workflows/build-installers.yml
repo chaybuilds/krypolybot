@@ -1,0 +1,79 @@
+name: Build Installers
+
+on:
+  push:
+    branches: [main, build]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: pip install -r python/requirements-dev.txt
+      - working-directory: python
+        run: python -m pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: macos-13
+            name: mac-intel
+          - os: macos-latest
+            name: mac-apple-silicon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Build app, bundle backend, package installer
+        run: npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Publish installers to a GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: CI build ${{ github.run_number }} (${{ github.sha }})
+          prerelease: true
+          body: >
+            Unsigned CI installers built from ${{ github.sha }}.
+            Windows: SmartScreen "More info → Run anyway". macOS: unsigned —
+            right-click → Open the first time (arm64 is ad-hoc signed).
+          files: |
+            release/*.AppImage
+            release/*.deb
+            release/*.exe
+            release/*.dmg

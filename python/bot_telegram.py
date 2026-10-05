@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Optional
+
+import bot_secrets
+import remote
+import terminal
+
+logger = logging.getLogger("krypt.remote.telegram")
+
+API = "https://api.telegram.org"
+
+_LONG_POLL_SEC = 50
+_HTTP_TIMEOUT = _LONG_POLL_SEC + 15
+
+_MAX_COMMAND_AGE_SEC = 120.0
+
+_task: Optional[asyncio.Task] = None
+_stop = False
+_last_error: Optional[str] = None
+_username: Optional[str] = None
+_offset = 0
+
+
+def is_running() -> bool:
+    return _task is not None and not _task.done()
+
+
+def last_error() -> Optional[str]:
+    return _last_error
+
+
+def bot_username() -> Optional[str]:
+    return _username
+
+
+def has_token() -> bool:
+    return bot_secrets.has_token("telegram")
+
+
+async def _client():
+    import polymarket_api as api
+    return await api._get_client()
+
+
+async def _call(method: str, params: Optional[dict] = None,
+                timeout: float = 20.0) -> Optional[dict]:
+    token = bot_secrets.load_token("telegram")
+    if not token:
+        return None
+    started = time.monotonic()
+    try:
+        client = await _client()
+        r = await client.get(f"{API}/bot{token}/{method}",
+                             params=params or {}, timeout=timeout)
+        data = r.json()
+        terminal.note_external_call(
+            "telegram", ok=True, ms=(time.monotonic() - started) * 1000)
+    except Exception as e:
+        terminal.note_external_call("telegram", ok=False)
+        raise RuntimeError(f"{type(e).__name__}: {e}") from e
+    if not isinstance(data, dict) or not data.get("ok"):
+        desc = (data or {}).get("description") if isinstance(data, dict) else None
+        raise RuntimeError(desc or "Telegram rejected the request")
+    return data.get("result")
+
+
+async def send(chat_id: str, text: str) -> None:
+    body = text or ""
+    while body:
+        chunk, body = body[:3900], body[3900:]
+        await _call("sendMessage", {
+            "chat_id": chat_id, "text": chunk,
+            "disable_web_page_preview": "true",
+        })
+
+
+async def verify_token(token: str) -> dict:
+    import polymarket_api as api
+    try:
+        client = await api._get_client()
+        r = await client.get(f"{API}/bot{(token or '').strip()}/getMe", timeout=15.0)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "message": f"Could not reach Telegram: {e}"}
+    if not isinstance(data, dict) or not data.get("ok"):
+        return {"ok": False,
+                "message": (data or {}).get("description")
+                or "Telegram rejected that token."}
+    me = data.get("result") or {}
+    return {"ok": True, "username": me.get("username"),
+            "message": f"Connected as @{me.get('username')}."}
+
+
+def is_stale(msg: dict) -> tuple[bool, float]:
+    sent_at = float(msg.get("date") or 0)
+    if not sent_at:
+        return False, 0.0
+    age = time.time() - sent_at
+    return age > _MAX_COMMAND_AGE_SEC, age
+
+
+async def process_updates(updates: list) -> None:
+    global _offset
+    warned_stale: set[str] = set()
+
+    for u in updates:
+        _offset = max(_offset, int(u.get("update_id", 0)) + 1)
+        msg = u.get("message") or {}
+        text = msg.get("text") or ""
+        chat = msg.get("chat") or {}
+        frm = msg.get("from") or {}
+        chat_id = str(chat.get("id") or "")
+        user_id = str(frm.get("id") or "")
+        if not text or not chat_id or not user_id:
+            continue
+
+        stale, age = is_stale(msg)
+        if stale:
+            remote.audit("telegram", user_id, text[:60], "stale",
+                         f"{age:.0f}s old — not executed")
+            if chat_id not in warned_stale:
+                warned_stale.add(chat_id)
+                try:
+                    await send(chat_id, (
+                        f"Ignored a command sent {int(age // 60)} minute(s) "
+                        f"ago — this app was not running then. Nothing was "
+                        f"executed. Send it again if you still want it."))
+                except Exception:
+                    pass
+            continue
+
+        label = frm.get("username") or frm.get("first_name") or ""
+        try:
+            reply = await remote.handle("telegram", user_id, text, label=label)
+            if reply:
+                await send(chat_id, reply)
+        except Exception as e:
+            logger.debug("telegram handler failed: %s", e, exc_info=True)
+            try:
+                await send(chat_id, f"That failed: {type(e).__name__}")
+            except Exception:
+                pass
+
+
+async def _poll_loop() -> None:
+    global _last_error, _username
+    backoff = 1.0
+    while not _stop:
+        try:
+            if _username is None:
+                me = await _call("getMe", timeout=15.0)
+                _username = (me or {}).get("username")
+                logger.info("telegram bot connected as @%s", _username)
+
+            updates = await _call(
+                "getUpdates",
+                {"offset": _offset, "timeout": _LONG_POLL_SEC,
+                 "allowed_updates": '["message"]'},
+                timeout=_HTTP_TIMEOUT)
+            _last_error = None
+            backoff = 1.0
+
+            await process_updates(updates or [])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _last_error = str(e)[:200]
+            logger.info("telegram poll error: %s", _last_error)
+            await asyncio.sleep(backoff)
+            backoff = min(60.0, backoff * 2)
+
+
+async def start() -> bool:
+    global _task, _stop, _last_error, _username
+    if is_running():
+        return True
+    if not has_token():
+        _last_error = "No bot token saved."
+        return False
+    _stop = False
+    _username = None
+    _last_error = None
+    _task = asyncio.ensure_future(_poll_loop())
+    remote.register_sender("telegram", send)
+    return True
+
+
+async def stop() -> None:
+    global _task, _stop
+    _stop = True
+    remote.unregister_sender("telegram")
+    if _task:
+        _task.cancel()
+        try:
+            await _task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _task = None

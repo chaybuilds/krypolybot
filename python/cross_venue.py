@@ -1,0 +1,1146 @@
+from __future__ import annotations
+
+import logging
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import kalshi
+import terminal as term
+from terminal import _are_opposites, _now_iso, num
+
+logger = logging.getLogger("krypt.crossvenue")
+
+_STOP = {
+    "the", "and", "for", "will", "with", "that", "this", "from", "have", "has",
+    "before", "after", "than", "any", "all", "who", "what", "when", "which",
+    "does", "did", "are", "was", "were", "his", "her", "its", "their", "there",
+    "market", "markets", "yes", "no", "not",
+}
+
+STRONG = 0.55
+POSSIBLE = 0.38
+
+
+def _tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in _STOP}
+
+
+_YEAR_MIN, _YEAR_MAX = 2000, 2040
+
+_MONEY_BEFORE = re.compile(r"[$€£¥]\s*$")
+_UNIT_AFTER = re.compile(
+    r"^\s*(?:[.,]\d|[kmb]\b|%|x\b|bps\b|dollars?\b|cents?\b|usd\b|pts\b"
+    r"|points?\b|bn\b)",
+    re.IGNORECASE)
+
+
+def _is_year(text: str, start: int, end: int, raw: str, v: float) -> bool:
+    if len(raw) != 4 or not raw.isdigit():
+        return False
+    if not (_YEAR_MIN <= v <= _YEAR_MAX):
+        return False
+    if _MONEY_BEFORE.search(text[max(0, start - 3):start]):
+        return False
+    if _UNIT_AFTER.match(text[end:end + 12]):
+        return False
+    return True
+
+
+def _numbers(text: str) -> set[str]:
+    s = text or ""
+    out: set[str] = set()
+    for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", s):
+        raw = m.group(0)
+        v = num(raw.replace(",", ""))
+        if v is None:
+            continue
+        if _is_year(s, m.start(), m.end(), raw, v):
+            continue
+        out.add(f"{v:g}")
+    return out
+
+
+def _close_ts(iso: Optional[str]) -> Optional[float]:
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _nth_weekday_utc(year: int, month: int, nth: int) -> datetime:
+    d = datetime(year, month, 1, tzinfo=timezone.utc)
+    first_sunday = 1 + ((6 - d.weekday()) % 7)
+    return datetime(year, month, first_sunday + 7 * (nth - 1), tzinfo=timezone.utc)
+
+
+def _et_offset_hours(dt: datetime) -> int:
+    start = _nth_weekday_utc(dt.year, 3, 2).replace(hour=7)
+    end = _nth_weekday_utc(dt.year, 11, 1).replace(hour=6)
+    return -4 if start <= dt < end else -5
+
+
+def et_date(iso: Optional[str]) -> Optional[str]:
+    ts = _close_ts(iso)
+    if ts is None:
+        return None
+    dt = datetime.fromtimestamp(ts, timezone.utc)
+    local = dt + timedelta(hours=_et_offset_hours(dt))
+    return local.strftime("%Y-%m-%d")
+
+
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+_KX_TICKER_DATE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})")
+_KX_TICKER_MONTH = re.compile(r"-(\d{2})([A-Z]{3})(?!\d)")
+_SLUG_DATE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
+_TEXT_DATE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b"
+    r"(?:,?\s*(20\d{2}))?", re.IGNORECASE)
+
+
+def kalshi_ticker_date(ticker: str) -> Optional[str]:
+    m = _KX_TICKER_DATE.search(str(ticker or "").upper())
+    if not m:
+        return None
+    yy, mon, dd = m.group(1), m.group(2).lower(), m.group(3)
+    if mon not in _MONTHS:
+        return None
+    try:
+        return f"20{yy}-{_MONTHS[mon]:02d}-{int(dd):02d}"
+    except ValueError:
+        return None
+
+
+def kalshi_ticker_month(ticker: str) -> Optional[str]:
+    up = str(ticker or "").upper()
+    m = _KX_TICKER_MONTH.search(up)
+    if not m:
+        return None
+    mon = m.group(2).lower()
+    if mon not in _MONTHS:
+        return None
+    return f"20{m.group(1)}-{_MONTHS[mon]:02d}"
+
+
+def text_date(text: str, *, year_hint: Optional[str] = None) -> Optional[str]:
+    m = _TEXT_DATE.search(text or "")
+    if not m:
+        return None
+    mon = _MONTHS[m.group(1).lower()[:3]]
+    day = int(m.group(2))
+    year = m.group(3) or (year_hint or "")[:4]
+    if not year:
+        return None
+    try:
+        datetime(int(year), mon, day)
+    except ValueError:
+        return None
+    return f"{int(year):04d}-{mon:02d}-{day:02d}"
+
+
+_ALIASES: dict[str, set[str]] = {
+    "bitcoin": {"btc"}, "btc": {"bitcoin"},
+    "ethereum": {"eth"}, "eth": {"ethereum"},
+    "solana": {"sol"}, "sol": {"solana"},
+    "dogecoin": {"doge"}, "doge": {"dogecoin"},
+    "ripple": {"xrp"}, "cardano": {"ada"},
+    "hyperliquid": {"hype"}, "zcash": {"zec"},
+    "fed": {"fomc", "federal", "reserve"},
+    "fomc": {"fed"},
+    "federal": {"fed"},
+    "inflation": {"cpi"}, "cpi": {"inflation"},
+    "unemployment": {"jobless", "jobs", "payrolls"},
+    "gdp": {"growth"},
+    "dip": {"low", "fall", "min", "lowest"},
+    "drop": {"low", "fall", "min"},
+    "crash": {"low", "fall", "min"},
+    "peak": {"high", "max", "highest"},
+    "reach": {"high", "max", "hit"},
+    "hit": {"high", "max", "reach"},
+    "above": {"over", "greater"},
+    "over": {"above"},
+    "below": {"under", "less"},
+    "under": {"below"},
+    "laliga": {"liga"},
+    "uefa": {"champions"},
+}
+
+_TOPIC_SERIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (r"\bla\s?liga\b", ("KXLALIGA",)),
+    (r"champions\s+league|\bucl\b", ("KXUCL",)),
+    (r"premier\s+league\b", ("KXEPL",)),
+    (r"\bserie\s?a\b", ("KXSERIEA",)),
+    (r"\bbundesliga\b", ("KXBUNDESLIGA",)),
+    (r"\bligue\s?1\b", ("KXLIGUE1",)),
+    (r"europa\s+league", ("KXUEL",)),
+    (r"\bbitcoin\b|\bbtc\b",
+     ("KXBTCD", "KXBTC", "KXBTCMINY", "KXBTCMAXY")),
+    (r"\bethereum\b|\beth\b",
+     ("KXETHD", "KXETH", "KXETHMINY", "KXETHMAXY")),
+    (r"\bsolana\b|\bsol\b", ("KXSOLD", "KXSOL")),
+    (r"\bxrp\b|\bripple\b", ("KXXRPD", "KXXRP")),
+    (r"\bdogecoin\b|\bdoge\b", ("KXDOGED", "KXDOGE")),
+    (r"\bfed\b|federal\s+reserve|\bfomc\b|interest\s+rate",
+     ("KXFEDDECISION", "KXRATECUT")),
+    (r"\bcpi\b|inflation", ("KXCPIYOY", "KXCPI", "KXCPICORE")),
+    (r"unemployment\s+rate", ("KXUNRATE",)),
+)
+
+_LEAGUE_PREFIX: dict[str, str] = {
+    "mlb": "KXMLB", "nba": "KXNBA", "nfl": "KXNFL", "nhl": "KXNHL",
+    "ncaaf": "KXNCAAF", "ncaab": "KXNCAAMB",
+    "atp": "KXATP", "wta": "KXWTA",
+    "epl": "KXEPL", "lal": "KXLALIGA", "ser": "KXSERIEA",
+    "bun": "KXBUNDESLIGA", "fl1": "KXLIGUE1", "bra": "KXBRASILEIRO",
+    "chi1": "KXCHLLDP", "arg": "KXARGPREMDIV", "mls": "KXMLS",
+    "mex": "KXLIGAMX", "ucl": "KXUCL", "uel": "KXUEL",
+    "por": "KXPRIMEIRA", "ned": "KXEREDIVISIE",
+}
+
+_FIXTURE_FAMILIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("first-half-spread", "spread", ("1HSPREAD",)),
+    ("first-half-total", "total", ("1HTOTAL",)),
+    ("1st-half-spread", "spread", ("1HSPREAD",)),
+    ("1st-half-total", "total", ("1HTOTAL",)),
+    ("first-half", "winner", ("1H",)),
+    ("game-totals", "total", ("TOTAL", "GTOTAL")),
+    ("total", "total", ("TOTAL", "GTOTAL")),
+    ("handicap", "spread", ("SPREAD", "GSPREAD")),
+    ("spread", "spread", ("SPREAD", "GSPREAD")),
+    ("btts", "btts", ("BTTS",)),
+)
+_DEFAULT_FAMILIES = ("GAME", "MATCH")
+
+_OUTCOME_CODE = re.compile(r"^[a-z0-9]{1,6}$")
+
+_SLUG_FIXTURE = re.compile(
+    r"^([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-(20\d{2}-\d{2}-\d{2})(?:-(.*))?$")
+
+_SLUG_LINE = re.compile(r"(\d+)pt(\d+)")
+
+
+def expand_tokens(tokens: set[str]) -> set[str]:
+    out = set(tokens)
+    for t in tokens:
+        out |= _ALIASES.get(t, set())
+    return out
+
+
+_SCALE = {"k": 1_000.0, "m": 1_000_000.0, "bn": 1e9, "b": 1e9}
+
+_NUM = r"\$?\s*(\d[\d,]*(?:\.\d+)?)(?:\s*(k|m|bn|b)(?![a-z0-9]))?"
+
+_ABOVE_WORDS = r"(?:above|over|greater\s+than|higher\s+than|at\s+least|more\s+than|exceed(?:s)?)"
+_BELOW_WORDS = r"(?:below|under|less\s+than|lower\s+than|at\s+most|fewer\s+than)"
+_TOUCH_DOWN = r"(?:dip(?:s)?\s+to|fall(?:s)?\s+to|drop(?:s)?\s+to|down\s+to)"
+_TOUCH_UP = r"(?:reach(?:es)?|hit(?:s)?|rise(?:s)?\s+to|climb(?:s)?\s+to|up\s+to)"
+
+_RE_BETWEEN = re.compile(
+    rf"between\s+{_NUM}\s*(?:and|to|[-–])\s*{_NUM}", re.IGNORECASE)
+_RE_BAND = re.compile(
+    rf"{_NUM}\s*(?:°\s*f?)?\s*(?:[-–]|\bto\b)\s*{_NUM}", re.IGNORECASE)
+_RE_ABOVE = re.compile(rf"{_ABOVE_WORDS}\s+{_NUM}", re.IGNORECASE)
+_RE_BELOW = re.compile(rf"{_BELOW_WORDS}\s+{_NUM}", re.IGNORECASE)
+_RE_ABOVE_POST = re.compile(
+    rf"{_NUM}\s*(?:°\s*f?)?\s+or\s+(?:above|higher|more|greater|over)",
+    re.IGNORECASE)
+_RE_BELOW_POST = re.compile(
+    rf"{_NUM}\s*(?:°\s*f?)?\s+or\s+(?:below|lower|less|fewer|under)",
+    re.IGNORECASE)
+_RE_TOUCH_DOWN = re.compile(rf"{_TOUCH_DOWN}\s+{_NUM}", re.IGNORECASE)
+_RE_TOUCH_UP = re.compile(rf"{_TOUCH_UP}\s+{_NUM}", re.IGNORECASE)
+_RE_OU = re.compile(rf"\bo\s*/\s*u\s+{_NUM}", re.IGNORECASE)
+
+_RE_DEADLINE = re.compile(
+    r"\b(?:by|before|prior\s+to)\s+(?:the\s+end\s+of\s+)?"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d{2})",
+    re.IGNORECASE)
+
+
+def _scaled(digits: str, suffix: Optional[str]) -> Optional[float]:
+    v = num(digits.replace(",", ""))
+    if v is None:
+        return None
+    return v * _SCALE.get((suffix or "").lower(), 1.0)
+
+
+def parse_threshold(text: str) -> Optional[tuple]:
+    s = text or ""
+    m = _RE_BETWEEN.search(s) or _RE_BAND.search(s)
+    if m:
+        lo, hi = _scaled(m.group(1), m.group(2)), _scaled(m.group(3), m.group(4))
+        if lo is not None and hi is not None and lo <= hi:
+            return ("between", lo, hi)
+    for rx, op in ((_RE_OU, "above"),
+                   (_RE_ABOVE_POST, "above"), (_RE_BELOW_POST, "below"),
+                   (_RE_ABOVE, "above"), (_RE_BELOW, "below"),
+                   (_RE_TOUCH_UP, "above"), (_RE_TOUCH_DOWN, "below")):
+        m = rx.search(s)
+        if m:
+            v = _scaled(m.group(1), m.group(2))
+            if v is not None:
+                return (op, v)
+    return None
+
+
+def _same_value(a: float, b: float) -> bool:
+    return abs(a - b) <= 0.011 or abs(a - b) <= abs(a) * 1e-9
+
+
+def compare_thresholds(pm_t: Optional[tuple],
+                       kx_t: Optional[tuple]) -> Optional[str]:
+    if not pm_t or not kx_t:
+        return None
+    if pm_t[0] == "between" or kx_t[0] == "between":
+        if pm_t[0] == kx_t[0] and _same_value(pm_t[1], kx_t[1]) \
+                and _same_value(pm_t[2], kx_t[2]):
+            return "same"
+        return None
+    if not _same_value(pm_t[1], kx_t[1]):
+        return None
+    return "same" if pm_t[0] == kx_t[0] else "complement"
+
+
+_FED_LEGS = ("H0", "H25", "H26", "C25", "C26")
+
+
+def fed_leg(text: str) -> Optional[str]:
+    s = (text or "").lower()
+    if not re.search(r"\bfed\b|federal reserve|fomc|interest rate", s):
+        return None
+    if re.search(r"no change|maintain|unchanged|hold rates|by 0\s*bps", s):
+        return "H0"
+    up = bool(re.search(r"increase|hike|raise", s))
+    down = bool(re.search(r"decrease|cut|lower", s))
+    if up == down:
+        return None
+    big = bool(re.search(r"5\d\+?\s*bps|\+\s*bps|>\s*25|more than 25|50\+", s))
+    if re.search(r"\b25\s*bps\b", s) and not big:
+        return "H25" if up else "C25"
+    if big:
+        return "H26" if up else "C26"
+    return None
+
+
+def kalshi_fed_leg(kx: dict) -> Optional[str]:
+    tick = str(kx.get("conditionId") or "").upper()
+    if "FEDDECISION" not in tick:
+        return None
+    leg = tick.rsplit("-", 1)[-1]
+    return leg if leg in _FED_LEGS else None
+
+
+def parse_fixture(pm: dict) -> Optional[dict]:
+    for key in ("slug", "eventSlug"):
+        s = str(pm.get(key) or "").strip().lower()
+        m = _SLUG_FIXTURE.match(s)
+        if not m:
+            continue
+        league = m.group(1)
+        prefix = _LEAGUE_PREFIX.get(league)
+        if not prefix:
+            continue
+        tail = m.group(5) or ""
+        family, kind = None, None
+        for needle, k, fams in _FIXTURE_FAMILIES:
+            if needle in tail:
+                family, kind = fams, k
+                break
+        if family is None:
+            if tail and not _OUTCOME_CODE.match(tail):
+                return None
+            family, kind = _DEFAULT_FAMILIES, "winner"
+        line = None
+        lm = _SLUG_LINE.search(tail)
+        if lm:
+            line = float(f"{lm.group(1)}.{lm.group(2)}")
+        return {
+            "league": league, "prefix": prefix, "date": m.group(4),
+            "families": family, "kind": kind, "line": line, "tail": tail,
+            "sides": (m.group(2), m.group(3)),
+        }
+    return None
+
+
+_SLUG_UPDOWN = re.compile(r"^([a-z]+)-updown-(\d+)(m|h)-(\d{9,12})$")
+
+_UPDOWN_ASSETS = {
+    "btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP", "doge": "DOGE",
+    "bnb": "BNB", "hype": "HYPE", "zec": "ZEC", "ada": "ADA", "bch": "BCH",
+    "ltc": "LTC", "link": "LINK",
+}
+
+_KALSHI_UPDOWN_MINUTES = 15
+
+
+def parse_updown(pm: dict) -> Optional[dict]:
+    m = _SLUG_UPDOWN.match(str(pm.get("slug") or "").strip().lower())
+    if not m:
+        return None
+    asset = _UPDOWN_ASSETS.get(m.group(1))
+    if not asset:
+        return None
+    minutes = int(m.group(2)) * (60 if m.group(3) == "h" else 1)
+    start = int(m.group(4))
+    return {"asset": asset, "minutes": minutes, "startTs": start,
+            "endTs": start + minutes * 60,
+            "series": f"KX{asset}{_KALSHI_UPDOWN_MINUTES}M"}
+
+
+def et_clock(iso_or_ts) -> Optional[str]:
+    ts = (float(iso_or_ts) if isinstance(iso_or_ts, (int, float))
+          else _close_ts(iso_or_ts))
+    if ts is None:
+        return None
+    dt = datetime.fromtimestamp(ts, timezone.utc)
+    local = dt + timedelta(hours=_et_offset_hours(dt))
+    hour = (local.hour % 12) or 12
+    return f"{hour}:{local.minute:02d}{'AM' if local.hour < 12 else 'PM'} ET"
+
+
+def updown_match(up: dict, kx: dict) -> Optional[dict]:
+    if str(kx.get("seriesTicker") or "").upper() != up["series"]:
+        return None
+    kx_end = _close_ts(kx.get("resolvesAt") or kx.get("closeTime"))
+    if kx_end is None:
+        return None
+    if up["minutes"] != _KALSHI_UPDOWN_MINUTES:
+        return None
+    if abs(kx_end - up["endTs"]) > 60:
+        return None
+    window = (f"{et_clock(up['startTs'])} to {et_clock(up['endTs'])}"
+              .replace(" ET to", " to"))
+    return {
+        "side": "yes", "score": 0.9,
+        "for": [
+            f"Same asset and the same {up['minutes']}-minute window: "
+            f"{window}. Kalshi states the window's end and Polymarket states "
+            f"its start, and the two land on the same instant.",
+            "Both resolve UP: Polymarket's YES is \"Up\", and Kalshi's YES is "
+            "the price finishing above the target it fixed at the window's "
+            "start.",
+        ],
+        "against": [
+            "The two venues read the price from different index providers, so "
+            "a window that ends within a few dollars of its start can settle "
+            "differently on each.",
+        ],
+    }
+
+
+async def explain_no_match(pm: dict) -> Optional[str]:
+    up = parse_updown(pm)
+    if not up:
+        return None
+    try:
+        rows = await kalshi.events_in_series(up["series"])
+    except Exception:
+        return None
+    open_ends = sorted(
+        {_close_ts(r.get("resolvesAt") or r.get("closeTime")) for r in rows
+         if r.get("probability") is not None}
+        - {None})
+    listed = (", ".join(et_clock(t) for t in open_ends[:3])
+              if open_ends else None)
+    window = f"{et_clock(up['startTs'])} to {et_clock(up['endTs'])}".replace(
+        " ET to", " to")
+
+    if not listed:
+        return (
+            f"Kalshi lists a {_KALSHI_UPDOWN_MINUTES}-minute {up['asset']} "
+            f"up/down market, but it has no open window quoting right now, so "
+            f"there is nothing to compare this {up['minutes']}-minute window "
+            f"({window}) against.")
+    if up["minutes"] != _KALSHI_UPDOWN_MINUTES:
+        return (
+            f"Kalshi lists {up['asset']} up/down in "
+            f"{_KALSHI_UPDOWN_MINUTES}-minute windows only. This is a "
+            f"{up['minutes']}-minute window ({window}), so no Kalshi market "
+            f"asks the same question — the window Kalshi is quoting ends "
+            f"{listed}. A price from a different window length is not a second "
+            f"opinion on this one, so none is shown.")
+    return (
+        f"Kalshi lists {up['asset']} in {_KALSHI_UPDOWN_MINUTES}-minute "
+        f"windows like this one, but opens one at a time: it is quoting the "
+        f"window ending {listed}, not the one ending {et_clock(up['endTs'])}. "
+        f"There is no counterpart for this window yet.")
+
+
+def pm_settlement_date(pm: dict) -> tuple[Optional[str], bool]:
+    fx = parse_fixture(pm)
+    if fx:
+        return fx["date"], True
+    close = pm.get("closeTime")
+    td = text_date(str(pm.get("title") or ""), year_hint=str(close or ""))
+    if td:
+        return td, True
+    return et_date(close), False
+
+
+def kx_settlement_date(kx: dict) -> tuple[Optional[str], bool]:
+    d = kalshi_ticker_date(str(kx.get("eventTicker")
+                               or kx.get("conditionId") or ""))
+    if d:
+        return d, True
+    d = et_date(kx.get("strikeDate"))
+    if d:
+        return d, True
+    return et_date(kx.get("resolvesAt") or kx.get("closeTime")), False
+
+
+def _subject_tokens(text: str) -> set[str]:
+    drop = {"price", "above", "below", "over", "under", "between", "highest",
+            "lowest", "maximum", "minimum", "temperature", "will", "get",
+            "high", "low", "range", "rate", "rates", "value", "level"}
+    return expand_tokens(
+        {t for t in _tokens(text) if t not in drop and not t.isdigit()})
+
+
+def structural_match(pm: dict, kx: dict) -> Optional[dict]:
+    pm_text = str(pm.get("title") or "")
+    kx_text = str(kx.get("matchText") or kx.get("title") or "")
+
+    up = parse_updown(pm)
+    if up:
+        return updown_match(up, kx)
+
+    leg = fed_leg(pm_text)
+    if leg:
+        klg = kalshi_fed_leg(kx)
+        if not klg:
+            return None
+        if klg != leg:
+            return None
+        pd, _ = pm_settlement_date(pm)
+        pm_month = (pd or "")[:7]
+        kx_month = kalshi_ticker_month(str(kx.get("eventTicker")
+                                           or kx.get("conditionId") or ""))
+        if not kx_month:
+            kd, _ = kx_settlement_date(kx)
+            kx_month = (kd or "")[:7]
+        if not pm_month or pm_month != kx_month:
+            return None
+        return {
+            "side": "yes", "score": 0.9,
+            "for": [
+                f"Both name the same Fed meeting ({pm_month}) and the same "
+                f"decision ({kx.get('subtitle') or klg}).",
+                "Matched on the decision itself, not on wording: Polymarket "
+                "writes the size in basis points and Kalshi writes it as a "
+                "band, so the two titles never share the same figure.",
+            ],
+            "against": [],
+        }
+
+    pm_t = parse_threshold(pm_text)
+    kx_t = parse_threshold(str(kx.get("subtitle") or "")) \
+        or _kx_strike_threshold(kx) \
+        or parse_threshold(kx_text)
+    rel = compare_thresholds(pm_t, kx_t)
+    if not rel:
+        return None
+
+    subj_pm, subj_kx = _subject_tokens(pm_text), _subject_tokens(kx_text)
+    shared = subj_pm & subj_kx
+    if not shared:
+        return None
+
+    pd, pd_exact = pm_settlement_date(pm)
+    kd, kd_exact = kx_settlement_date(kx)
+    if not pd or not kd:
+        return None
+
+    against: list[str] = []
+    if pd != kd:
+        d0, d1 = sorted((pd, kd))
+        one_day = (datetime.fromisoformat(d1)
+                   - datetime.fromisoformat(d0)).days <= 1
+        if not one_day:
+            return None
+        if _RE_DEADLINE.search(pm_text) and kd > pd:
+            for_deadline = True
+        elif pd_exact or kd_exact:
+            return None
+        else:
+            for_deadline = False
+            against.append(
+                f"Neither venue states the settlement day outright; the two "
+                f"close dates are {pd} and {kd}.")
+        if for_deadline:
+            against.append(
+                f"Polymarket writes the deadline as {pd} and Kalshi settles "
+                f"it at {kd} — the same cut-off from either side of midnight, "
+                f"but check the exact hour if the price is close.")
+
+    for_ = [
+        f"Same subject: {', '.join(sorted(shared)[:4])}.",
+        f"Same settlement day ({pd}) in US Eastern, which is the timezone "
+        f"both venues state their dates in.",
+        _threshold_phrase(pm_t, kx_t),
+    ]
+
+    if rel == "complement":
+        return {
+            "side": "no", "score": 0.78, "for": for_,
+            "against": against + [
+                "Compared against the NO side of the Kalshi market: Kalshi "
+                "lists this level from the other direction, so its NO price "
+                "is the one that answers this question. The two venues may "
+                "still treat the boundary value itself differently.",
+            ],
+        }
+    return {"side": "yes", "score": 0.9, "for": for_, "against": against}
+
+
+def _threshold_phrase(pm_t: tuple, kx_t: tuple) -> str:
+    def fmt(t: tuple) -> str:
+        if t[0] == "between":
+            return f"between {t[1]:g} and {t[2]:g}"
+        return f"{t[0]} {t[1]:g}"
+    if pm_t[0] == kx_t[0]:
+        return f"Both ask the same threshold: {fmt(pm_t)}."
+    return (f"The same level from opposite sides: this market asks "
+            f"{fmt(pm_t)}, Kalshi's asks {fmt(kx_t)}.")
+
+
+def _kx_strike_threshold(kx: dict) -> Optional[tuple]:
+    st = str(kx.get("strikeType") or "").lower()
+    floor, cap = kx.get("floorStrike"), kx.get("capStrike")
+    if st in ("greater", "greater_or_equal") and floor is not None:
+        return ("above", float(floor))
+    if st in ("less", "less_or_equal") and cap is not None:
+        return ("below", float(cap))
+    if st == "between" and floor is not None and cap is not None:
+        return ("between", float(floor), float(cap))
+    return None
+
+
+def score_pair(pm: dict, kx: dict) -> tuple[float, list[str], list[str]]:
+    pm_text = f"{pm.get('title') or ''}"
+    kx_text = kx.get("matchText") or kx.get("title") or ""
+
+    for_: list[str] = []
+    against: list[str] = []
+
+    if _are_opposites(pm_text, kx_text):
+        return 0.0, [], ["The two questions are phrased as opposites."]
+
+    pt, kt = _tokens(pm_text), _tokens(kx_text)
+    if not pt or not kt:
+        return 0.0, [], ["One of the two has no matchable text."]
+    overlap = len(pt & kt) / len(pt | kt)
+    shared = sorted(pt & kt)[:6]
+    if shared:
+        for_.append(f"Shares {len(pt & kt)} key term(s): {', '.join(shared)}.")
+
+    score = overlap
+
+    pn, kn = _numbers(pm_text), _numbers(kx_text)
+    shared = pn & kn
+    only_pm, only_kx = pn - kn, kn - pn
+    if only_pm and only_kx:
+        score -= 0.45
+        against.append(
+            f"Different figures: this market says "
+            f"{', '.join(sorted(only_pm))} where Kalshi's says "
+            f"{', '.join(sorted(only_kx))}.")
+    elif shared and not (only_pm or only_kx):
+        score += 0.18
+        for_.append(f"Both name the same figure(s): {', '.join(sorted(shared))}.")
+    elif only_pm:
+        score -= 0.10
+        against.append(
+            f"This market names a figure ({', '.join(sorted(only_pm))}) that "
+            f"the Kalshi market does not.")
+    elif only_kx:
+        score -= 0.10
+        against.append(
+            f"The Kalshi market names a figure ({', '.join(sorted(only_kx))}) "
+            f"that this one does not.")
+
+    pts, kts = _close_ts(pm.get("closeTime")), _close_ts(kx.get("closeTime"))
+    if pts and kts:
+        days = abs(pts - kts) / 86400.0
+        if days <= 2:
+            score += 0.12
+            for_.append(f"Both settle within {days * 24:.0f}h of each other.")
+        elif days <= 14:
+            for_.append(f"Settlement dates are {days:.0f} days apart.")
+        else:
+            score -= 0.22
+            against.append(
+                f"Settlement dates are {days:.0f} days apart — these are "
+                f"probably different periods of the same question.")
+    else:
+        against.append("One of the two has no settlement date to compare.")
+
+    return max(0.0, min(1.0, score)), for_, against
+
+
+def _confidence(score: float) -> str:
+    return "strong" if score >= STRONG else "possible"
+
+
+_SERIES_FANOUT = 6
+_TOKEN_FANOUT = 3
+
+_index: tuple[float, list[dict], dict[str, set[int]]] | None = None
+
+
+async def _get_index() -> tuple[list[dict], dict[str, set[int]], bool]:
+    global _index
+    now = time.monotonic()
+    if _index and now - _index[0] < kalshi.TTL_SERIES:
+        return _index[1], _index[2], True
+
+    rows, ok = await kalshi.series_index()
+    if not rows:
+        return [], {}, ok
+
+    inv: dict[str, set[int]] = {}
+    for i, r in enumerate(rows):
+        for tok in _tokens(r.get("title") or ""):
+            inv.setdefault(tok, set()).add(i)
+    _index = (now, rows, inv)
+    return rows, inv, ok
+
+
+def _series_candidates(pm_tokens: set[str], rows: list[dict],
+                       inv: dict[str, set[int]]) -> list[dict]:
+    counts: dict[int, int] = {}
+    for tok in pm_tokens:
+        for i in inv.get(tok, ()):
+            counts[i] = counts.get(i, 0) + 1
+    scored = []
+    for i, n in counts.items():
+        st = rows[i]
+        stoks = _tokens(st.get("title") or "")
+        if not stoks:
+            continue
+        cover = len(pm_tokens & stoks) / len(stoks)
+        if n >= 1 and cover >= 0.5:
+            scored.append((cover, n, st))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [st for _, _, st in scored[:_TOKEN_FANOUT]]
+
+
+def _candidate_series(pm: dict, rows: list[dict],
+                      inv: dict[str, set[int]]) -> list[dict]:
+    by_ticker = {r["ticker"]: r for r in rows}
+    picked: list[dict] = []
+    seen: set[str] = set()
+
+    def add(ticker: str) -> None:
+        r = by_ticker.get(ticker)
+        if r and ticker not in seen:
+            seen.add(ticker)
+            picked.append(r)
+
+    title = str(pm.get("title") or "")
+
+    fx = parse_fixture(pm)
+    if fx:
+        for fam in fx["families"]:
+            add(fx["prefix"] + fam)
+
+    up = parse_updown(pm)
+    if up:
+        add(up["series"])
+
+    for pattern, tickers in _TOPIC_SERIES:
+        if re.search(pattern, title, re.IGNORECASE):
+            for t in tickers:
+                add(t)
+
+    pt = expand_tokens(_tokens(title))
+    for sx in _series_candidates(pt, rows, inv):
+        if sx["ticker"] not in seen:
+            seen.add(sx["ticker"])
+            picked.append(sx)
+
+    return picked[:_SERIES_FANOUT]
+
+
+_RE_WILL_WIN = re.compile(r"^will\s+(.+?)\s+(?:win|beat|defeat)\b", re.IGNORECASE)
+_RE_LABEL = re.compile(
+    r"^(?:\d?(?:st|nd)?\s*half\s+)?(?:game\s+)?"
+    r"(?:spread|handicap|total|moneyline)\s*:\s*(.+?)\s*[\(:]", re.IGNORECASE)
+_RE_VS = re.compile(r"^(.*?)\s+vs\.?\s+(.*)$", re.IGNORECASE)
+
+
+def pm_yes_claim(pm: dict, fx: dict) -> Optional[str]:
+    title = str(pm.get("title") or "").strip()
+    tail = fx.get("tail") or ""
+    line = fx.get("line")
+
+    if "draw" in tail or re.search(r"\bdraw\b|\btie\b", title, re.IGNORECASE):
+        return "tie draw"
+    if fx["kind"] == "total":
+        return f"over {line:g}" if line is not None else None
+    if fx["kind"] == "spread":
+        m = _RE_LABEL.match(title)
+        team = m.group(1) if m else None
+        if not team:
+            return None
+        return f"{team} over {line:g}" if line is not None else team
+
+    m = _RE_WILL_WIN.match(title)
+    if m:
+        return m.group(1)
+    head = title
+    if ":" in head and " vs" not in head.split(":", 1)[0].lower():
+        head = head.split(":", 1)[1].strip()
+    m = _RE_VS.match(head)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _leg_score(claim: str, kx: dict) -> float:
+    kt = _tokens(str(kx.get("subtitle") or kx.get("title") or ""))
+    ct = _tokens(claim)
+    if not ct or not kt:
+        return 0.0
+    score = float(len(ct & kt))
+    cn = _numbers(claim)
+    kn = _numbers(str(kx.get("subtitle") or kx.get("title") or ""))
+    if cn and kn:
+        score += 3.0 if cn & kn else -4.0
+    return score
+
+
+def pick_leg(claim: str, legs: list[dict]) -> Optional[tuple[dict, float, float]]:
+    scored = sorted(((_leg_score(claim, k), k) for k in legs),
+                    key=lambda x: -x[0])
+    if not scored or scored[0][0] <= 0:
+        return None
+    best, runner = scored[0], (scored[1] if len(scored) > 1 else (0.0, None))
+    if best[0] - runner[0] < 1.0:
+        return None
+    return best[1], best[0], runner[0]
+
+
+_STRIP_DIGITS = re.compile(r"^\d+")
+
+
+def event_code(ticker: str) -> str:
+    up = str(ticker or "").upper()
+    m = _KX_TICKER_DATE.search(up)
+    if not m:
+        return ""
+    return _STRIP_DIGITS.sub("", up[m.end():])
+
+
+def _event_score(pm_title: str, sides: tuple, legs: list[dict]) -> float:
+    code = event_code(str(legs[0].get("eventTicker") or ""))
+    hits = 0
+    for s in sides:
+        s = (s or "").upper()
+        if len(s) >= 3 and (s in code or s[:3] in code):
+            hits += 1
+    ev_text = " ".join(str(legs[0].get(k) or "")
+                       for k in ("eventTitle", "eventSubtitle"))
+    return 2.0 * hits + len(_tokens(pm_title) & _tokens(ev_text))
+
+
+def _fixture_verdict(pm: dict, fx: dict, markets: list[dict]) -> Optional[dict]:
+    claim = pm_yes_claim(pm, fx)
+    if not claim:
+        return None
+
+    priced = [k for k in markets if k.get("probability") is not None]
+    dates = [fx["date"]]
+    close_day = et_date(pm.get("closeTime"))
+    if close_day and close_day not in dates:
+        dates.append(close_day)
+
+    for date in dates:
+        same_day = [k for k in priced
+                    if kalshi_ticker_date(str(k.get("eventTicker") or "")) == date]
+        if not same_day:
+            continue
+        by_event: dict[str, list[dict]] = {}
+        for k in same_day:
+            by_event.setdefault(str(k.get("eventTicker") or ""), []).append(k)
+
+        title = str(pm.get("title") or "")
+        ranked = sorted(
+            ((_event_score(title, fx["sides"], legs), tk, legs)
+             for tk, legs in by_event.items()), key=lambda x: -x[0])
+        top = ranked[0]
+        if top[0] <= 0:
+            continue
+        if len(ranked) > 1 and top[0] - ranked[1][0] < 1.0:
+            continue
+
+        picked = pick_leg(claim, top[2])
+        if not picked:
+            continue
+        leg, best, runner = picked
+        against = [
+            "Kalshi and Polymarket may void or push a postponed fixture on "
+            "different rules, so a delayed game can still settle differently.",
+        ]
+        if date != fx["date"]:
+            against.append(
+                f"Polymarket's slug dates this {fx['date']}; the fixture "
+                f"matched is Kalshi's on {date}, which is the day this market "
+                f"closes.")
+        return {
+            "market": leg, "score": 0.88,
+            "for": [
+                f"Same fixture on the same day: Polymarket's slug says "
+                f"{fx['league'].upper()} on {date}, and this is Kalshi's "
+                f"\"{leg.get('eventTitle')}\" for that date.",
+                f"Polymarket's YES here is \"{claim}\"; the Kalshi leg "
+                f"compared is \"{leg.get('subtitle') or leg.get('title')}\" — "
+                f"it outscored the next leg {best:g} to {runner:g}, so the "
+                f"side is not a guess.",
+            ],
+            "against": against,
+            "side": "yes",
+        }
+    return None
+
+
+async def find_match(pm: dict) -> Optional[dict]:
+    rows, inv, _ = await _get_index()
+    if not rows:
+        return None
+    if not _tokens(pm.get("title") or ""):
+        return None
+
+    series = _candidate_series(pm, rows, inv)
+    if not series:
+        return None
+
+    pool: list[tuple[dict, dict]] = []
+    for sx in series:
+        try:
+            markets = await kalshi.events_in_series(sx["ticker"])
+        except Exception as e:
+            logger.debug("cross-venue: series %s failed: %s", sx["ticker"], e)
+            continue
+        for kx in markets:
+            pool.append((kx, sx))
+
+    fx = parse_fixture(pm)
+    if fx:
+        for sx in series:
+            legs = [k for k, s in pool if s["ticker"] == sx["ticker"]]
+            v = _fixture_verdict(pm, fx, legs)
+            if v:
+                v["series"] = sx
+                return v
+
+    structural_only = parse_updown(pm) is not None
+
+    cands: list[dict] = []
+    for kx, sx in pool:
+        if kx.get("probability") is None:
+            continue
+        sv = structural_match(pm, kx)
+        if sv:
+            cands.append({
+                "market": kx, "score": sv["score"], "for": list(sv["for"]),
+                "against": list(sv["against"]), "series": sx,
+                "side": sv["side"],
+            })
+            continue
+        if structural_only:
+            continue
+        score, for_, against = score_pair(pm, kx)
+        if score > 0:
+            cands.append({
+                "market": kx, "score": round(score, 3), "for": for_,
+                "against": against, "series": sx, "side": "yes",
+            })
+
+    for cand in sorted(cands, key=lambda c: -c["score"]):
+        if cand["score"] < POSSIBLE:
+            break
+        if _beats_its_siblings(cand, cands):
+            return cand
+    return None
+
+
+_SIBLING_MARGIN = 0.08
+
+
+def _beats_its_siblings(cand: dict, cands: list[dict]) -> bool:
+    ev = str(cand["market"].get("eventTicker") or "")
+    if not ev:
+        return True
+    mine = cand["market"].get("conditionId")
+    sibs = [c["score"] for c in cands
+            if str(c["market"].get("eventTicker") or "") == ev
+            and c["market"].get("conditionId") != mine]
+    return not sibs or cand["score"] - max(sibs) >= _SIBLING_MARGIN
+
+
+_BUCKETS = {
+    "1h": (60, 3600, 1),
+    "6h": (300, 6 * 3600, 5),
+    "1d": (3600, 24 * 3600, 60),
+    "1w": (3600, 7 * 24 * 3600, 60),
+    "max": (86400, 90 * 24 * 3600, 1440),
+}
+
+
+def _bucket(points: list[dict], size: int) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for p in points:
+        t, v = p.get("t"), p.get("p")
+        if t is None or v is None:
+            continue
+        out[int(t) - (int(t) % size)] = float(v)
+    return out
+
+
+async def compare(condition_id: str, interval: str = "1d") -> dict:
+    iv = interval if interval in _BUCKETS else "1d"
+    bucket_s, lookback_s, kx_period = _BUCKETS[iv]
+
+    pm = await term.market(condition_id)
+    if not pm:
+        return _empty(condition_id, iv, "Could not read this Polymarket market.")
+
+    if term.is_offline():
+        return _empty(condition_id, iv, term.OFFLINE_REASON)
+
+    match = await find_match(pm)
+    if not match:
+        return _empty(
+            condition_id, iv,
+            await explain_no_match(pm) or
+            "No Kalshi market looks like this question. Kalshi lists a "
+            "different set of markets, so most Polymarket questions simply "
+            "have no counterpart — this is a real answer, not a failed lookup.")
+
+    kx = match["market"]
+    confidence = _confidence(match["score"])
+    side = match.get("side") or "yes"
+
+    pm_p = pm.get("probability")
+    kx_p = kx.get("probability")
+    kx_bid, kx_ask = kx.get("bid"), kx.get("ask")
+    kx_leg = kx.get("subtitle")
+    if side == "no":
+        kx_p = None if kx_p is None else round(100.0 - kx_p, 2)
+        kx_bid, kx_ask = (
+            None if kx.get("ask") is None else round(100.0 - kx["ask"], 2),
+            None if kx.get("bid") is None else round(100.0 - kx["bid"], 2))
+        kx_leg = (f"NO on \"{kx.get('subtitle') or kx.get('title')}\""
+                  if (kx.get("subtitle") or kx.get("title")) else "NO")
+
+    spread = None
+    if confidence != "strong":
+        spread_note = (
+            "No spread is shown: this pairing is not certain enough, and a "
+            "price difference between two markets that may not be the same "
+            "question is a meaningless number. Read both titles above and "
+            "decide for yourself.")
+    elif pm_p is None or kx_p is None:
+        spread_note = (
+            "One of the two venues has no price right now, so there is no "
+            "difference to compute.")
+    else:
+        spread = round(kx_p - pm_p, 2)
+        which = ("Kalshi's NO side prices this"
+                 if side == "no" else "Kalshi prices this")
+        spread_note = (
+            f"{which} {abs(spread):.1f}¢ "
+            f"{'higher' if spread > 0 else 'lower'} than Polymarket."
+            if abs(spread) >= 0.5 else
+            f"{which} the same, to within half a cent.")
+
+    now = int(time.time())
+    pm_hist = await term.price_history(condition_id, "yes", iv)
+    kx_pts = await kalshi.candles(
+        kx["conditionId"], start_ts=now - lookback_s, end_ts=now,
+        period_interval=kx_period,
+        series_ticker=kx.get("seriesTicker") or "")
+
+    if side == "no":
+        kx_pts = [{"t": p["t"], "p": round(100.0 - p["p"], 2)} for p in kx_pts]
+
+    pm_b = _bucket(pm_hist.get("points") or [], bucket_s)
+    kx_b = _bucket(kx_pts, bucket_s)
+    grid = sorted(set(pm_b) | set(kx_b))
+    series = [{"t": t, "p": pm_b.get(t), "k": kx_b.get(t)} for t in grid]
+    both = sum(1 for r in series if r["p"] is not None and r["k"] is not None)
+
+    hist_note = None
+    if not kx_pts:
+        hist_note = (
+            "Kalshi has no candle history for this market at this resolution, "
+            "so only the Polymarket line is drawn.")
+    elif both == 0:
+        hist_note = (
+            "The two venues have no overlapping periods in this window, so "
+            "the lines never appear side by side. Try a longer interval.")
+    elif both < len(grid) * 0.25:
+        hist_note = (
+            f"The venues overlap in only {both} of {len(grid)} periods — the "
+            f"thinner market simply did not trade in the rest.")
+
+    return {
+        "conditionId": condition_id,
+        "interval": iv,
+        "polymarket": {
+            "title": pm.get("title"), "probability": pm_p,
+            "bid": pm.get("bid"), "ask": pm.get("ask"),
+            "spread": pm.get("spread"), "closeTime": pm.get("closeTime"),
+            "volume24hUsd": pm.get("volume24hUsd"),
+            "liquidityUsd": pm.get("liquidityUsd"),
+        },
+        "kalshi": {
+            "ticker": kx["conditionId"],
+            "title": kx.get("eventTitle") or kx.get("title"),
+            "subtitle": kx_leg,
+            "probability": kx_p,
+            "bid": kx_bid, "ask": kx_ask,
+            "spread": kx.get("spread"), "closeTime": kx.get("closeTime"),
+            "volume24hUsd": kx.get("volume24hUsd"),
+            "liquidityUsd": kx.get("liquidityUsd"),
+            "url": kalshi.web_url(kx["conditionId"], kx.get("eventSlug")),
+            "side": side,
+        },
+        "match": {
+            "confidence": confidence,
+            "score": match["score"],
+            "for": match["for"],
+            "against": match["against"],
+            "comparedSides": {"polymarket": "yes", "kalshi": side},
+        },
+        "spreadCents": spread,
+        "spreadNote": spread_note,
+        "series": series,
+        "overlapPeriods": both,
+        "historyNote": hist_note,
+        "venueNote": kalshi.VENUE_NOTE,
+        "caveats": kalshi.SPREAD_CAVEATS,
+        "fetchedAt": _now_iso(),
+        "note": None,
+    }
+
+
+def _empty(condition_id: str, interval: str, note: str) -> dict:
+    return {
+        "conditionId": condition_id, "interval": interval,
+        "polymarket": None, "kalshi": None, "match": None,
+        "spreadCents": None, "spreadNote": None,
+        "series": [], "overlapPeriods": 0, "historyNote": None,
+        "venueNote": kalshi.VENUE_NOTE, "caveats": kalshi.SPREAD_CAVEATS,
+        "fetchedAt": _now_iso(), "note": note,
+    }

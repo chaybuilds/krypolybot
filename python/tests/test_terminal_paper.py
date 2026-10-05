@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+import db
+import terminal as t
+import terminal_paper as tp
+import terminal_trade as tt
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+@pytest.fixture
+def paper_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "db_path", lambda: tmp_path / "paper.db")
+    db.init_db()
+    return tmp_path
+
+
+def _mock_market(monkeypatch, *, asks=None, bids=None, resolved=None,
+                 category="crypto", available=True):
+    async def _market(cid, include_raw=False):
+        m = {
+            "conditionId": cid, "title": "Test market", "slug": "t",
+            "category": category, "status": "settled" if resolved else "open",
+            "resolvedOutcome": resolved, "closeTime": "2030-01-01T00:00:00Z",
+            "probability": 50.0, "spread": 2.0, "liquidityUsd": 100000.0,
+            "hoursToClose": 100.0, "bid": 49.0, "ask": 51.0,
+            "_raw": {"orderPriceMinTickSize": 0.01, "orderMinSize": 1,
+                     "acceptingOrders": True, "feesEnabled": False},
+        }
+        return m if include_raw else {k: v for k, v in m.items() if k != "_raw"}
+
+    async def _book(cid, side="yes"):
+        return {
+            "conditionId": cid, "tokenSide": side,
+            "asks": [{"priceCents": p, "size": s, "cumulative": s,
+                      "notionalUsd": s * p / 100} for p, s in (asks or [])],
+            "bids": [{"priceCents": p, "size": s, "cumulative": s,
+                      "notionalUsd": s * p / 100} for p, s in (bids or [])],
+            "bestAsk": (asks or [[None]])[0][0] if asks else None,
+            "bestBid": (bids or [[None]])[0][0] if bids else None,
+            "spreadCents": 2.0, "midCents": 50.0,
+            "bidDepthUsd": 1.0, "askDepthUsd": 1.0,
+            "available": available, "fetchedAt": "", "source": "clob",
+            "note": None if available else "could not read",
+        }
+
+    async def _summaries(ids):
+        return [await _market(i) for i in ids]
+
+    monkeypatch.setattr(tp.term, "market", _market)
+    monkeypatch.setattr(tt.term, "market", _market)
+    monkeypatch.setattr(tp.term, "book", _book)
+    monkeypatch.setattr(tt.term, "book", _book)
+    monkeypatch.setattr(tp.term, "_summaries_for", _summaries)
+
+
+def _order(**kw):
+    base = {"conditionId": "0xabc", "side": "yes", "action": "buy",
+            "priceCents": 55, "size": 10, "orderType": "FAK"}
+    base.update(kw)
+    return base
+
+
+def test_fill_uses_the_walked_average_not_your_limit(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 4), (52.0, 6)])
+    r = _run(tp.place(_order(priceCents=55, size=10)))
+    assert r["ok"]
+    assert r["filledSize"] == 10.0
+    assert abs(r["avgPriceCents"] - 51.2) < 1e-6, "paper filled at the limit price"
+
+
+def test_fill_never_exceeds_what_was_resting(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 3)])
+    r = _run(tp.place(_order(priceCents=55, size=10, orderType="FAK")))
+    assert r["filledSize"] == 3.0, "paper invented size that was not on the book"
+    assert r["status"] == "partial"
+
+
+def test_nothing_at_your_price_means_no_fill(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    r = _run(tp.place(_order(priceCents=55, size=10, orderType="FAK")))
+    assert r["filledSize"] == 0.0
+    assert r["status"] == "unfilled"
+
+
+def test_all_or_none_is_killed_when_the_book_is_short(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 3)])
+    r = _run(tp.place(_order(priceCents=55, size=10, orderType="FOK")))
+    assert r["filledSize"] == 0.0, "FOK partially filled"
+    assert r["status"] == "unfilled"
+
+
+def test_an_unreadable_book_refuses_to_simulate(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)], available=False)
+    r = _run(tp.place(_order()))
+    assert r["ok"] is False
+    assert "book" in r["message"].lower()
+
+
+def test_a_non_crossing_limit_rests_instead_of_filling(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    r = _run(tp.place(_order(priceCents=50, size=10, orderType="GTC")))
+    assert r["filledSize"] == 0.0
+    assert r["status"] == "resting"
+
+
+def test_a_resting_order_does_not_fill_merely_at_the_touch(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    _run(tp.place(_order(priceCents=50, size=10, orderType="GTC")))
+    _mock_market(monkeypatch, asks=[(50.0, 100)])
+    assert _run(tp._fill_resting()) == 0
+    orders = tp.orders()["orders"]
+    assert orders[0]["filledSize"] == 0.0
+    assert orders[0]["status"] == "resting"
+
+
+def test_a_resting_order_fills_once_the_market_trades_through(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    _run(tp.place(_order(priceCents=50, size=10, orderType="GTC")))
+    _mock_market(monkeypatch, asks=[(49.0, 100)])
+    assert _run(tp._fill_resting()) == 1
+    o = tp.orders()["orders"][0]
+    assert o["filledSize"] == 10.0
+    assert o["status"] == "filled"
+    assert o["feesUsd"] == 0.0 or o["feesUsd"] is None, \
+        "a resting fill is a MAKER fill and must not be charged a taker fee"
+
+
+def test_a_crossing_limit_fills_the_crossed_part_and_rests_the_remainder(
+        paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 4)])
+    r = _run(tp.place(_order(priceCents=50, size=10, orderType="GTC")))
+    assert r["filledSize"] == 4.0
+    o = tp.orders()["orders"][0]
+    assert o["restingSize"] == 6.0
+    assert o["status"] == "partial"
+
+
+def test_a_canceled_resting_order_stops_filling(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    r = _run(tp.place(_order(priceCents=50, size=10, orderType="GTC")))
+    _run(tp.cancel(r["localId"]))
+    _mock_market(monkeypatch, asks=[(40.0, 100)])
+    assert _run(tp._fill_resting()) == 0
+
+
+def test_a_taker_fill_is_charged_the_real_fee_curve(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)], category="crypto")
+    monkeypatch.setattr(tt.api, "_fee_schedule_from_gamma", lambda raw: None)
+    _run(tp.place(_order(priceCents=50, size=100, orderType="FAK")))
+    o = tp.orders()["orders"][0]
+    assert abs(o["feesUsd"] - 1.75) < 1e-6
+
+
+def test_a_markets_own_fee_free_schedule_is_respected(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)])
+    _run(tp.place(_order(priceCents=50, size=100, orderType="FAK")))
+    assert tp.orders()["orders"][0]["feesUsd"] == 0.0
+
+
+def test_you_cannot_sell_paper_you_do_not_hold(paper_db, monkeypatch):
+    _mock_market(monkeypatch, bids=[(50.0, 100)])
+    r = _run(tp.place(_order(action="sell", priceCents=40, size=10)))
+    assert r["ok"] is False
+    assert "naked short" in r["message"].lower()
+
+
+def test_settlement_pays_exactly_100c_on_a_winner(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(40.0, 100)])
+    _run(tp.place(_order(priceCents=40, size=10, orderType="FAK")))
+    _mock_market(monkeypatch, asks=[(40.0, 100)], resolved="yes")
+    assert _run(tp._settle_resolved()) == 1
+    pf = _run(tp.portfolio({"terminal_paper_bankroll_usd": 1000.0}))
+    assert pf["positions"] == []
+    assert abs(pf["realizedPnlUsd"] - 6.0) < 1e-6
+    assert abs(pf["cashUsd"] - 1006.0) < 1e-6
+
+
+def test_settlement_pays_exactly_zero_on_a_loser(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(40.0, 100)])
+    _run(tp.place(_order(priceCents=40, size=10, orderType="FAK")))
+    _mock_market(monkeypatch, asks=[(40.0, 100)], resolved="no")
+    _run(tp._settle_resolved())
+    pf = _run(tp.portfolio({"terminal_paper_bankroll_usd": 1000.0}))
+    assert abs(pf["realizedPnlUsd"] + 4.0) < 1e-6
+    assert abs(pf["cashUsd"] - 996.0) < 1e-6
+
+
+def test_settling_twice_does_not_double_pay(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(40.0, 100)])
+    _run(tp.place(_order(priceCents=40, size=10, orderType="FAK")))
+    _mock_market(monkeypatch, asks=[(40.0, 100)], resolved="yes")
+    _run(tp._settle_resolved())
+    assert _run(tp._settle_resolved()) == 0
+    pf = _run(tp.portfolio({"terminal_paper_bankroll_usd": 1000.0}))
+    assert abs(pf["cashUsd"] - 1006.0) < 1e-6
+
+
+def test_paper_fills_never_enter_the_real_ledger(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)])
+    _run(tp.place(_order(priceCents=55, size=10, orderType="FAK")))
+    assert tt._ledger_basis() == {}, "a paper fill reached the real cost basis"
+    with db.get_db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM terminal_fills").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM terminal_orders").fetchone()[0] == 0
+
+
+def test_paper_cash_starts_at_the_configured_bankroll(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)])
+    pf = _run(tp.portfolio({"terminal_paper_bankroll_usd": 250.0}))
+    assert pf["cashUsd"] == 250.0
+    assert pf["bankrollUsd"] == 250.0
+
+
+def test_average_cost_across_two_paper_buys(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(40.0, 100)])
+    _run(tp.place(_order(priceCents=40, size=100, orderType="FAK")))
+    _mock_market(monkeypatch, asks=[(60.0, 100)])
+    _run(tp.place(_order(priceCents=60, size=100, orderType="FAK")))
+    pf = _run(tp.portfolio(None))
+    p = pf["positions"][0]
+    assert p["size"] == 200
+    assert abs(p["avgCostCents"] - 50.0) < 1e-6
+
+
+def test_reset_clears_the_paper_account(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 100)])
+    _run(tp.place(_order(priceCents=55, size=10, orderType="FAK")))
+    assert tp.reset()["cleared"] == 1
+    pf = _run(tp.portfolio({"terminal_paper_bankroll_usd": 1000.0}))
+    assert pf["positions"] == [] and pf["cashUsd"] == 1000.0
+
+
+def test_a_large_order_warns_about_missing_market_impact(paper_db, monkeypatch):
+    _mock_market(monkeypatch, asks=[(50.0, 10)])
+    r = _run(tp.place(_order(priceCents=55, size=10, orderType="FAK")))
+    assert any("depth" in w for w in r.get("warnings", [])), \
+        "sweeping the whole book should say the real fill would be worse"
