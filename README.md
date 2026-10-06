@@ -6,6 +6,10 @@
 
 **A free, open-source Polymarket trading desktop app.**
 
+<a href="https://discord.gg/muzFKR657F"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="48" /></a>
+&nbsp;&nbsp;
+<a href="https://krypt.cc/tools"><img src="https://img.shields.io/badge/More%20free%20tools%20%E2%86%92%20krypt.cc%2Ftools-A855F7?style=for-the-badge&logo=googlechrome&logoColor=white" alt="More free tools at krypt.cc/tools" height="48" /></a>
+
 A manual trading terminal, whale tracker, momentum scanner, short-term crypto engine, copy trading, a Perps market maker and your own Python strategies in one clean app — your wallet key never leaves your machine.
 
 [![CI](https://github.com/scripflipped/krypt-polybot/actions/workflows/ci.yml/badge.svg)](https://github.com/scripflipped/krypt-polybot/actions/workflows/ci.yml)
@@ -13,8 +17,6 @@ A manual trading terminal, whale tracker, momentum scanner, short-term crypto en
 &nbsp;[![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](#download)
 &nbsp;[![Status: beta](https://img.shields.io/badge/status-beta-F59E0B)](#download)
 &nbsp;[![Price: free](https://img.shields.io/badge/Price-free-EC4899)](#download)
-&nbsp;[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/muzFKR657F)
-&nbsp;[![Website](https://img.shields.io/badge/web-krypt.cc-A855F7?logo=googlechrome&logoColor=white)](https://krypt.cc)
 
 </div>
 

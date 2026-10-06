@@ -315,6 +315,22 @@ _UNREADABLE = (SyntaxError, ValueError, RecursionError, MemoryError)
 
 _UNWALKABLE = (RecursionError, MemoryError)
 
+# Whether the recursive walk overflows depends on the interpreter's recursion
+# limit and C stack, which differ by version and OS. Measure depth iteratively
+# and refuse past a fixed cap so the verdict is the same everywhere. Real
+# strategy code sits far below this.
+_MAX_DEPTH = 200
+
+
+def _too_deep(tree: ast.AST) -> bool:
+    stack = [(tree, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+    return False
+
 
 def _unreadable(e: BaseException) -> dict:
     lineno = getattr(e, "lineno", None) if isinstance(e, SyntaxError) else None
@@ -343,6 +359,8 @@ def audit(code: str) -> dict:
         tree = ast.parse(code or "")
     except _UNREADABLE as e:
         return _unreadable(e)
+    if _too_deep(tree):
+        return _unreadable(RecursionError())
 
     scan = _Scan()
     try:
