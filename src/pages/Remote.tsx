@@ -18,7 +18,7 @@ export function RemotePage() {
   const [status, setStatus] = useState<RemoteStatus | null>(null);
 
   const load = useCallback(async () => {
-    try { setStatus(await window.krypt.remote.status()); } catch {}
+    try { setStatus(await window.krypt.remote.status()); } catch { }
   }, []);
 
   useEffect(() => {
@@ -32,7 +32,7 @@ export function RemotePage() {
   ) => {
     await window.krypt.config.update({ [key]: value } as Partial<TraderConfig>);
     await refresh.state();
-    try { setStatus(await window.krypt.remote.sync()); } catch {}
+    try { setStatus(await window.krypt.remote.sync()); } catch { }
   }, [refresh]);
 
   if (!config) {
@@ -402,6 +402,12 @@ function AuditLog({ rows }: { rows: RemoteStatus['audit'] }) {
                 <span className="w-16 shrink-0 text-krypt-muted">{r.platform}</span>
                 <span className="w-24 shrink-0 truncate font-mono text-krypt-dim">{r.sender}</span>
                 <span className="min-w-0 flex-1 truncate font-mono text-white">{r.command}</span>
+                {(r.count ?? 0) > 1 && (
+                  <span className="shrink-0 font-mono text-krypt-dim"
+                    title={r.firstAt ? `first seen ${new Date(r.firstAt).toLocaleString()}` : undefined}>
+                    ×{r.count}
+                  </span>
+                )}
                 <span className={cls('shrink-0 rounded px-1.5 py-0.5 uppercase tracking-wider',
                   r.outcome === 'accepted' ? 'text-krypt-win'
                     : r.outcome === 'unauthorised' ? 'bg-krypt-loss/15 text-krypt-loss'

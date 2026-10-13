@@ -1,3 +1,33 @@
+"""Perps market-maker backtester.
+
+Replays the public trade tape of each market against the SAME quote planner
+the live engine uses (`perps_maker.plan_quotes` / `diff_orders`), so a
+backtested setting means exactly what it means live.
+
+DATA. The tape comes from `perps_trades`: whatever the live feed recorded,
+plus REST backfill of any window not already known complete
+(`perps_tape_coverage`). The exchange serves about 30 days of trade history,
+so a backtest works the first time it's run, with no waiting on a recorder.
+Funding is fetched from the exchange's funding history. Where the live feed
+recorded BBO samples (`perps_ticks`) they give the real touch; elsewhere the
+touch is inferred from the tape (takers buy at the ask and sell at the bid:
+the latest buy print ≈ ask, the latest sell print ≈ bid).
+
+THE FILL MODEL (the honest part — read before trusting a number):
+  * A taker SELL at price X fills our bid at P when P > X (it traded through
+    us) — fully, up to the print's size. When P == X we get a share of the
+    print: all of it if our quote improved the touch when placed (we were
+    first in the queue), `queue_share` of it otherwise.
+  * Our orders never move the market: the tape is what happened without us.
+    Real fills can only be fewer and worse.
+  * Quotes go live `latency_ms` after the decision that placed them.
+  * Fees are the maker fee of the chosen fee tier on every fill.
+  * NOT modelled: index-dislocation pulls (no index history), auto-cancel,
+    rejected post-only orders, and the exact queue position.
+  * Liquidity rewards are an ESTIMATE: time-weighted reward score while
+    quoting, today's competing depth on the board, and the 1%-maker-share
+    eligibility assumed met. Shown separately from trading P&L.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +64,9 @@ _TICK_FRESH_MS = 15_000
 _EQUITY_POINTS = 240
 
 
+
 def missing_ranges(cov: list[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+    """Sub-ranges of [start, end] not covered by the (sorted) spans."""
     out = []
     cur = start
     for a, b in sorted(cov):
@@ -60,6 +92,8 @@ def _pipe() -> asyncio.Semaphore:
 
 
 async def _get_paced(params: dict, path: str = "/v1/info/trades") -> Optional[dict]:
+    """One history page through the shared pipe, retrying rate limits and
+    transient failures with a GLOBAL cooldown."""
     global _cooldown_until, _next_slot
     for attempt in range(_MAX_RETRIES):
         wait = _cooldown_until - time.monotonic()
@@ -83,6 +117,8 @@ async def _get_paced(params: dict, path: str = "/v1/info/trades") -> Optional[di
 
 
 async def _fetch_window(iid: int, a: int, b: int, budget: list[int]) -> tuple[list[dict], bool]:
+    """All trades in [a, b], newest-first pages walked backwards. Returns
+    (rows, complete)."""
     rows: list[dict] = []
     end = b
     while True:
@@ -114,6 +150,9 @@ async def _fetch_window(iid: int, a: int, b: int, budget: list[int]) -> tuple[li
 
 
 async def ensure_history(iid: int, start: int, end: int) -> dict:
+    """Backfill [start, end] for one market. Returns {fetched, complete,
+    coveredFrom} — coveredFrom is where the complete tape begins when the page
+    budget ran out before reaching `start`."""
     with db.get_db() as conn:
         gaps = missing_ranges(db.perps_coverage(conn, iid), start, end)
     chunks = []
@@ -173,6 +212,7 @@ async def funding_history(iid: int, start: int, end: int) -> list[tuple[int, flo
     return sorted(set(out))
 
 
+
 class _Order:
     __slots__ = ("buy", "px", "qty", "rem", "live_at", "prio", "price", "level")
 
@@ -196,6 +236,8 @@ def simulate(trades: list[tuple], *, ticks: list[tuple] = (), funding: list[tupl
              maker_fee: float = FEE_TIERS[0][1], queue_share: float = 0.5,
              latency_ms: int = 250, comp_score: Optional[float] = None,
              pool_usd: float = 0.0) -> dict:
+    """Replay one market. `trades`: (ts, side, price, qty) oldest first, side
+    = taker side. `ticks`: (ts, bid, ask). `funding`: (ts, hourly rate)."""
     p = perps_maker.params(cfg)
     requote = float(cfg.get("perps_requote_bps") or 1.5)
     realtime = bool(cfg.get("perps_realtime", True))
@@ -248,6 +290,9 @@ def simulate(trades: list[tuple], *, ticks: list[tuple] = (), funding: list[tupl
     mid = None
 
     def touch_at(ts: int) -> Optional[tuple[float, float, bool]]:
+        """(bid, ask, firm). `firm` = a recorded BBO or a fresh print on both
+        sides; a one-sided guess (last print ± half the typical spread) still
+        places quotes but isn't trusted to detect a fast move."""
         nonlocal real_touch_events, touch_events
         touch_events += 1
         if tick_ts:
@@ -443,6 +488,7 @@ MAX_VARIANTS = 36
 
 
 def grid_variants(grid: dict) -> list[dict]:
+    """Cartesian product of a {knob: [values]} grid, capped at MAX_VARIANTS."""
     import itertools
     axes = []
     for k, vals in (grid or {}).items():
@@ -489,6 +535,8 @@ def _merge(base: dict, patch: dict) -> dict:
 async def run(cfg: dict, *, days: float = 7, markets: Optional[list[str]] = None,
               variants: Optional[list[dict]] = None, grid: Optional[dict] = None,
               fee_tier: int = 0, queue_share: float = 0.5, latency_ms: int = 250) -> dict:
+    """Backtest the current settings (and optional variants) over the last
+    `days` on `markets` (symbols; default = what the engine would pick)."""
     t0 = time.time()
     days = max(0.25, min(float(days), MAX_DAYS))
     end = int(time.time() * 1000)

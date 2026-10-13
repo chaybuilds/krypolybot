@@ -1,3 +1,20 @@
+"""Backfill the trend/VWAP tick fields for HISTORICAL crypto15m_ticks.
+
+The trend indicator columns (price_vs_vwap_pct, change5m_pct, ema12_vs_sma20_pct,
+…) are NULL on every row recorded before they existed, so a rule over them fails
+closed in replay (0 trades). This recomputes them by re-fetching 1-minute
+candles up to the last one that had CLOSED when each tick was recorded — the
+same math the live path uses (crypto15m.asset_indicators), never a candle
+from the tick's future — and writes them back.
+
+Efficient + resumable: only rows still missing the fields are processed, grouped
+by (asset, minute) so ONE candle fetch serves every tick in that minute; a
+bounded `--limit` lets it run in chunks. Additive UPDATE of the new columns only
+— never touches trades/positions/outcomes.
+
+Usage:
+  python crypto15m_backfill.py [--env mainnet] [--days N] [--limit N] [--loop]
+"""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +50,20 @@ def _epoch_ms(observed_at: str) -> Optional[int]:
         return None
 
 
+def _last_closed_candle_ms(minute: str) -> Optional[int]:
+    """Open time (epoch ms) of the newest 1-minute candle that had CLOSED
+    when a tick in `minute` ('YYYY-MM-DD HH:MM') was recorded: the one ending
+    at that minute's start. The candle the tick sits in closes up to 60s
+    after the tick, so ending the slice there handed every backfilled row a
+    price from its future (audit 2026-10-11). Live reads that candle's
+    partial close instead; a completed candle is the nearest causal match."""
+    start = _epoch_ms(minute + ":00")
+    return None if start is None else start - 60_000
+
+
 async def _fetch_candles_hyperliquid(asset: str, client: httpx.AsyncClient, end_ms: int) -> tuple[list[float], list[float]]:
+    """(closes, volumes) for the 90 minutes ending at end_ms, oldest→newest.
+    Hyperliquid only retains ~3-4 days of 1-min candles."""
     body = {"type": "candleSnapshot", "req": {
         "coin": asset, "interval": "1m",
         "startTime": end_ms - _LOOKBACK_MIN * 60_000, "endTime": end_ms}}
@@ -45,6 +75,8 @@ async def _fetch_candles_hyperliquid(asset: str, client: httpx.AsyncClient, end_
     closes, vols = [], []
     for r in rows:
         if not isinstance(r, dict) or not r.get("c"):
+            continue
+        if isinstance(r.get("t"), (int, float)) and r["t"] > end_ms:
             continue
         try:
             closes.append(float(r["c"]))
@@ -58,6 +90,9 @@ async def _fetch_candles_hyperliquid(asset: str, client: httpx.AsyncClient, end_
 
 
 async def _fetch_candles_coinbase(asset: str, client: httpx.AsyncClient, end_ms: int) -> tuple[list[float], list[float]]:
+    """(closes, volumes) for the 90 minutes ending at end_ms, oldest→newest, from
+    Coinbase Exchange. Rows are [time, low, high, open, close, volume],
+    newest-first — we sort ascending and take close/volume. One 429 retry."""
     end_s = end_ms // 1000
     start_iso = datetime.fromtimestamp(end_s - _LOOKBACK_MIN * 60, tz=timezone.utc).isoformat()
     end_iso = datetime.fromtimestamp(end_s, tz=timezone.utc).isoformat()
@@ -76,7 +111,8 @@ async def _fetch_candles_coinbase(asset: str, client: httpx.AsyncClient, end_ms:
     rows = resp.json()
     if not isinstance(rows, list):
         return [], []
-    rows = sorted((r for r in rows if isinstance(r, list) and len(r) >= 6),
+    rows = sorted((r for r in rows if isinstance(r, list) and len(r) >= 6
+                   and not (isinstance(r[0], (int, float)) and r[0] > end_s)),
                   key=lambda r: r[0])
     closes, vols = [], []
     for r in rows:
@@ -98,6 +134,10 @@ _COINBASE_MAX = 300
 
 async def _fetch_series_coinbase(asset: str, client: httpx.AsyncClient,
                                  start_ms: int, end_ms: int) -> dict[int, tuple[float, float]]:
+    """Fetch the ENTIRE 1-min candle series for [start_ms, end_ms] once, paged at
+    300 candles/request, and return {minute_epoch_s: (close, volume)}. This is the
+    bulk path: one coin's whole history in ~(span/5h) calls instead of one 90-min
+    window per tick-minute (which refetched ~89 min of overlap every step)."""
     url = _COINBASE_URL.format(asset)
     headers = {"User-Agent": "KryptPolyBot/1.0"}
     out: dict[int, tuple[float, float]] = {}
@@ -134,6 +174,8 @@ async def _fetch_series_coinbase(asset: str, client: httpx.AsyncClient,
 
 def _slice_trailing(series: dict[int, tuple[float, float]], end_min_s: int,
                     lookback_min: int = _LOOKBACK_MIN) -> tuple[list[float], list[float]]:
+    """The 90 candles ending at end_min_s (inclusive), oldest->newest, from the
+    prefetched series — mirrors the live 90-min fetch window."""
     closes, vols = [], []
     for t in range(end_min_s - lookback_min * 60, end_min_s + 1, 60):
         cv = series.get(t)
@@ -145,13 +187,16 @@ def _slice_trailing(series: dict[int, tuple[float, float]], end_min_s: int,
 
 async def backfill_bulk(env: str = "mainnet", since_days: int = 90,
                         concurrency: int = 4) -> dict:
+    """Bulk Coinbase backfill: fetch each coin's full 1-min history once, then
+    compute every pending (asset,minute) group locally. Orders-of-magnitude fewer
+    HTTP calls than the per-group path for a large historical dataset."""
     groups = _pending_groups(env, since_days, limit=10_000_000)
     if not groups:
         return {"groups": 0, "rowsUpdated": 0, "fetchErrors": 0, "noData": 0, "assets": 0}
 
     per_asset: dict[str, list[tuple[str, int]]] = {}
     for (asset, minute) in groups:
-        end_ms = _epoch_ms(minute + ":30")
+        end_ms = _last_closed_candle_ms(minute)
         if end_ms is None:
             continue
         per_asset.setdefault(asset, []).append((minute, end_ms))
@@ -173,7 +218,7 @@ async def backfill_bulk(env: str = "mainnet", since_days: int = 90,
                 errors += len(items)
                 return
         for minute, end_ms_i in items:
-            end_min_s = (end_ms_i // 1000 // 60) * 60
+            end_min_s = end_ms_i // 1000
             closes, vols = _slice_trailing(series, end_min_s)
             data = indicators.compute(closes, vols)
             sets = {col: data.get(k) for k, col in _KEY_TO_COL.items()}
@@ -197,6 +242,7 @@ async def backfill_bulk(env: str = "mainnet", since_days: int = 90,
 
 
 def _pending_groups(env: str, since_days: int, limit: int) -> dict[tuple[str, str], list[int]]:
+    """(asset, minute) -> [tick ids] for rows still missing the fields."""
     with dbmod.get_db() as conn:
         rows = conn.execute(
             """SELECT id, asset, observed_at FROM crypto15m_ticks
@@ -225,7 +271,7 @@ async def backfill(env: str = "mainnet", since_days: int = 90, limit: int = 500,
 
     async def fetch_group(client: httpx.AsyncClient, key: tuple[str, str]):
         asset, minute = key
-        end_ms = _epoch_ms(minute + ":30")
+        end_ms = _last_closed_candle_ms(minute)
         if end_ms is None:
             return ("skip", key)
         async with sem:

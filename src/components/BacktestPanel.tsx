@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { FlaskConical } from 'lucide-react';
+import { noDataHeadline } from '@shared/c15Presets';
 import type { Crypto15mBacktest } from '@shared/types';
 import { cls, fmtUsd } from '../utils/format';
 
@@ -43,18 +44,26 @@ export function BacktestPanel() {
         </button>
       </div>
       {err && <p className="mt-2 text-[11px] text-krypt-loss">{err}</p>}
-      {res && (
+      {res && res.windowsScanned === 0 && (
+        <div className="mt-3 rounded-lg bg-krypt-surface2/60 p-2.5">
+          <div className="text-xs font-semibold text-white">{noDataHeadline(res.noData)}</div>
+          {res.caveats?.[0] && (
+            <p className="mt-1 text-[11px] leading-relaxed text-krypt-dim">{res.caveats[0]}</p>
+          )}
+        </div>
+      )}
+      {res && res.windowsScanned > 0 && (
         <div className="mt-3">
           <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-5">
             <Stat label="Trades" value={`${res.n}`} sub={`${res.windowsScanned} windows scanned`} />
             <Stat label="Win rate" value={res.n ? `${(res.winRate * 100).toFixed(1)}%` : '—'} />
             <Stat
-              label="Edge / contract" value={`${res.netEvCentsPerContract.toFixed(2)}¢`}
-              tone={res.netEvCentsPerContract >= 0 ? 'good' : 'bad'}
+              label="Edge / contract" value={res.n ? `${res.netEvCentsPerContract.toFixed(2)}¢` : '—'}
+              tone={!res.n ? undefined : res.netEvCentsPerContract >= 0 ? 'good' : 'bad'}
             />
             <Stat
-              label={`Total @ ${res.contracts} lots`} value={fmtUsd(res.totalPnlUsd, { sign: true })}
-              tone={res.totalPnlUsd >= 0 ? 'good' : 'bad'}
+              label={`Total @ ${res.contracts} lots`} value={res.n ? fmtUsd(res.totalPnlUsd, { sign: true }) : '—'}
+              tone={!res.n ? undefined : res.totalPnlUsd >= 0 ? 'good' : 'bad'}
             />
             <Stat label="Max drawdown" value={fmtUsd(res.maxDrawdownUsd)} tone="bad" />
           </div>

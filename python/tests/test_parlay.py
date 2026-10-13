@@ -1,3 +1,6 @@
+"""Tests for the parlay per-hour schedule: the hour_override/resignal helpers,
+the live engine's kv-backed state + exit exemptions, the replay _simulate
+schedule gating, and the generator's qualify/rank logic."""
 from __future__ import annotations
 
 import json
@@ -26,6 +29,7 @@ def _cfg(**over):
     c["crypto15m_enabled"] = True
     c.update(over)
     return c
+
 
 
 def test_hour_override_no_schedule_returns_cfg_unchanged():
@@ -61,6 +65,7 @@ def test_resignal_asset_recomputes_signal_under_new_config():
     assert crypto15m.resignal_asset(a, deep)["signal"] is False
 
 
+
 def test_parlay_state_unarmed_and_armed(fresh_db):
     armed, sched = ct.parlay_state(force=True)
     assert armed is False and sched is None
@@ -74,6 +79,11 @@ def test_parlay_state_unarmed_and_armed(fresh_db):
 
 
 def test_empty_schedule_seats_nothing_and_cannot_be_armed(fresh_db):
+    """A zero-hour schedule is a NORMAL generator outcome (the win-rate bar
+    seats nothing on a short corpus). It must never read as armed: the engine
+    stamps every row it opens as strategy="parlay", which exempts them from all
+    four exit paths — an empty schedule falling through to the base config
+    meant real money traded with no stop-loss."""
     assert crypto15m.hour_override(_cfg(crypto15m_hour_configs={}), 7) is None
     c_absent = _cfg()
     assert crypto15m.hour_override(c_absent, 7) is c_absent
@@ -97,6 +107,7 @@ def test_parlay_state_armed_without_valid_schedule_is_disarmed(fresh_db):
     assert armed is False and sched is None
 
 
+
 def test_parlay_rows_exempt_from_stop_and_take_profit():
     pos = {"strategy": "parlay", "status": "filled", "filled_contracts": 5,
            "cost_usd": 4.9, "avg_entry_cents": 98.0}
@@ -111,7 +122,9 @@ def test_parlay_rows_exempt_from_stop_and_take_profit():
     assert ct.should_stop_loss(fav, 0.05, c) is True
 
 
+
 def _window(ticker, hour, up_won, *, up_prob=0.97, ask=0.97, macd=1.0):
+    """One resolved window whose single qualifying tick sits in `hour`."""
     return {
         ticker: [{
             "ticker": ticker, "asset": "BTC", "network": "mainnet",
@@ -148,6 +161,10 @@ def test_simulate_trades_seated_hour_and_skips_unseated():
 
 
 def test_simulate_empty_schedule_trades_nothing():
+    """An empty schedule seats no hours, so it must replay as ZERO trades. It
+    used to fall through to the base config, so the generator's own stitched
+    validation printed a healthy summary for a schedule that trades nothing —
+    which is exactly what talks an operator into arming it."""
     wins = {}
     wins.update(_window("W7", 7, 1))
     wins.update(_window("W8", 8, 1))
@@ -163,24 +180,73 @@ def test_simulate_no_schedule_unchanged_baseline():
     assert len(trades) == 1
 
 
+
 def _trades(spec):
+    """spec: list of (date, won, pnl)"""
     return [{"at": f"{d} 07:57:00", "won": w, "pnlUsd": p} for d, w, p in spec]
 
 
-def test_generator_qualifies_perfect_train_and_holdout():
+def test_generator_qualifies_perfect_train():
     tr = pg._stats(_trades([("2026-07-10", True, 0.02)] * 12))
-    ho = pg._stats(_trades([("2026-07-21", True, 0.02)] * 3))
-    assert pg._qualifies(tr, ho, 1.0, 10) is True
+    assert pg._qualifies(tr, 1.0, 10) is True
 
 
-def test_generator_rejects_thin_lossy_or_failed_holdout():
+def test_generator_rejects_thin_or_lossy_train():
     perfect12 = _trades([("2026-07-10", True, 0.02)] * 12)
-    assert not pg._qualifies(pg._stats(perfect12[:5]), pg._stats([]), 1.0, 10)
+    assert not pg._qualifies(pg._stats(perfect12[:5]), 1.0, 10)
     with_loss = pg._stats(perfect12 + _trades([("2026-07-11", False, -0.97)]))
-    assert not pg._qualifies(with_loss, pg._stats([]), 1.0, 10)
-    bad_holdout = pg._stats(_trades([("2026-07-21", False, -0.97)]))
-    assert not pg._qualifies(pg._stats(perfect12), bad_holdout, 1.0, 10)
-    assert pg._qualifies(pg._stats(perfect12), pg._stats([]), 1.0, 10)
+    assert not pg._qualifies(with_loss, 1.0, 10)
+
+
+
+def _dated_window(ticker, date, up_won):
+    w = _window(ticker, 7, up_won)
+    for t in w[ticker]:
+        t["observed_at"] = f"{date} 07:57:00"
+        t["sig_close"] = f"{date}T07:59:59Z"
+    return w
+
+
+def test_generator_seats_on_train_and_reports_the_holdout_untouched(monkeypatch):
+    wins = {}
+    for d in range(1, 13):
+        wins.update(_dated_window(f"T{d}", f"2026-09-{d:02d}", 1))
+    wins.update(_dated_window("H1", "2026-09-20", 0))
+    monkeypatch.setattr(pg.replay, "load_windows", lambda **_k: wins)
+    s = pg.generate(holdout_days=1, min_trades=10)
+    assert s["holdout_dates"] == ["2026-09-20"]
+    assert "7" in s["hour_configs"]
+    ho = s["hours"]["7"]["holdout"]
+    assert (ho["n"], ho["wins"]) == (1, 0)
+    assert s["validation"]["holdout"]["losses"] == 1
+    assert s["holdout_untouched"] is True
+
+
+def test_stale_schedules_are_flagged(fresh_db):
+    old = {"interval": "15m", "generated_at": "2026-08-01T00:00:00Z",
+           "hour_configs": {"7": {"crypto15m_entry_threshold": 0.97}}}
+    why = ct.parlay_stale_reason(old)
+    assert "2026-08-07" in why and "Regenerate" in why
+    assert "2026-08-14" in ct.parlay_stale_reason(
+        dict(old, interval="5m", generated_at="2026-08-10T00:00:00Z"))
+    assert "holdout" in ct.parlay_stale_reason(
+        dict(old, generated_at="2026-09-01T00:00:00Z"))
+    fresh = dict(old, generated_at="2026-10-11T00:00:00Z", holdout_untouched=True)
+    assert ct.parlay_stale_reason(fresh) is None
+    with db.get_db() as conn:
+        db.kv_set(conn, ct._PARLAY_KV_SCHEDULE, json.dumps(old))
+    import asyncio
+    st = asyncio.run(ct.status(_cfg()))
+    assert "2026-08-07" in st["parlay"]["staleReason"]
+
+
+def test_generator_notes_pre_twap_dates(monkeypatch):
+    wins = {}
+    for d in range(1, 13):
+        wins.update(_dated_window(f"T{d}", f"2026-08-{d:02d}", 1))
+    monkeypatch.setattr(pg.replay, "load_windows", lambda **_k: wins)
+    s = pg.generate(holdout_days=1, min_trades=5)
+    assert any("precede 2026-08-07" in n for n in s["notes"])
 
 
 def test_generator_split_by_holdout_dates():

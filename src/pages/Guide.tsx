@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Card, Page, Section } from '../components/common';
 import { POLYMARKET_REFERRAL_URL, KRYPT_YOUTUBE_GUIDE } from '../utils/links';
+import { GuideVideoButton } from '../components/GuideVideo';
 import { followYuhgo, X_PROFILE } from '../utils/share';
 
 export function GuidePage() {
@@ -31,9 +32,12 @@ export function GuidePage() {
               way to get up and running.
             </p>
           </div>
-          <button onClick={open(KRYPT_YOUTUBE_GUIDE)} className="krypt-btn-primary shrink-0">
-            <Youtube className="h-4 w-4" /> Watch on YouTube <ExternalLink className="h-3 w-3" />
-          </button>
+          <div className="flex shrink-0 gap-2">
+            <GuideVideoButton className="krypt-btn-primary" />
+            <button onClick={open(KRYPT_YOUTUBE_GUIDE)} className="krypt-btn-default">
+              <Youtube className="h-4 w-4" /> Watch on YouTube <ExternalLink className="h-3 w-3" />
+            </button>
+          </div>
         </div>
       </Card>
 
@@ -222,8 +226,8 @@ export function GuidePage() {
               title="Start small, then scale"
               body={
                 <>
-                  Paper mode covers orders you place by hand, not this engine
-                  &mdash; pressing{' '}
+                  In Paper this engine sends nothing &mdash; it is not simulated. Once the
+                  app is Live, pressing{' '}
                   <span className="text-white">Start this engine</span> on the{' '}
                   <span className="text-white">Main Engine</span> page sends real orders.
                   Begin with a small balance and low caps, watch a few scan cycles, then
@@ -249,9 +253,9 @@ export function GuidePage() {
           </div>
           <ol className="space-y-4 text-sm">
             <Step n={1} title="Paper trading (real markets, no money, no wallet)" body={
-              <>Turn on <span className="text-white">paper mode</span> in
-                Settings &rarr; Manual terminal and the order ticket simulates
-                instead of trading. Fills come out of the{' '}
+              <>The app starts on <span className="text-white">Paper</span>{' '}
+                (Settings &rarr; Account): the order ticket, your phone, standing
+                stops and AI agents simulate instead of trading. Fills come out of the{' '}
                 <span className="text-white">real order book</span> at the price
                 you would actually have walked &mdash; ask for 400 contracts at
                 99&cent; against a book whose best offer is 19&cent; and you get
@@ -272,7 +276,8 @@ export function GuidePage() {
               <>For a real-money smoke test, fund a{' '}
                 <span className="text-white">separate</span> wallet with a small amount of USDC you can
                 afford to lose, set a low <span className="text-white">hard max position</span> + daily
-                stop-loss, then press <span className="text-white">Start this engine</span> on the{' '}
+                stop-loss, go Live in Settings &rarr; Account, then press{' '}
+                <span className="text-white">Start this engine</span> on the{' '}
                 <span className="text-white">Main Engine</span> page. Judge results on
                 the <span className="text-white">History</span> page before scaling up.
               </>
@@ -386,7 +391,7 @@ export function GuidePage() {
             <Row
               icon={CheckCircle2}
               label="Today P&L"
-              body="Sum of realized P&L on positions resolved today (rolls over at midnight). Does not include unrealized swing on still-open bets."
+              body="Your total balance now minus your total at the first snapshot of the UTC day (rolls over at 00:00 UTC), with detected deposits and withdrawals taken out. Open positions count at their live marks, so it moves before anything settles. The daily stop-loss and take-profit read this same number."
             />
             <Row
               icon={Briefcase}
@@ -407,11 +412,12 @@ export function GuidePage() {
           <div className="mb-3 flex items-start gap-3 rounded-lg border border-krypt-warn/30 bg-krypt-warn/5 p-3">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-krypt-warn" />
             <div className="text-xs text-krypt-muted">
-              <span className="text-white">Today P&L can be negative while your balance climbs.</span>
-              {' '}Realized P&L only counts <span className="text-white">settled</span> bets.
-              If your open positions are appreciating, your total balance goes up
-              even though "Today P&L" reflects only the bets that already
-              resolved. That's normal — wait for settlement.
+              <span className="text-white">Today P&L moves with your open positions.</span>
+              {' '}It is a change in your balance, not a sum of <span className="text-white">settled</span> bets,
+              so a position marked down shows as a loss before it settles. A deposit or
+              withdrawal is taken out only when it is bigger than trading could explain
+              (roughly the cost of your open positions); a smaller one reads as a gain or
+              loss for the day, and the daily stop sees it too.
             </div>
           </div>
           <div className="text-sm text-krypt-muted">
@@ -659,8 +665,8 @@ export function GuidePage() {
               switch</span>, off by default, and it never turns on with the one
               above. Even on, every order is previewed, needs a fresh{' '}
               <span className="font-mono text-white">/confirm</span> within 90
-              seconds, obeys a per-order dollar cap, and still passes your
-              live-trading switch and paper mode. The realistic risk here is not a
+              seconds, obeys a per-order dollar cap, and in Paper trades the
+              paper book like every other order. The realistic risk here is not a
               hacker &mdash; it is an unlocked phone.
             </p>
           </div>
@@ -811,4 +817,4 @@ function FlowDiagram() {
       </defs>
     </svg>
   );
-}
+}

@@ -2,6 +2,9 @@ import { app } from 'electron';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { AppState, Profile, TraderConfig } from '../../shared/types';
+import { defaultAgent, DEFAULT_AGENT_ID } from '../../shared/agents';
+import { migrateConfig } from './legacy-settings';
+import { isPersonalKey } from './sanitize';
 
 const userDataDir = (): string => app.getPath('userData');
 
@@ -221,23 +224,37 @@ export const DEFAULT_CONFIG: TraderConfig = {
   terminalNotifications: true,
   aiEnabled: false,
   aiProvider: 'anthropic',
-  aiAnthropicModel: 'claude-opus-5',
-  aiOpenaiModel: '',
+  aiModel: 'claude-opus-5',
   aiWebSearch: false,
   remoteEnabled: false,
   remoteDiscordEnabled: false,
   remoteTelegramEnabled: false,
   remoteTradingEnabled: false,
   remoteMaxOrderUsd: 100,
-  terminalPaperMode: false,
+  accountMode: 'paper',
+  terminalPaperMode: true,
   terminalPaperBankrollUsd: 1000,
   mcpEnabled: false,
   mcpPort: 47615,
-  mcpLiveTradingEnabled: false,
+  mcpTradeMode: 'paper',
   mcpMaxOrderUsd: 25,
-  mcpDailyLimitUsd: 100,
+  mcpDailySpendUsd: 100,
+  mcpMaxPositions: 10,
+  mcpMinEdgeCents: 3,
+  mcpDailyLossUsd: 50,
+  mcpLiveApproval: true,
+  mcpAgents: [defaultAgent('paper')],
+  mcpAllowLiveSwitches: false,
   mcpScriptsEnabled: false,
   mcpPaperBankrollUsd: 1000,
+  mcpHttpEnabled: false,
+  autopilotEnabled: false,
+  autopilotIntervalMin: 60,
+  autopilotMaxRunsPerDay: 12,
+  autopilotDailyTokenBudget: 1_500_000,
+  autopilotMaxSteps: 15,
+  autopilotMission: '',
+  autopilotAgentId: DEFAULT_AGENT_ID,
   whaleActivityWs: true,
   dbCleanupInterval: 3600,
   crypto15mRulesNo: [],
@@ -263,6 +280,7 @@ export const DEFAULT_STATE: AppState = {
   acceptedDisclaimer: false,
   uiMode: 'simple',
   windowBounds: null,
+  onboardingSeen: 0,
 };
 
 let cached: AppState | null = null;
@@ -274,8 +292,15 @@ function ensureDir(): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
 }
 
-function mergeConfig(loaded: Partial<TraderConfig> | undefined): TraderConfig {
-  return { ...DEFAULT_CONFIG, ...(loaded || {}) };
+function mergeConfig(
+  loaded: Partial<TraderConfig> | undefined,
+  opts: { live?: boolean; existingUser?: boolean } = {},
+): TraderConfig {
+  return migrateConfig(loaded, DEFAULT_CONFIG, opts);
+}
+
+export function mergeConfigPublic(partial: Partial<TraderConfig>): TraderConfig {
+  return mergeConfig(partial);
 }
 
 export function mergeProfile(loaded: any): Profile | null {
@@ -301,7 +326,7 @@ function mergeState(loaded: any): AppState {
     ? loaded.customProfiles.map(mergeProfile).filter((p: Profile | null): p is Profile => p !== null)
     : [];
   return {
-    config: mergeConfig(loaded.config),
+    config: mergeConfig(loaded.config, { live: true, existingUser: !!loaded.acceptedDisclaimer }),
     activeProfileId: loaded.activeProfileId || null,
     activeCryptoProfileId: loaded.activeCryptoProfileId || null,
     activeCopyProfileId: loaded.activeCopyProfileId || null,
@@ -319,6 +344,8 @@ function mergeState(loaded: any): AppState {
           ? 'advanced'
           : 'simple',
     windowBounds: loaded.windowBounds || null,
+    onboardingSeen: Number.isInteger(loaded.onboardingSeen) && loaded.onboardingSeen > 0
+      ? Math.min(loaded.onboardingSeen, 1000) : 0,
   };
 }
 
@@ -410,7 +437,7 @@ export function get(): AppState {
 export function patchConfig(patch: Partial<TraderConfig>): AppState {
   const cur = get();
   vaultMirrorAllowed = true;
-  const next: AppState = { ...cur, config: { ...cur.config, ...patch } };
+  const next: AppState = { ...cur, config: mergeConfig({ ...cur.config, ...patch }) };
   return save(next);
 }
 
@@ -424,8 +451,11 @@ export function replaceConfig(config: TraderConfig): AppState {
 export function resetConfig(): AppState {
   const cur = get();
   vaultMirrorAllowed = true;
+  const keep = Object.fromEntries(
+    Object.entries(cur.config).filter(([k]) => isPersonalKey(k)),
+  ) as Partial<TraderConfig>;
   const next: AppState = {
-    ...cur, config: { ...DEFAULT_CONFIG },
+    ...cur, config: mergeConfig({ ...DEFAULT_CONFIG, ...keep }),
     activeProfileId: null, activeCryptoProfileId: null, activeCopyProfileId: null,
     activePerpsProfileId: null,
   };

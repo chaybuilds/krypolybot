@@ -1,3 +1,27 @@
+"""Coinbase WebSocket spot feed — the low-latency price source for the
+crypto up/down engine's settlement model.
+
+Polymarket's crypto up/down windows (5m / 15m / hourly) resolve on a
+point-in-time oracle price at window close vs the window open. The whole
+edge of the 'model' direction mode is that the CLOB quote LAGS live spot
+near close — so the model's spot input must be as fresh as possible. The
+REST spot chain (CryptoCompare → Coinbase → CoinGecko) mixes venues and its
+cache makes model inputs up to ~14s stale; this keyless public ticker
+stream delivers sub-second prices for the Coinbase-listed assets
+(BTC/ETH/SOL/XRP/DOGE; HYPE and BNB aren't listed and stay on REST).
+
+Also keeps a once-per-second sample ring per asset (window_partial): not
+needed for Polymarket's point-in-time resolution, but recorded so research
+can compare realized final-minute paths against outcomes — and it keeps
+this module drop-in compatible with the windowed-average model should a
+venue with average-based settlement ever need it.
+
+STRICT ACCELERATOR like clob_ws: every consumer falls back to the REST
+chain per-asset whenever the socket is down, an asset isn't covered, or a
+price is stale. Never MORE fragile than pure REST — only fresher.
+
+Opt out with KRYPT_SPOT_WS=0 (env) or the `crypto15m_spot_ws` config key.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,10 +36,10 @@ from typing import Optional
 logger = logging.getLogger("spot_ws")
 
 try:
-    import websockets
+    import websockets  # type: ignore
     _WS_IMPORT_OK = True
-except Exception:
-    websockets = None
+except Exception:  # pragma: no cover - websockets missing
+    websockets = None  # type: ignore
     _WS_IMPORT_OK = False
 
 _URL = os.environ.get("KRYPT_SPOT_WS_URL") or "wss://advanced-trade-ws.coinbase.com"
@@ -161,6 +185,10 @@ class _Client:
                     self.prices[asset] = (now, px)
 
     def _sample_once(self, now: Optional[float] = None) -> None:
+        """Append at most one (second, price) sample per asset per wall
+        second. Local wall clock: polybot's clock-offset sync already warns
+        loudly when the system clock is skewed, and window boundaries are
+        slug-derived wall-clock times."""
         if now is None:
             now = time.time()
         sec = int(now)
@@ -190,6 +218,8 @@ class _Client:
         return px
 
     def fresh_spots(self) -> dict[str, float]:
+        """Live prices fresh enough to trust, keyed by asset. Empty when the
+        socket is down/cold — callers then use the REST chain untouched."""
         if not self.connected:
             return {}
         now = time.time()
@@ -201,6 +231,9 @@ class _Client:
     def sample_at(
         self, asset: str, epoch_sec: float, tolerance_sec: float = 3.0,
     ) -> Optional[float]:
+        """The ring's price nearest `epoch_sec` (within tolerance), or None —
+        the fallback source for a window's true open when the RTDS ring has
+        no boundary print (see rtds_ws.sample_at)."""
         ring = self.samples.get((asset or "").upper())
         if not ring:
             return None
@@ -217,6 +250,9 @@ class _Client:
     def window_partial(
         self, asset: str, close_epoch: float, now: Optional[float] = None,
     ) -> tuple[float, int]:
+        """(sum, count) of the one-per-second prints observed so far inside a
+        window's final minute [close−60s, close). Research data on Polymarket
+        (resolution is point-in-time); (0, 0) when nothing observed."""
         ring = self.samples.get((asset or "").upper())
         if not ring:
             return 0.0, 0

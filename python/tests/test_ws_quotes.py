@@ -1,3 +1,17 @@
+"""Live-book (websocket) quotes on the order paths — the strict-accelerator
+contract.
+
+Both engines used to pay a REST quote immediately before `place_limit_order`:
+a cached market-meta lookup plus TWO CLOB /price round-trips, for a number
+`clob_ws.feed` already holds and stamped when we received it. These tests pin
+the contract that lets us skip it:
+
+  * a FRESH, two-sided, sentinel-free book is used and REST is not called;
+  * anything less — stale, one-sided, an empty-book sentinel, an unwarmed
+    market, the kill switch — falls back to the REST quote, unchanged;
+  * `warm_books` is what turns the order-path read into pure dict work (no
+    await, no network) by resolving the outcome token once.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +33,10 @@ def run_async(coro):
 
 @pytest.fixture(autouse=True)
 def _clean_feed(monkeypatch):
+    """A private feed + token map per test — the module singletons are process
+    wide and a leaked book would make another test's REST fallback disappear."""
     feed = clob_ws.ClobMarketFeed()
+    monkeypatch.setattr(feed, "start", lambda: None)
     monkeypatch.setattr(clob_ws, "feed", feed)
     monkeypatch.setattr(trader, "_ws_token", {}, raising=False)
     monkeypatch.setattr(trader, "_WS_QUOTES_OFF", False, raising=False)
@@ -35,10 +52,13 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _warm(token="TOK", ticker="T-A", side="yes"):
+    """Stand in for a completed `warm_books` pass."""
     trader._ws_token[(ticker, side)] = token
 
 
 def _rest_spy(monkeypatch, bid=10, ask=11):
+    """Count REST quotes. Returns a book deliberately unlike any ws book in
+    these tests, so the assertion says WHICH source priced the order."""
     calls = {"n": 0}
 
     async def _q(_ticker, _side):
@@ -48,6 +68,7 @@ def _rest_spy(monkeypatch, bid=10, ask=11):
     monkeypatch.setattr(polymarket_api, "get_quote", _q)
     monkeypatch.setattr(trader, "get_quote", _q, raising=False)
     return calls
+
 
 
 def test_ws_quote_cents_reads_the_warmed_token(_clean_feed):
@@ -114,6 +135,7 @@ def test_warm_books_survives_a_failing_meta(monkeypatch, _clean_feed):
     assert run_async(trader.warm_books([("T-A", "yes")])) == 0
 
 
+
 def test_main_engine_prices_off_the_feed_without_a_rest_quote(monkeypatch, _clean_feed):
     rest = _rest_spy(monkeypatch, bid=10, ask=11)
     _warm()
@@ -152,6 +174,8 @@ def test_main_engine_falls_back_to_rest_on_an_empty_book(monkeypatch, _clean_fee
 
 
 def test_feed_price_still_obeys_the_max_entry_cap(monkeypatch, _clean_feed):
+    """The websocket changes WHERE the number comes from, never which numbers
+    are allowed: the user's cap still bounds the order price."""
     _rest_spy(monkeypatch)
     _warm()
     _clean_feed._set("TOK", 0.80, 0.81)
@@ -160,6 +184,7 @@ def test_feed_price_still_obeys_the_max_entry_cap(monkeypatch, _clean_feed):
                 "cross_spread_fallback_offset": 2})
     px = run_async(trader._compute_limit_price_cents("T-A", "yes", 80, cfg))
     assert px == 81
+
 
 
 def _copy_cfg(**over):
@@ -221,6 +246,9 @@ def test_copy_entry_falls_back_to_rest_when_stale(fresh_db, monkeypatch, _clean_
 def test_copy_entry_band_still_applies_to_a_feed_price(
     fresh_db, monkeypatch, _clean_feed,
 ):
+    """Nothing enters on websocket data that would not have entered on REST
+    data — the band rejects an 81c live ask under a 60c cap exactly as it
+    rejects an 81c REST ask."""
     monkeypatch.setattr(trader, "get_env", lambda: "mainnet")
     _rest_spy(monkeypatch, bid=10, ask=11)
     place = _patch_place(monkeypatch)

@@ -1,3 +1,11 @@
+"""Gaps in the wipe, the sweep and the roll-ups.
+
+Every one of these is a figure or a limit that is WRONG rather than missing,
+which is the failure mode this codebase treats as the serious one: a "start my
+stats fresh" that leaves a track record behind, a per-script cap that stops
+counting rows it still holds, and a roll-up that counts simulated money as
+real. None of them raise, none of them look broken on screen.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -42,7 +50,11 @@ def _count_shadow() -> int:
         return c.execute("SELECT COUNT(*) FROM script_shadow_orders").fetchone()[0]
 
 
+
 def test_clear_trade_history_wipes_the_shadow_ledger(fresh_db):
+    """A script's shadow orders ARE a track record — the Scripts tab renders
+    them as W/L and P&L next to the live ones. Left behind by "start my stats
+    fresh", the page showed a record from before the reset."""
     with db.get_db() as c:
         _shadow(c, ticker="0xa")
     assert _count_shadow() == 1
@@ -58,6 +70,9 @@ def test_factory_reset_wipes_the_shadow_ledger(fresh_db):
 
 
 def test_a_wipe_stamps_a_reconcile_floor(fresh_db):
+    """The venue's trade history outlives the wipe, and the terminal's fill
+    walk has no cursor of its own — so without this floor the next reconcile
+    re-imports every historical fill stamped 'external', permanently."""
     with db.get_db() as c:
         assert db.terminal_reconcile_floor(c) is None
     db.clear_trade_history()
@@ -67,12 +82,18 @@ def test_a_wipe_stamps_a_reconcile_floor(fresh_db):
 
 
 def test_factory_reset_stamps_the_floor_after_wiping_app_kv(fresh_db):
+    """Ordering matters: factory_reset clears app_kv, so a floor written
+    before the delete would be the first thing destroyed."""
     db.factory_reset()
     with db.get_db() as c:
         assert db.terminal_reconcile_floor(c) is not None
 
 
+
 def test_cleanup_prunes_settled_shadow_orders_and_keeps_open_ones(fresh_db):
+    """Never swept at all before this: a script left in shadow mode grew the
+    table forever. Unresolved rows are KEPT — one still holds a slot in the
+    per-script open cap, so deleting it would silently free the cap."""
     old = (datetime.now(timezone.utc) - timedelta(days=90)).strftime(
         "%Y-%m-%d %H:%M:%S")
     with db.get_db() as c:
@@ -90,7 +111,13 @@ def test_cleanup_prunes_settled_shadow_orders_and_keeps_open_ones(fresh_db):
     assert left == {"0xopen", "0xrecent"}
 
 
+
 def test_an_old_row_that_can_still_settle_keeps_its_cap_slot(fresh_db):
+    """The two definitions disagreed: the cap aged a row out 7 days after it
+    was CREATED, while the settler retires one 7 days after it CLOSES. A
+    shadow order on a market three weeks out therefore stopped counting a
+    fortnight before it could possibly settle, and the per-script open cap
+    could be exceeded without limit."""
     future = (datetime.now(timezone.utc) + timedelta(days=21)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     old = (datetime.now(timezone.utc)
@@ -106,6 +133,9 @@ def test_an_old_row_that_can_still_settle_keeps_its_cap_slot(fresh_db):
 
 
 def test_a_row_the_settler_can_never_reach_still_ages_out(fresh_db):
+    """The other side of the same rule: a row with no close time at all is
+    invisible to the settler's backstop, so the cap has to age it out itself
+    or it holds a slot for the rest of time."""
     old = (datetime.now(timezone.utc)
            - timedelta(days=db.SHADOW_STALE_DAYS + 1)).strftime(
         "%Y-%m-%d %H:%M:%S")
@@ -115,6 +145,7 @@ def test_a_row_the_settler_can_never_reach_still_ages_out(fresh_db):
         c.execute("UPDATE script_shadow_orders SET created_at=? WHERE id=?",
                   (old, rid))
         assert db.count_open_script_shadow(c, "s1", ENV) == 0
+
 
 
 def _c15(conn, *, dry_run: int, pnl: float, ticker: str):
@@ -132,6 +163,9 @@ def _c15(conn, *, dry_run: int, pnl: float, ticker: str):
 
 
 def test_crypto15m_stats_ignores_dry_run_rows(fresh_db):
+    """Its two siblings (strategy stats, resolved history) both filter
+    dry_run; this one did not, so a simulated row counted as a real win and
+    real realized P&L — and this figure drives the take-profit kill-switch."""
     with db.get_db() as c:
         _c15(c, dry_run=0, pnl=-2.0, ticker="0xreal")
         _c15(c, dry_run=1, pnl=50.0, ticker="0xfake")
@@ -142,13 +176,18 @@ def test_crypto15m_stats_ignores_dry_run_rows(fresh_db):
 
 
 def test_the_loss_breaker_ignores_dry_run_rows(fresh_db):
+    """A SIMULATED win must not pay down a real drawdown (nor a simulated
+    loss trip a real breaker)."""
     with db.get_db() as c:
         _c15(c, dry_run=0, pnl=-30.0, ticker="0xreal")
         _c15(c, dry_run=1, pnl=1000.0, ticker="0xfake")
         assert db.lifetime_realized_pnl(c, "crypto15m", ENV) == -30.0
 
 
+
 def test_the_signals_whale_read_walks_an_index(fresh_db):
+    """service._h_signals reads whale_trades newest-first every poll. With no
+    index on created_at that is a full scan plus a temporary B-tree sort."""
     with db.get_db() as c:
         plan = " ".join(str(r[-1]) for r in c.execute(
             """EXPLAIN QUERY PLAN

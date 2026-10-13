@@ -112,7 +112,7 @@ export function PerpsPage() {
   }, []);
 
   const update = async (patch: Partial<TraderConfig>) => {
-    try { await window.krypt.config.update(patch); } catch {}
+    try { await window.krypt.config.update(patch); } catch { }
   };
 
   async function action(id: string, fn: () => Promise<{ ok: boolean; message: string }>) {
@@ -333,7 +333,7 @@ function LinkCard({ status, busy, onAction }: {
         <KV label="Fee tier" value={`${acct?.feeTier ?? 0}`} />
         <span className="text-krypt-dim">
           signer <span className="font-mono">{link.owner ? `${link.owner.slice(0, 6)}…${link.owner.slice(-4)}` : '—'}</span>
-          {exp && <> · key renews by {exp.toLocaleDateString()}</>}
+          {exp && <> · key expires {exp.toLocaleString()} (renewed automatically while the engine runs)</>}
         </span>
         <button
           disabled={busy !== null}
@@ -349,6 +349,12 @@ function LinkCard({ status, busy, onAction }: {
       {unfunded && (
         <div className="mt-2 text-[11px] text-krypt-warn">
           Your Perps balance is empty — deposit pUSD to Perps on polymarket.com before enabling the engine.
+        </div>
+      )}
+      {link.renewError && (
+        <div className="mt-2 text-[11px] text-krypt-warn">
+          Couldn't renew the Perps trading key: {link.renewError}. The engine retries every 10 minutes and pulls
+          its quotes 15 minutes before the key expires — unlink and link again to renew it yourself.
         </div>
       )}
     </div>
@@ -406,7 +412,7 @@ function StrategySettings({ config, uiMode, board }: {
   const [saveOpen, setSaveOpen] = useState(false);
   const toast = useToast();
   const update = async (patch: Partial<TraderConfig>) => {
-    try { await window.krypt.config.update(patch); } catch {}
+    try { await window.krypt.config.update(patch); } catch { }
   };
   const saveProfile = async (name: string): Promise<void> => {
     setSaveOpen(false);

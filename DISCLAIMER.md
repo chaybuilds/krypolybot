@@ -52,16 +52,27 @@ You are solely responsible for:
 
 ## Start small — the engines have no practice mode
 Polymarket is mainnet-only (real USDC) and there is no demo exchange, so **every
-engine places real orders with real money the moment you enable it**. All engines
+engine places real orders with real money the moment it is enabled while the app is
+Live**. All engines
 ship **OFF by default**. Before turning any engine on, understand exactly what it
 does, and begin with a small amount you can afford to lose entirely.
 
-The app does include a **paper mode for the manual terminal**: orders you place by
-hand from a market page can be simulated instead, with fills walked out of the real
-order book and no wallet required. **It covers hand-placed orders only.** The whale,
-momentum, crypto, copy-trading and script engines always trade for real when enabled
-— do not assume paper mode protects you from them. (User scripts have their own
+The app has one **Paper | Live** account mode, and a new install starts on Paper.
+In Paper, orders you place by hand, from the phone, by standing stops and by AI
+agents are simulated, with fills walked out of the real order book and no wallet
+required. **The engines are not simulated.** In Paper the whale, momentum, crypto,
+copy-trading, Perps and live-script engines send nothing; once the app is Live, each
+one you have switched on trades for real. Do not mistake an engine that waited
+quietly in Paper for one that has been tested. (User scripts have their own
 separate *shadow mode*, which is a paper mode in all but name.)
+
+## AI agents trade on your behalf
+If you connect an AI agent or switch on Autopilot, **every order it places is an
+order you placed.** Language models are often wrong, can be confidently wrong, and
+can be talked into things by text they read. The app enforces caps, a daily loss
+stop, approvals and other rules in its backend, but those limit the damage; they do
+not make an agent's decisions good. No model has a proven edge. Keep agents on
+paper until their scored record says otherwise, and keep live caps small.
 
 ## No usage data leaves your machine
 Krypt PolyBot sends **no** usage data, telemetry or statistics anywhere. Earlier
@@ -69,9 +80,12 @@ versions posted anonymous profit/loss figures to a community leaderboard; that
 has been **removed entirely**, along with the optional Discord webhooks.
 
 The app talks to Polymarket (and Kalshi, for read-only price comparison), and to
-nobody else — unless you switch on the optional Discord/Telegram remote-control
-bots yourself, which necessarily send what you ask them for to that chat
-platform. Every outbound host is listed with live call counts in
+nobody else — unless you switch on one of these yourself: the optional
+Discord/Telegram remote-control bots, which necessarily send what you ask them for
+to that chat platform; AI analysis or Autopilot, which send market text (and, for
+Autopilot, whatever its agent reads) to the AI provider you chose; or an AI agent
+client, which sends whatever the agent reads, including your positions and balance,
+to that client's provider. Every outbound host is listed with live call counts in
 **Settings → Data & privacy**, with one switch that turns market data off.
 
 ## Affiliate disclosure

@@ -1,3 +1,26 @@
+"""Terminal — Act and Track.
+
+This is the half that spends money, so it is written to a different standard
+than the read side.
+
+WHO DECIDES. The app never decides to act. Every order that leaves this module
+traces to something the user did: a click, or an instruction they WROTE DOWN
+(a stop loss, a take profit) that fires later. A standing instruction is gated
+identically to a manual click, and every pending one is listed on one page and
+cancellable there. No score, signal or strategy in this codebase can reach
+``place()``.
+
+COST BASIS. What a fill actually cost is NOT what we asked for. The requested
+price ignores tick-snapping, partial fills and taker fees — every one of which
+makes the naive number wrong IN THE USER'S FAVOUR, on every single row. So a
+fill is reconciled against the venue's own trades ledger, and a fill that
+cannot be reconciled is stored ``unreconciled``, EXCLUDED from every aggregate
+figure, and counted in a warning strip. Never guessed at.
+
+Convention: AVERAGE COST, not FIFO — what a trader means by "I am up 2x on
+this". The UI says so, so nobody has to guess.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,18 +42,20 @@ logger = logging.getLogger("krypt.terminal.trade")
 
 MAX_MANUAL_CONTRACTS = 5000
 MAX_MANUAL_USD = 5000.0
+MIN_MARKETABLE_BUY_USD = 1.0
 CONFIRM_TOLERANCE_USD = 0.51
 MAX_STANDING_FAILURES = 3
 
 
 class TerminalTradeError(Exception):
-    pass
+    """A refusal the user should read verbatim."""
 
 
 _bg_tasks: set[asyncio.Task] = set()
 
 
 def _spawn(coro) -> Optional[asyncio.Task]:
+    """Fire-and-forget, but keep the reference until it finishes."""
     try:
         t = asyncio.ensure_future(coro)
     except RuntimeError:
@@ -53,8 +78,16 @@ def _conn():
     return db.get_db()
 
 
+
 def _fee_per_share(price_cents: float, category: Optional[str],
                    schedule: Optional[dict]) -> Optional[float]:
+    """Taker fee per share, in dollars, on the fee-v2 curve.
+
+    A market's own Gamma ``feeSchedule`` beats the category table. Returns
+    None when we have neither — an unknown fee is NOT a zero fee, and quoting
+    a cost that silently omits it is exactly the "wrong in the user's favour"
+    failure this module exists to prevent.
+    """
     p = max(0.0, min(1.0, float(price_cents) / 100.0))
     if isinstance(schedule, dict):
         if schedule.get("enabled") is False:
@@ -70,7 +103,8 @@ def _fee_per_share(price_cents: float, category: Optional[str],
         return None
     try:
         import backtest
-        rate = backtest.CATEGORY_TAKER_FEE.get(str(category).strip().lower())
+        cat = backtest.fee_category(category)
+        rate = backtest.CATEGORY_TAKER_FEE[cat] if cat else None
     except Exception:
         return None
     if rate is None:
@@ -78,8 +112,15 @@ def _fee_per_share(price_cents: float, category: Optional[str],
     return rate * p * (1.0 - p)
 
 
+
 def _walk_book(levels: list[dict], want: float,
                limit_cents: float, is_buy: bool) -> tuple[Optional[float], Optional[float]]:
+    """Walk resting levels up to `limit_cents` → (fillable_size, avg_cents).
+
+    Returns (None, None) when there is no book to walk — an unknown fill is
+    not a zero fill, and a ticket that shows "0 available" on a book it could
+    not read is telling the user something false about the market.
+    """
     if not levels:
         return None, None
     filled = 0.0
@@ -106,23 +147,41 @@ def _walk_book(levels: list[dict], want: float,
 
 
 async def _available_cash_usd(paper: bool) -> Optional[float]:
+    """What this account can actually spend, or None when we do not know.
+
+    None is not zero and must never be rendered as a balance. The live figure
+    is the SAME cached wallet read the header shows (`trader.refresh_balance`
+    fills it on the status poll), read out of the cache rather than forced, so
+    a ticket keystroke never triggers a chain of RPC calls. A cache entry
+    whose last read FAILED carries a stale number under `ok: False`; that is
+    reported as unknown, because a blocker built on a stale balance would
+    refuse an order the wallet can afford.
+
+    Paper cash is net of what the account's resting buys would still spend.
+    A resting order is not a position, but it is a claim on the cash: without
+    this, three resting buys that each fit the balance were all accepted, all
+    filled, and left the account at minus a thousand dollars.
+    """
     if paper:
         try:
             import terminal_paper
             import service
             pf = await terminal_paper.portfolio(dict(service.STATE.cfg or {}))
-        except Exception:
+            reserved = terminal_paper.reserved_buy_usd()
+        except Exception:  # noqa: BLE001 — no service (tests, CLI)
             return None
-        return num((pf or {}).get("cashUsd"))
+        cash = num((pf or {}).get("cashUsd"))
+        return None if cash is None else round(cash - reserved, 2)
     try:
         import trader
         entry = trader._balance_cache.get(auth.get_env())
-    except Exception:
+    except Exception:  # noqa: BLE001 — no trader module (tests, CLI)
         return None
     if not entry or not entry.get("ok"):
         return None
     c = num(entry.get("cents"))
     return None if c is None else round(c / 100.0, 2)
+
 
 
 def _usd(v: Optional[float]) -> Optional[str]:
@@ -133,6 +192,7 @@ _DOLLARS_RE = re.compile(r"\$\s*([0-9]+(?:\.[0-9]+)?)")
 
 
 def _amount_in(raw: str) -> Optional[float]:
+    """The dollar figure the venue quoted back, when it quoted one."""
     m = _DOLLARS_RE.search(raw or "")
     return float(m.group(1)) if m else None
 
@@ -140,7 +200,18 @@ def _amount_in(raw: str) -> Optional[float]:
 def translate_venue_error(raw: str, *, action: str,
                           cost_usd: Optional[float] = None,
                           balance_usd: Optional[float] = None) -> Optional[str]:
+    """One CLOB rejection → one plain sentence, or None to keep the raw text.
+
+    Never invents a number: every figure below is one we independently know
+    (the preview's cost, the cached balance) or one the venue itself quoted.
+    """
     low = (raw or "").lower()
+
+    if "restricted in your region" in low or "geoblock" in low:
+        return (
+            "Polymarket refused this order: trading is restricted from your "
+            "current region or connection. Nothing was placed. Orders will keep "
+            "being refused until you trade from a permitted location.")
 
     if "balance" in low and ("not enough" in low or "allowance" in low):
         if action == "sell":
@@ -171,6 +242,12 @@ def translate_venue_error(raw: str, *, action: str,
 
 
 async def preview(req: dict) -> dict:
+    """Everything the user should know BEFORE the money leaves.
+
+    Deliberately verbose. A terminal that shows a price without saying whether
+    it came from the live book or a cached index is asking for trust, and
+    trust is exactly what we are trying not to require.
+    """
     cid = str(req.get("conditionId") or "").strip()
     side = "no" if str(req.get("side") or "yes").lower() == "no" else "yes"
     action = "sell" if str(req.get("action") or "buy").lower() == "sell" else "buy"
@@ -286,6 +363,15 @@ async def preview(req: dict) -> dict:
             f"{bk.get('note') or 'the venue did not answer'}. The order is "
             "still valid; you are just sending it blind.")
 
+    marketable = order_type in ("FAK", "FOK") or out.get("crossesNow") is True
+    if action == "buy" and marketable and snapped > 0:
+        notional = req_size * snapped / 100.0
+        if notional < MIN_MARKETABLE_BUY_USD - 1e-9:
+            need = math.ceil(MIN_MARKETABLE_BUY_USD / (snapped / 100.0) - 1e-9)
+            out["blockers"].append(
+                f"Polymarket's minimum for a marketable buy is $1.00; this order is "
+                f"{_usd(notional)}. Buy at least {need:g} contracts at {snapped:g}¢.")
+
     fillable = out["fillableSize"]
     avg = out["estimatedAvgCents"]
     if fillable is None:
@@ -362,10 +448,13 @@ async def preview(req: dict) -> dict:
                 "checks whether you can afford this order. The exchange will.")
         elif cost is not None and cost > avail + 1e-9:
             out["blockers"].append(
-                f"{'Your paper account holds' if paper else 'Your wallet holds'} "
-                f"${avail:,.2f} of USDC; this order costs ${cost:,.2f}.")
+                (f"Your paper account has ${avail:,.2f} not already held by "
+                 f"resting buys; this order costs ${cost:,.2f}.") if paper else
+                (f"Your wallet holds ${avail:,.2f} of USDC; this order costs "
+                 f"${cost:,.2f}."))
 
     return out
+
 
 
 def _record_order(row: dict) -> int:
@@ -388,12 +477,61 @@ def _record_order(row: dict) -> int:
 
 
 def _paper_mode_on() -> bool:
+    """Is the terminal's PAPER switch on right now?
+
+    Read from the live config rather than passed in, so every caller of
+    `place()` inherits the check — the standing-instruction tick and the chat
+    bots call it directly and used to bypass the RPC handler's paper gate.
+    Asked through account_live, which also reads account_mode: before the
+    first setConfig the config is the raw default, where only account_mode
+    says Paper. Lazy import: service imports this module lazily too."""
     try:
         import service
         cfg = service.STATE.cfg or {}
-    except Exception:
+    except Exception:  # noqa: BLE001 — no service (tests, CLI) means no paper
         return False
-    return bool(cfg.get("terminal_paper_mode") or cfg.get("terminalPaperMode"))
+    from config import account_live
+    return not account_live(cfg) or bool(cfg.get("terminalPaperMode"))
+
+
+def _definite_refusal(e: BaseException) -> bool:
+    """True when a failed send PROVABLY placed nothing.
+
+    `place()` used to file every non-ambiguous failure under 'error', which
+    the agent rails read as "may have reached the venue" — so a geoblocked
+    user's refused buys held their spend cap and position slots forever. These
+    cases cannot have placed an order:
+
+      * a `ValueError` from the order builder — raised before anything is
+        signed or sent (bad side/price/size/type);
+      * a 4xx `PolymarketAPIError` — the CLOB's own definitive "no": region
+        403, insufficient balance/allowance, minimum size, invalid tick, the
+        engine-restart 425, plus the local pre-send refusals the API module
+        raises with a 4xx status (no market meta, EOA maker, unsupported
+        protocol version);
+      * the post-restart post-only refusal;
+      * a connection that was never established (refused/connect-timeout/
+        pool-timeout), which `polymarket_api._post_outcome_ambiguous` also
+        classes as "never sent".
+
+    Everything else (a read timeout, a dropped reply, a 5xx, anything
+    unexpected) stays ambiguous: the order may be on the book.
+    """
+    if isinstance(e, api.OrderStatusUnknownError):
+        return False
+    if isinstance(e, ValueError):
+        return not isinstance(e, (json.JSONDecodeError, UnicodeError))
+    if isinstance(e, api.PostOnlyModeError):
+        return True
+    if isinstance(e, api.PolymarketAPIError):
+        st = int(getattr(e, "status", 0) or 0)
+        return 400 <= st < 500 and st != 408
+    try:
+        import httpx
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout,
+                          httpx.PoolTimeout))
 
 
 def _refused(message: str) -> dict:
@@ -406,7 +544,19 @@ def _refused(message: str) -> dict:
 _MATCHED_KEYS = ("size_matched", "sizeMatched", "matched_size", "filled_size")
 
 
-def _matched_size(resp: Optional[dict]) -> Optional[float]:
+def _matched_size(resp: Optional[dict], action: Optional[str] = None,
+                  size: Optional[float] = None,
+                  limit_cents: Optional[float] = None) -> Optional[float]:
+    """How many contracts the venue says crossed, or None when it did not say.
+
+    Only SHARE counts are trusted. `makingAmount` on a buy is collateral, not
+    contracts, and reading it as a size would report a fill that never
+    happened — the exact class of mistake this module exists to avoid. The
+    placement reply's amounts are read only by direction, given the order's
+    `action` and `size`: a buy TAKES shares (`takingAmount`), a sell MAKES
+    (gives) them (`makingAmount`). No field means unknown, and unknown is
+    not zero.
+    """
     raw = (resp or {}).get("raw")
     for src in (raw, resp):
         if not isinstance(src, dict):
@@ -415,11 +565,29 @@ def _matched_size(resp: Optional[dict]) -> Optional[float]:
             v = num(src.get(k))
             if v is not None:
                 return v
+    act = str(action or "").lower()
+    if act not in ("buy", "sell") or not size or not isinstance(raw, dict):
+        return None
+    v = num(raw.get("takingAmount" if act == "buy" else "makingAmount"))
+    if v is None or v <= 0:
+        return None
+    cap = float(size)
+    if act == "buy" and limit_cents and limit_cents > 0:
+        cap = float(size) * float(limit_cents) / 0.1
+    for shares in (v, v / 1e6):
+        if shares <= cap * (1 + 1e-9):
+            return shares
     return None
 
 
 async def place(req: dict, *, origin: str = "manual",
                 standing_id: Optional[str] = None) -> dict:
+    """Send one hand-placed order.
+
+    Every gate here runs in the MAIN backend process, never only in the UI.
+    A renderer that lies about `confirmUsd` gets refused, because the number
+    is recomputed from the same book the preview used.
+    """
     if _paper_mode_on():
         return _refused(
             "Paper mode is on, so no real order was sent. Turn it off in "
@@ -455,7 +623,7 @@ async def place(req: dict, *, origin: str = "manual",
     action = pv["action"]
     order_type = str(req.get("orderType") or "GTC").upper()
     size = int(round(pv["size"]))
-    price_cents = int(round(pv["priceCents"]))
+    price_cents = round(float(pv["priceCents"]), 4)
 
     summary = await term.market(cid)
     title = (summary or {}).get("title") or ""
@@ -475,16 +643,42 @@ async def place(req: dict, *, origin: str = "manual",
             price_cents=price_cents, order_type=order_type,
             client_order_id=f"term_{uuid.uuid4().hex[:12]}",
         )
-    except Exception as e:
-        local = _record_order({**base, "order_id": None, "status": "error",
+    except api.OrderStatusUnknownError as e:
+        local = _record_order({**base, "order_id": e.order_id, "status": "unknown",
+                               "error": str(e)})
+        _spawn(_reconcile_soon(e.order_id))
+        return {
+            "ok": False, "orderId": e.order_id, "status": "unknown",
+            "filledSize": None, "avgPriceCents": None, "localId": local,
+            "message": (
+                f"Polymarket did not confirm this order and it could not be found "
+                f"yet (order {e.order_id[:10]}…). It may be resting, filled, or "
+                f"never have arrived. Check your resting orders and Track before "
+                f"sending it again."),
+        }
+    except Exception as e:  # noqa: BLE001 — every failure must leave a row
+        rejected = _definite_refusal(e)
+        st = "rejected" if rejected else "error"
+        local = _record_order({**base, "order_id": None, "status": st,
                                "error": f"{type(e).__name__}: {e}"})
         plain = translate_venue_error(
             str(e), action=action, cost_usd=pv.get("costUsd"),
             balance_usd=pv.get("availableUsd"))
+        if not rejected:
+            return {
+                "ok": False, "orderId": None, "status": "error", "filledSize": None,
+                "avgPriceCents": None, "localId": local,
+                "message": plain or str(e),
+            }
+        http = int(getattr(e, "status", 0) or 0) if isinstance(
+            e, api.PolymarketAPIError) else None
         return {
-            "ok": False, "orderId": None, "status": "error", "filledSize": None,
+            "ok": False, "orderId": None, "status": "rejected",
+            "filledSize": 0.0,
             "avgPriceCents": None, "localId": local,
             "message": plain or str(e),
+            "httpStatus": http or None,
+            "geoblocked": "restricted in your region" in str(e).lower(),
         }
 
     order = (resp or {}).get("order") or {}
@@ -507,39 +701,45 @@ async def place(req: dict, *, origin: str = "manual",
 
     _spawn(_reconcile_soon(oid))
 
-    matched = _matched_size(resp)
+    matched = _matched_size(resp, action, size, price_cents)
     status_l = status.lower()
     ref = pv.get("bestAskCents") if action == "buy" else pv.get("bestBidCents")
     ref_label = "ask" if action == "buy" else "bid"
 
-    if order_type == "GTC" and status_l not in ("matched",) and not matched:
+    if status_l == "delayed" and not matched:
+        msg = (
+            f"Crossing at {price_cents:g}¢ — this market has a short matching "
+            f"delay, so the fill is not confirmed yet. It is not a position "
+            f"until it fills; fill details appear once it reconciles against "
+            f"Polymarket's own ledger.")
+    elif order_type == "GTC" and status_l not in ("matched",) and not matched:
         if ref is not None:
             msg = (
-                f"Resting at {price_cents}¢ — the best {ref_label} is {ref:g}¢, "
+                f"Resting at {price_cents:g}¢ — the best {ref_label} is {ref:g}¢, "
                 f"so nothing has filled. It is not a position until it fills; "
                 f"cancel or reprice from the panel below.")
         else:
             msg = (
-                f"Resting at {price_cents}¢ — we could not read the touch, so "
+                f"Resting at {price_cents:g}¢ — we could not read the touch, so "
                 f"whether anything crossed is unknown. It is not a position "
                 f"until it fills; cancel or reprice from the panel below.")
     elif matched is not None and 0 < matched < size:
         rest = round(size - matched, 4)
         if order_type == "GTC":
             msg = (
-                f"Filled {matched:g} of {size} at {price_cents}¢; the "
-                f"remaining {rest:g} is RESTING at {price_cents}¢ and is not a "
+                f"Filled {matched:g} of {size} at {price_cents:g}¢; the "
+                f"remaining {rest:g} is RESTING at {price_cents:g}¢ and is not a "
                 f"position until it fills — cancel or reprice it from the "
                 f"panel below.")
         else:
             msg = (
-                f"Filled {matched:g} of {size} at {price_cents}¢ or better; the "
+                f"Filled {matched:g} of {size} at {price_cents:g}¢ or better; the "
                 f"remaining {rest:g} was killed, not rested — that is what "
                 f"fill-and-kill means. Fill details appear once it reconciles "
                 f"against Polymarket's own ledger.")
     else:
         msg = (
-            f"Order sent: {action} {size} {side.upper()} at {price_cents}¢ "
+            f"Order sent: {action} {size} {side.upper()} at {price_cents:g}¢ "
             f"({order_type}). Fill details appear once it reconciles against "
             f"Polymarket's own ledger.")
 
@@ -551,10 +751,11 @@ async def place(req: dict, *, origin: str = "manual",
 
 
 async def _reconcile_soon(order_id: Optional[str]) -> None:
+    """Give the venue a moment to book the trade, then pull the real numbers."""
     await asyncio.sleep(3.0)
     try:
         await reconcile_fills()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("terminal reconcile after %s failed: %s", order_id, e)
 
 
@@ -563,20 +764,48 @@ async def cancel(order_id: str) -> dict:
     if not oid:
         return {"ok": False, "message": "No order id."}
     try:
-        await api.cancel_order(oid)
-    except Exception as e:
+        resp = await api.cancel_order(oid)
+    except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"Cancel failed: {e}"}
+    resp = resp if isinstance(resp, dict) else {}
+    done = {str(x).lower() for x in (resp.get("canceled") or [])}
+    if oid.lower() not in done:
+        nc = resp.get("not_canceled")
+        why = next((str(v) for k, v in (nc.items() if isinstance(nc, dict) else ())
+                    if str(k).lower() == oid.lower()), "") or "not acknowledged"
+        return {"ok": False, "notCanceled": why,
+                "message": (f"Polymarket did not cancel order {oid[:10]}… "
+                            f"({why}). If it filled, the fill shows on Track.")}
     with _conn() as conn:
         conn.execute(
-            "UPDATE terminal_orders SET status='canceled' WHERE order_id=?",
-            (oid,))
+            "UPDATE terminal_orders SET status='canceled' "
+            "WHERE order_id=? AND COALESCE(status,'') != 'filled'", (oid,))
+    try:
+        import mcp_rails
+        await mcp_rails.note_cancelled(oid)
+    except Exception as e:  # noqa: BLE001 — the row keeps counting in full
+        logger.debug("terminal cancel: agent bookkeeping for %s failed: %s", oid, e)
     return {"ok": True, "message": f"Canceled order {oid[:10]}…"}
 
 
 async def resting_orders(condition_id: Optional[str] = None) -> dict:
+    """Live resting orders, from the venue — tagged with WHO placed each one.
+
+    A terminal must never blur what you did with what an engine did, so an
+    order id we have no local row for is reported as 'external', not silently
+    absorbed into your manual trades.
+
+    `condition_id` narrows the list to one market AND turns on the touch read:
+    each row gains `bestTouchCents`, the price this order would have to reach
+    to fill (a buy needs the best ask, a sell the best bid). That is what
+    turns "resting at 14¢" into "resting at 14¢, the ask is 15¢" — the
+    sentence that tells the user why nothing has happened. It costs one book
+    read per outcome side, which is why it is only done for the one market the
+    user is looking at and never on the Track-wide list.
+    """
     try:
         data = await api._authed_request("GET", "/data/orders")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"orders": [], "fetchedAt": _now_iso(),
                 "note": f"Could not read your open orders: {e}"}
 
@@ -633,7 +862,7 @@ async def resting_orders(condition_id: Optional[str] = None) -> dict:
         for s in {r["side"] for r in out}:
             try:
                 books[s] = await term.book(want, s)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — a missing touch is None
                 logger.debug("resting-order touch read failed (%s): %s", s, e)
         for r in out:
             bk = books.get(r["side"]) or {}
@@ -648,7 +877,29 @@ async def resting_orders(condition_id: Optional[str] = None) -> dict:
                 else "No resting orders.")}
 
 
+
 async def _flatten_positions() -> tuple[list[tuple[str, str, float]], int, int]:
+    """(OPEN sellable positions, how many held nothing, how many had settled).
+
+    Read the way `portfolio()` reads — `strict=True`, so a failed wallet read
+    RAISES rather than coming back as an empty wallet. "You hold nothing" and
+    "we could not tell" must never be the same answer to a function whose next
+    step is selling.
+
+    SETTLED POSITIONS ARE NOT SELLABLE, and this is where that has to be
+    decided — before any book read, not after one fails. A resolved market is
+    closed on the CLOB: there is no book, so every one of them came back
+    "Could not read the order book", which is a true sentence about the wrong
+    question. A resolved loser is worth exactly $0 and a resolved winner is
+    REDEEMED on chain, not sold. So they are dropped here and reported as one
+    count with one sentence, rather than as 105 identical refusals.
+
+    Settlement is read exactly the way `portfolio()` reads it — the market's
+    `resolvedOutcome` from the same Gamma summary — so the two screens can
+    never disagree about which positions are still live. A lookup that fails
+    leaves the position OPEN (unknown is not settled), and the book read then
+    refuses it honestly, one row at a time.
+    """
     rows = await api.get_positions(strict=True)
     held: list[tuple[str, str, float]] = []
     empty = 0
@@ -672,7 +923,7 @@ async def _flatten_positions() -> tuple[list[tuple[str, str, float]], int, int]:
             resolved[str(m.get("conditionId") or "")] = r
             if r in ("yes", "no"):
                 _resolution_remember(str(m.get("conditionId") or ""), str(r))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — unknown, which means "still open"
         logger.debug("flatten: resolution lookup failed: %s", e)
 
     out = [t for t in held if resolved.get(t[0]) is None]
@@ -680,6 +931,14 @@ async def _flatten_positions() -> tuple[list[tuple[str, str, float]], int, int]:
 
 
 def _engine_tracked_markets() -> Optional[set[str]]:
+    """Condition ids some ENGINE still has an open row for.
+
+    Read-only, and best-effort: `None` means we could not tell, which is
+    reported as unknown rather than as zero. Selling one of these from here is
+    fine — each engine's wallet reconcile books an externally-closed position
+    as `sold` — but the user should be told it happened, because it is the one
+    case where this button reaches past the terminal's own trades.
+    """
     try:
         import db
         keys: set[str] = set()
@@ -690,13 +949,20 @@ def _engine_tracked_markets() -> Optional[set[str]]:
                 keys.add(str(r.get("ticker") or ""))
         keys.discard("")
         return keys
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("flatten: engine position read failed: %s", e)
         return None
 
 
 async def _flatten_quote(cid: str, side: str,
                          size: float) -> tuple[Optional[dict], Optional[dict], Optional[str]]:
+    """Price one exit → (request, preview, refusal).
+
+    A refusal is a REASON, and the caller surfaces it verbatim. The order is a
+    marketable FAK at the current best bid: a limit above the bid rests (and a
+    resting exit is not an exit), and the walked average from the preview is
+    what the confirmation gate in `place()` then re-checks.
+    """
     bk = await term.book(cid, side)
     if not bk.get("available"):
         why = str(bk.get("note") or "the venue did not answer").strip().rstrip(".")
@@ -728,6 +994,7 @@ async def _flatten_quote(cid: str, side: str,
 
 
 def _flatten_partial_note(pv: Optional[dict]) -> Optional[str]:
+    """The one preview warning that changes what the user still holds."""
     for w in ((pv or {}).get("warnings") or []):
         if "are available at" in w:
             return w
@@ -735,6 +1002,12 @@ def _flatten_partial_note(pv: Optional[dict]) -> Optional[str]:
 
 
 async def flatten_preview() -> dict:
+    """What `flatten_wallet` would sell, and roughly for how much.
+
+    Read-only — it prices, it does not send. Every figure is an ESTIMATE off a
+    book that is already a moment old, and it says so; an unknown one is null
+    so the caller prints an em dash rather than a confident number.
+    """
     out: dict = {
         "ok": False, "positions": [], "count": 0, "skipped": 0,
         "settledSkipped": 0,
@@ -743,7 +1016,7 @@ async def flatten_preview() -> dict:
     }
     try:
         targets, empty, settled = await _flatten_positions()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         out["message"] = (
             f"Could not read your positions ({type(e).__name__}: {e}), so "
             f"there is nothing to show. Nothing has been sold.")
@@ -760,7 +1033,7 @@ async def flatten_preview() -> dict:
     for cid, side, size in targets:
         try:
             _req, pv, refusal = await _flatten_quote(cid, side, size)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             pv, refusal = None, (
                 f"Could not price this market ({type(e).__name__}: {e}).")
         row = {
@@ -816,6 +1089,21 @@ async def flatten_preview() -> dict:
 
 async def flatten_wallet(*, allow_trading: bool = True, origin: str = "manual",
                          reason: str = "flatten") -> dict:
+    """Sell every open position in the wallet, one at a time.
+
+    Counts: ``attempted`` is how many exits were sent or refused by us,
+    ``sold`` and ``refused`` split those two ways (a venue rejection, and a
+    fill-and-kill that crossed nothing, count as refused — the position is
+    still open either way, which is the only thing
+    the user cares about), and ``skipped`` is rows that held nothing to begin
+    with. ``proceedsUsd`` is the ESTIMATE from the previews, null when any
+    accepted sell could not be priced — the real number arrives when the fills
+    reconcile against Polymarket's own ledger.
+
+    Serialised deliberately. There is no burst to be gained: the CLOB rate
+    limits us anyway, and firing twenty signed sells at once turns one bad
+    read into twenty.
+    """
     base: dict = {
         "ok": False, "attempted": 0, "sold": 0, "refused": 0, "skipped": 0,
         "settledSkipped": 0,
@@ -835,7 +1123,7 @@ async def flatten_wallet(*, allow_trading: bool = True, origin: str = "manual",
 
     try:
         targets, empty, settled = await _flatten_positions()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {**base, "message": (
             f"Could not read your positions ({type(e).__name__}: {e}), so "
             f"NOTHING was sold. Selling against a wallet we cannot read is "
@@ -861,7 +1149,7 @@ async def flatten_wallet(*, allow_trading: bool = True, origin: str = "manual",
     for cid, side, size in targets:
         try:
             req, pv, refusal = await _flatten_quote(cid, side, size)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             req, pv, refusal = None, None, (
                 f"Could not price this market ({type(e).__name__}: {e}), so it "
                 f"was left alone.")
@@ -875,6 +1163,10 @@ async def flatten_wallet(*, allow_trading: bool = True, origin: str = "manual",
         res = await place(req, origin=origin)
         ok = bool(res.get("ok"))
         msg = str(res.get("message") or "")
+        if ok and (str(res.get("status") or "").lower() == "unmatched"
+                   or num(res.get("filledSize")) == 0):
+            ok = False
+            msg = (f"{msg} Nothing sold — this position is still open.").strip()
         if ok:
             sold += 1
             if tracked is not None and cid in tracked:
@@ -949,6 +1241,13 @@ _SELL_ESTIMATE_NOTE = (
 
 def _walk_deepest(levels: list[dict], want: float,
                   floor_cents: float) -> Optional[float]:
+    """The deepest (lowest) bid level a sell walk of `want` actually touches.
+
+    Deliberately the same traversal as `_walk_book(..., is_buy=False)` — it
+    answers the one question that walk does not: how far down did we have to
+    go? That price, not the best bid, is what the limit has to be, because a
+    limit at the touch only crosses the touch.
+    """
     filled = 0.0
     deepest: Optional[float] = None
     for lvl in levels:
@@ -987,13 +1286,19 @@ def _sell_blank(cid: str, side: str, paper: bool) -> dict:
 
 
 async def _position_for(cid: str, side: str, paper: bool) -> Optional[dict]:
+    """The one position row for this market + side, from the right book.
+
+    Paper reads the PAPER ledger and live reads the wallet. They are never
+    mixed: a paper number added to a real one is the single worst thing a
+    simulator can do.
+    """
     if paper:
         import terminal_paper
         cfg = None
         try:
             import service
             cfg = service.STATE.cfg
-        except Exception:
+        except Exception:  # noqa: BLE001 — no service (tests, CLI)
             cfg = None
         pf = await terminal_paper.portfolio(cfg)
     else:
@@ -1009,6 +1314,11 @@ async def _position_for(cid: str, side: str, paper: bool) -> Optional[dict]:
 
 
 async def sell_position_preview(req: dict) -> dict:
+    """Price a marketable exit out of one position. Read-only.
+
+    ``req``: ``conditionId``, ``side``, optional ``size`` (default: the whole
+    position), optional ``maxSlippageCents`` (default 5), ``paper``.
+    """
     cid = str(req.get("conditionId") or "").strip()
     side = "no" if str(req.get("side") or "yes").lower() == "no" else "yes"
     paper = bool(req.get("paper"))
@@ -1031,7 +1341,7 @@ async def sell_position_preview(req: dict) -> dict:
             f"So what you hold here is unknown, not nothing. Nothing was "
             f"priced.")
         return out
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — unreadable is not empty
         out["blockers"].append(
             f"Could not read your {'paper ' if paper else ''}positions "
             f"({type(e).__name__}: {e}), so what you hold here is unknown, not "
@@ -1234,6 +1544,13 @@ def _sell_refused(message: str, pv: Optional[dict] = None) -> dict:
 
 
 async def sell_position(req: dict, *, origin: str = "manual") -> dict:
+    """Send ONE marketable fill-and-kill that closes (part of) a position.
+
+    Same request as the preview, plus ``confirmUsd`` — the proceeds figure the
+    user actually read. It is re-derived here and the order is refused if the
+    book moved, exactly as `place()` does for the ticket: the confirmation is a
+    contract about a number, not a checkbox.
+    """
     paper = bool(req.get("paper"))
     pv = await sell_position_preview(req)
     if pv["blockers"]:
@@ -1263,7 +1580,7 @@ async def sell_position(req: dict, *, origin: str = "manual") -> dict:
         try:
             import service
             cfg = service.STATE.cfg
-        except Exception:
+        except Exception:  # noqa: BLE001
             cfg = None
         res = await terminal_paper.place(order, cfg)
     else:
@@ -1293,13 +1610,29 @@ async def sell_position(req: dict, *, origin: str = "manual") -> dict:
     }
 
 
+
 _FILL_MAX_PAGES = 25
 _FILL_PAGE = 100
 
 
 async def _walk_trades(max_pages: int = _FILL_MAX_PAGES) -> tuple[list, bool]:
+    """Every authed fill we can reach, oldest page last.
+
+    Returns ``(rows, complete)``. The CLOB paginates ``/data/trades`` with an
+    opaque ``next_cursor`` and signals the end with ``LTE=``. A single
+    un-paginated call only ever saw the most recent page, so any position
+    opened before that window could never be reconciled — it stayed
+    ``unreconciled`` forever, excluded from every total, with no way to
+    backfill it.
+    """
+    rows, complete, _ = await _walk_pages("", max_pages)
+    return rows, complete
+
+
+async def _walk_pages(cursor: str, max_pages: int) -> tuple[list, bool, str]:
+    """`_walk_trades` from `cursor` → ``(rows, complete, next_cursor)``.
+    ``next_cursor`` is where a walk that hit the page cap would go on."""
     rows: list = []
-    cursor = ""
     seen_cursors: set[str] = set()
     for _ in range(max_pages):
         params: dict = {"limit": _FILL_PAGE}
@@ -1310,15 +1643,75 @@ async def _walk_trades(max_pages: int = _FILL_MAX_PAGES) -> tuple[list, bool]:
             page = data.get("data") or []
             nxt = str(data.get("next_cursor") or "")
         elif isinstance(data, list):
-            return rows + data, True
+            return rows + data, True, ""
         else:
-            return rows, False
+            return rows, False, ""
         rows.extend(page)
         if not page or not nxt or nxt == "LTE=" or nxt in seen_cursors:
-            return rows, True
+            return rows, True, ""
         seen_cursors.add(nxt)
         cursor = nxt
-    return rows, False
+    return rows, False, cursor
+
+
+_FILL_RESUME_KV = "terminal:fills:resume:"
+
+
+def _fill_resume_key() -> str:
+    """Per network and wallet: a cursor into one account's history means
+    nothing in another's."""
+    try:
+        addr = str(auth.trading_address() or "").lower()
+    except Exception:  # noqa: BLE001
+        addr = ""
+    return f"{_FILL_RESUME_KV}{_net()}:{addr}"
+
+
+async def _walk_history() -> tuple[list, bool]:
+    """The newest fills, plus the next stretch of the older history.
+
+    A walk always starts at the newest fill, so on a wallet past the page cap
+    every pass re-read the same newest pages: anything older could never be
+    imported, while the note told the user to run it again to continue. Where
+    the walk stopped is now remembered, and each following pass also walks on
+    from there until it reaches the oldest fill; then the cycle starts over,
+    so old fills are still re-derived in turn. ``complete`` means the whole
+    history has been read, across passes, at least once.
+    """
+    import db
+    key = _fill_resume_key()
+    end_key = key + ":end"
+    rows, complete, nxt = await _walk_pages("", _FILL_MAX_PAGES)
+    with _conn() as conn:
+        resume = db.kv_get(conn, key)
+        reached_end = bool(db.kv_get(conn, end_key))
+        if complete or not resume:
+            if complete:
+                db.kv_delete(conn, key)
+            elif nxt:
+                db.kv_set(conn, key, nxt)
+            return rows, complete or reached_end
+    try:
+        older, done, nxt = await _walk_pages(resume, _FILL_MAX_PAGES)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("fill backfill from a saved cursor failed: %s", e)
+        older, done, nxt = [], False, ""
+    with _conn() as conn:
+        if done or not nxt:
+            db.kv_delete(conn, key)
+        else:
+            db.kv_set(conn, key, nxt)
+        if done:
+            db.kv_set(conn, end_key, "1")
+    seen: set[str] = set()
+    out: list = []
+    for t in rows + older:
+        tid = str(t.get("id") or t.get("trade_id") or "") if isinstance(t, dict) else ""
+        if tid and tid in seen:
+            continue
+        seen.add(tid)
+        out.append(t)
+    return out, done or reached_end
 
 
 _YES_WORDS = {"yes", "up", "over", "above", "long", "win", "true"}
@@ -1327,6 +1720,22 @@ _NO_WORDS = {"no", "down", "under", "below", "short", "lose", "false"}
 
 def _side_from_token(asset_id: str, outcome_label: str,
                      summary: Optional[dict]) -> Optional[str]:
+    """Which of a market's two outcomes a fill was for → 'yes' | 'no' | None.
+
+    Mapped through the OUTCOME INDEX, never through the label text. This was
+    the single biggest wrong number on the Track screen: the old rule was
+    literally ``"yes" if outcome == "yes" else "no"``, so every market whose
+    first outcome is not spelled "Yes" — every "Up or Down" crypto market,
+    every over/under, every named-team sports market — had its buys filed
+    under 'no' while the position itself (derived from ``outcomeIndex`` via
+    ``position_fp``) sat under 'yes'. Buys and sells landed on different keys,
+    so the position had no cost basis at all and was dropped from every total.
+
+    Order of authority: the CLOB token id (exact), then the market's own
+    ``outcomes`` list (exact), then a known vocabulary, then unknown. Unknown
+    is a real answer here — a fill we cannot attribute to an outcome is left
+    out rather than filed under a guess.
+    """
     tid = str(asset_id or "").strip()
     if summary and tid:
         if tid == str(summary.get("yesTokenId") or ""):
@@ -1348,6 +1757,26 @@ def _side_from_token(asset_id: str, outcome_label: str,
 
 
 def _our_leg(t: dict, addr: str) -> Optional[dict]:
+    """Which side of a match WE were on → asset, outcome, price, size, role.
+
+    ``/data/trades`` reports every match FROM THE TAKER'S POINT OF VIEW. The
+    top-level ``asset_id``, ``outcome``, ``price``, ``size`` and ``side`` are
+    the taker's order; when we were the MAKER, our own leg is one of the
+    entries in ``maker_orders`` — on a different token, at a different price,
+    and possibly in a different direction.
+
+    Reading the top level unconditionally recorded, for one real trade in this
+    wallet, "bought 10 DOWN at 70¢" for what was actually "bought 10 UP at
+    30¢": wrong outcome, wrong price, and therefore a cost of $7.00 booked
+    against $3.00 actually spent. On a wallet that rests a lot of orders that
+    is a systematically wrong basis, not a rounding error.
+
+    ``role`` is the venue's own ``trader_side`` where it gives one, because it
+    also settles the fee question outright: a maker pays nothing, a taker pays
+    the curve, and neither has to be inferred from whether an order id happened
+    to match a local row. Returns None when we cannot tell which leg was ours —
+    unknown, not guessed.
+    """
     role = str(t.get("trader_side") or "").upper()
     makers = [m for m in (t.get("maker_orders") or []) if isinstance(m, dict)]
     ours = [m for m in makers
@@ -1393,14 +1822,19 @@ def _our_leg(t: dict, addr: str) -> Optional[dict]:
 
 
 async def reconcile_fills(limit: int = 0) -> dict:
+    """Pull our authed trade history and write it into terminal_fills.
+
+    Idempotent: keyed on the venue's own trade id. This is the only writer of
+    cost basis in the terminal — nothing here trusts what we asked for.
+    """
     try:
-        rows, complete = await _walk_trades()
-    except Exception as e:
-        return {"inserted": 0, "matched": 0,
+        rows, complete = await _walk_history()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "inserted": 0, "matched": 0,
                 "note": f"Could not read your fills: {e}"}
 
     if not isinstance(rows, list):
-        return {"inserted": 0, "matched": 0,
+        return {"ok": False, "inserted": 0, "matched": 0,
                 "note": "The CLOB returned no trade list."}
     if limit:
         rows = rows[:int(limit)]
@@ -1422,30 +1856,52 @@ async def reconcile_fills(limit: int = 0) -> dict:
     try:
         for m in await term._summaries_for([c for c in cids if c]):
             market_by_id[m["conditionId"]] = m
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a miss just means an unknown fee
         logger.debug("reconcile: market lookup failed: %s", e)
 
     inserted = 0
     skipped = 0
     unmapped = 0
     corrected = 0
+    failed_trades = 0
+    unwound = 0
     net = _net()
     try:
         our_addr = str(auth.trading_address() or "").lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         our_addr = ""
     with _conn() as conn:
         prior = {str(r["trade_id"]): (str(r["side"]), str(r["action"]),
                                       float(r["size"] or 0.0),
-                                      float(r["price_cents"] or 0.0))
+                                      float(r["price_cents"] or 0.0),
+                                      r["fees_usd"])
                  for r in conn.execute(
-                     "SELECT trade_id, side, action, size, price_cents "
+                     "SELECT trade_id, side, action, size, price_cents, fees_usd "
                      "FROM terminal_fills")}
         for t in rows:
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id") or t.get("trade_id") or "")
             if not tid:
+                continue
+            status = str(t.get("status") or "").upper().replace("TRADE_STATUS_", "")
+            if status == "FAILED":
+                failed_trades += 1
+                if tid in prior:
+                    gone = conn.execute(
+                        "SELECT order_id FROM terminal_fills WHERE trade_id=?",
+                        (tid,)).fetchone()
+                    conn.execute("DELETE FROM terminal_fills WHERE trade_id=?", (tid,))
+                    if gone and gone["order_id"]:
+                        conn.execute(
+                            """UPDATE terminal_orders
+                               SET reconciled=0, filled_size=NULL,
+                                   avg_fill_price_cents=NULL, fees_usd=NULL,
+                                   cost_usd=NULL, reconciled_at=NULL,
+                                   status=CASE WHEN status='filled'
+                                               THEN 'placed' ELSE status END
+                               WHERE order_id=?""", (gone["order_id"],))
+                    unwound += 1
                 continue
             leg = _our_leg(t, our_addr)
             if leg is None:
@@ -1513,6 +1969,10 @@ async def reconcile_fills(limit: int = 0) -> dict:
             title = ((local or {}).get("title")
                      or (market_by_id.get(cid) or {}).get("title") or "")
             was = prior.get(tid)
+            same = (was is not None and was[0] == side and was[1] == action
+                    and abs(was[2] - size) <= 1e-6 and abs(was[3] - price) <= 1e-6)
+            if fee is None and same:
+                fee = was[4]
             cur = conn.execute(
                 """INSERT INTO terminal_fills
                    (trade_id, order_id, condition_id, title, side, action,
@@ -1535,8 +1995,7 @@ async def reconcile_fills(limit: int = 0) -> dict:
             )
             if was is None:
                 inserted += cur.rowcount or 0
-            elif (was[0] != side or was[1] != action
-                  or abs(was[2] - size) > 1e-6 or abs(was[3] - price) > 1e-6):
+            elif not same:
                 corrected += 1
 
         matched = 0
@@ -1567,11 +2026,17 @@ async def reconcile_fills(limit: int = 0) -> dict:
             )
             matched += 1
 
+    try:
+        import mcp_rails
+        mcp_rails.promote_from_ledger()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("reconcile: agent unknown-order promotion failed: %s", e)
+
     notes = []
     if not complete:
         notes.append(
-            f"Walked {len(rows)} fills across {_FILL_MAX_PAGES} pages and there "
-            f"is more history beyond that. Run this again to continue — older "
+            f"Walked {len(rows)} fills and there is more history beyond that. "
+            f"The next reconcile continues from where this one stopped — older "
             f"positions stay marked unreconciled until it reaches them."
         )
     if skipped:
@@ -1593,13 +2058,32 @@ async def reconcile_fills(limit: int = 0) -> dict:
             f"two outcomes, so they were left out rather than filed under a "
             f"guess."
         )
+    if unwound:
+        notes.append(
+            f"{unwound} fill(s) came from trades that Polymarket has since "
+            f"marked FAILED: they never settled, so nothing changed hands. "
+            f"They have been taken out of the ledger."
+        )
     return {"inserted": inserted, "matched": matched, "skipped": skipped,
             "corrected": corrected, "unmapped": unmapped,
+            "failed": failed_trades, "unwound": unwound,
             "scanned": len(rows), "complete": complete,
             "note": " ".join(notes) or None}
 
 
+
 def _ledger_basis() -> dict[tuple[str, str], dict]:
+    """Average cost per (conditionId, side) from RECONCILED fills only.
+
+    Average cost, not FIFO. A sell reduces size and leaves the average alone —
+    which is the convention every trader means when they say "my basis".
+
+    EVERY fill counts, whatever its `origin`. The user's wallet is the user's
+    wallet: a position the crypto engine opened cost real money out of the
+    same balance a hand-placed one did, and filing it as "placed elsewhere"
+    used to be a reason it had no basis at all. Origin decides which TRACK
+    RECORD a trade belongs to; it never decides whether a position has a cost.
+    """
     out: dict[tuple[str, str], dict] = {}
     with _conn() as conn:
         rows = conn.execute(
@@ -1639,6 +2123,11 @@ _RESOLUTION_MISS_TTL = 300.0
 
 
 def _miss_expired(missed_at, now: float) -> bool:
+    """May this market be looked up (again)? A market never looked up has no
+    miss on record — and that is NOT a miss at monotonic zero. time.monotonic()
+    counts from boot, so `.get(c, 0.0)` made every market look like a
+    five-minute-old miss on any machine up for less than the TTL: every CI
+    runner, and every user's PC for five minutes after boot, resolved nothing."""
     return missed_at is None or (now - float(missed_at)) > _RESOLUTION_MISS_TTL
 _resolution_misses: dict[str, float] = {}
 _resolution_mem: dict[str, str] = {}
@@ -1653,7 +2142,7 @@ def _resolution_scope_check() -> None:
     try:
         import db
         scope = str(db.db_path())
-    except Exception:
+    except Exception:  # noqa: BLE001
         scope = ""
     if scope != _resolution_scope:
         _resolution_scope = scope
@@ -1664,6 +2153,11 @@ def _resolution_scope_check() -> None:
 
 
 def _resolutions_cached() -> dict[str, str]:
+    """Every outcome we have already learned, from memory then app_kv.
+
+    One query, not one per market: the whole point of the cache is that a
+    Track refresh over a 580-market ledger costs a single SELECT.
+    """
     _resolution_scope_check()
     if _resolution_mem:
         return dict(_resolution_mem)
@@ -1673,7 +2167,7 @@ def _resolutions_cached() -> dict[str, str]:
                 "SELECT k, v FROM app_kv WHERE k LIKE ?",
                 (_RESOLVED_KV_PREFIX + "%",),
             ).fetchall()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a cache miss is not an error
         logger.debug("resolution cache read failed: %s", e)
         return {}
     for r in rows:
@@ -1684,6 +2178,7 @@ def _resolutions_cached() -> dict[str, str]:
 
 
 def _resolution_remember(cid: str, outcome: str) -> None:
+    """Persist one settled outcome. Written once; never revisited."""
     if outcome not in ("yes", "no") or not cid:
         return
     _resolution_scope_check()
@@ -1695,11 +2190,17 @@ def _resolution_remember(cid: str, outcome: str) -> None:
         import db
         with _conn() as conn:
             db.kv_set(conn, _RESOLVED_KV_PREFIX + cid, outcome)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("resolution cache write failed for %s: %s", cid, e)
 
 
 async def _resolutions_for(condition_ids) -> dict[str, Optional[str]]:
+    """conditionId → ``'yes'`` | ``'no'`` | ``None``.
+
+    ``None`` means WE DO NOT KNOW — the market is still open, or Gamma did not
+    answer. It never means "lost". Everything that reads this has to carry the
+    unknown through rather than settle it at zero.
+    """
     ids = [str(c) for c in condition_ids if c]
     if not ids:
         return {}
@@ -1713,7 +2214,7 @@ async def _resolutions_for(condition_ids) -> dict[str, Optional[str]]:
         chunk = missing[i:i + 20]
         try:
             summaries = await term._summaries_for(chunk)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — a miss degrades to unknown
             logger.debug("resolution lookup failed: %s", e)
             summaries = []
         seen: set[str] = set()
@@ -1733,7 +2234,9 @@ async def _resolutions_for(condition_ids) -> dict[str, Optional[str]]:
     return out
 
 
+
 def _market_meta_cached() -> dict[str, dict]:
+    """Every resolved market we have already described, in one SELECT."""
     _resolution_scope_check()
     if _market_meta_mem:
         return dict(_market_meta_mem)
@@ -1743,13 +2246,13 @@ def _market_meta_cached() -> dict[str, dict]:
                 "SELECT k, v FROM app_kv WHERE k LIKE ?",
                 (_MARKET_KV_PREFIX + "%",),
             ).fetchall()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a cache miss is not an error
         logger.debug("market meta cache read failed: %s", e)
         return {}
     for r in rows:
         try:
             v = json.loads(str(r[1] or ""))
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         if isinstance(v, dict) and v.get("outcome") in ("yes", "no"):
             _market_meta_mem[str(r[0])[len(_MARKET_KV_PREFIX):]] = v
@@ -1757,6 +2260,7 @@ def _market_meta_cached() -> dict[str, dict]:
 
 
 def _market_meta_remember(cid: str, entry: dict) -> None:
+    """Persist one resolved market's outcome, labels and close time."""
     if not cid or entry.get("outcome") not in ("yes", "no"):
         return
     _resolution_scope_check()
@@ -1768,11 +2272,22 @@ def _market_meta_remember(cid: str, entry: dict) -> None:
         import db
         with _conn() as conn:
             db.kv_set(conn, _MARKET_KV_PREFIX + cid, json.dumps(entry))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("market meta cache write failed for %s: %s", cid, e)
 
 
 async def _market_meta_for(condition_ids) -> dict[str, dict]:
+    """conditionId → ``{outcome, labels, closeTime, title}`` for the record.
+
+    Everything already cached costs one SELECT. Only markets we have never
+    seen RESOLVED are asked about, and an unresolved one is re-asked at most
+    every few minutes — so the first time the settled table is opened on a
+    580-market ledger it pays about thirty batched Gamma calls, and every
+    time after that it pays none.
+
+    A market we cannot describe is simply absent. Never guessed at, and never
+    defaulted to "lost".
+    """
     ids = list(dict.fromkeys(str(c) for c in condition_ids if c))
     if not ids:
         return {}
@@ -1787,7 +2302,7 @@ async def _market_meta_for(condition_ids) -> dict[str, dict]:
         chunk = missing[i:i + 20]
         try:
             summaries = await term._summaries_for(chunk)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — a miss degrades to unknown
             logger.debug("market meta lookup failed: %s", e)
             summaries = []
         seen: set[str] = set()
@@ -1820,6 +2335,25 @@ _RECORD_MIN_CONTRACTS = 0.5
 
 
 async def _ledger_record(basis: dict[tuple[str, str], dict]) -> dict:
+    """Settle the WHOLE fill ledger, not just what is left in the wallet.
+
+    THE BUG THIS EXISTS TO FIX. Realised P&L used to be summed over the
+    positions the wallet still holds. But a resolved WINNER leaves the wallet
+    the moment it is redeemed, while a resolved LOSER stays behind forever as
+    $0 dust — and a redemption is an on-chain claim, not a CLOB trade, so it
+    leaves no "sell" row either. Summing the wallet therefore added up the
+    losers and silently dropped every win: a real wallet with 453 redeemed
+    winners reported "105 positions, 105 losses, realised −$681.13".
+
+    So the ledger is the unit of account. For every (market, side) we ever
+    bought, the contracts still outstanding settle at exactly $1 if that side
+    won and exactly $0 if it lost — whether or not the tokens are still in
+    the wallet, because a redeemed winner has already been PAID.
+
+    An unresolved market settles nothing; it realises from its sells only. A
+    market whose outcome we cannot read is counted as UNKNOWN and left out of
+    the total — never folded in as a loss.
+    """
     cids = sorted({cid for cid, _ in basis})
     res = await _resolutions_for(cids)
 
@@ -1863,6 +2397,7 @@ async def _ledger_record(basis: dict[tuple[str, str], dict]) -> dict:
 
 
 def _record_note(record: dict) -> Optional[str]:
+    """One sentence saying what the win/loss counts are and are not."""
     settled = record["wonMarkets"] + record["lostMarkets"]
     if not settled and not record["unknownMarkets"]:
         return None
@@ -1890,13 +2425,21 @@ def _record_note(record: dict) -> Optional[str]:
 
 
 def _ledger_meta() -> dict[tuple[str, str], dict]:
+    """Per (market, side): the title we saw and when we last traded it.
+
+    The title is the one on the most recent fill — bare columns beside a
+    `MAX()` are documented in SQLite to come from the row that produced the
+    maximum. `last_at` is what the record sorts by when the venue never told
+    us a close time, so a row still lands in the right place rather than at
+    the bottom under a fabricated date.
+    """
     try:
         with _conn() as conn:
             rows = conn.execute(
                 "SELECT condition_id, side, MAX(filled_at) AS last_at, title "
                 "FROM terminal_fills GROUP BY condition_id, side"
             ).fetchall()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("ledger meta read failed: %s", e)
         return {}
     return {(str(r["condition_id"]), str(r["side"])):
@@ -1905,9 +2448,15 @@ def _ledger_meta() -> dict[tuple[str, str], dict]:
 
 
 async def _wallet_sides() -> Optional[set[tuple[str, str]]]:
+    """(market, side) the wallet still holds, or None if we could not read it.
+
+    None is not "holds nothing". A record that quietly claimed every winner
+    had left the wallet because the positions call timed out would be exactly
+    the class of lie this module exists to prevent, so the rows say unknown.
+    """
     try:
         rows = await api.get_positions(strict=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("settled record: wallet read failed: %s", e)
         return None
     out: set[tuple[str, str]] = set()
@@ -1920,6 +2469,34 @@ async def _wallet_sides() -> Optional[set[tuple[str, str]]]:
 
 
 async def settled_record() -> dict:
+    """The record: every market the FILL LEDGER has ever settled.
+
+    THE SCREEN THIS EXISTS FOR. "Show settled" used to list the wallet's
+    settled positions, and the wallet is a survivorship filter with the sign
+    flipped: a resolved WINNER leaves it the moment it is redeemed, a resolved
+    LOSER stays behind forever as $0 dust. So a real account with 453 wins and
+    117 losses showed "105 losses" and not one win — every row true, the whole
+    table a lie by omission.
+
+    This reads the ledger instead. For every (market, side) we ever bought,
+    the contracts still outstanding settle at exactly $1 on the winning
+    outcome and exactly $0 on the loser, whether or not the tokens are still
+    here — a redeemed winner has already been PAID.
+
+    Four outcomes, and no fifth:
+
+      ``won``       held the winning side into settlement
+      ``lost``      held the losing side into settlement
+      ``closedOut`` sold back before it resolved (or left a residual too small
+                    to have been worth claiming) — no outcome decided it
+      ``unknown``   contracts outstanding, and we could not read the outcome.
+                    Never folded in as a loss.
+
+    A market held on BOTH sides into settlement is won on one row and lost on
+    the other; both carry ``bothSides`` so the screen can say so instead of
+    quietly counting it twice. The counts here are the same sets
+    `portfolio()` reports as `wonMarkets` / `lostMarkets`, by construction.
+    """
     basis = _ledger_basis()
     meta = _ledger_meta()
     cids = sorted({cid for cid, _ in basis})
@@ -2065,9 +2642,29 @@ async def settled_record() -> dict:
 
 
 async def portfolio() -> dict:
+    """Positions with a cost basis, and a stamp saying where each one came from.
+
+    TWO sources of basis, in this order:
+
+      1. OUR FILL LEDGER — every reconciled fill for this wallet, whatever
+         placed it. Average cost, fee-exclusive, computed here.
+      2. THE VENUE'S OWN AVERAGE — ``avgPrice`` / ``initialValue`` from the
+         Data API positions read, used when our ledger cannot cover the size
+         (history older than we ever imported, or a wiped ledger). Stamped
+         ``data-api`` so the screen can say so.
+
+    Only when NEITHER can answer is the basis unknown — and then it stays
+    unknown: never zero, never break-even, and the row is left out of the
+    totals and counted in a warning strip.
+
+    Every outcome question — which side you hold, which side won — is decided
+    by the OUTCOME INDEX (0 = the market's first outcome), never by the label
+    text, so an "Up or Down" market and a named-team market are read exactly
+    as reliably as a Yes/No one.
+    """
     try:
         raw_positions = await api.get_positions()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {
             "positions": [], "totalValueUsd": None, "totalCostUsd": None,
             "totalUnrealizedPnlUsd": None, "realizedPnlUsd": None,
@@ -2096,7 +2693,7 @@ async def portfolio() -> dict:
             market_by_id[m["conditionId"]] = m
             if m.get("resolvedOutcome") in ("yes", "no"):
                 _resolution_remember(str(m["conditionId"]), str(m["resolvedOutcome"]))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a miss degrades to "unknown"
         logger.debug("terminal portfolio market lookup failed: %s", e)
 
     positions: list[dict] = []
@@ -2423,6 +3020,12 @@ def fills(limit: int = 100) -> dict:
 
 
 def order_log(limit: int = 100) -> dict:
+    """Every manual order attempt, including the ones that failed.
+
+    Failures are kept on purpose: an order that errored after the venue may
+    have accepted it is exactly the row you need when a position appears that
+    you do not remember opening.
+    """
     limit = max(1, min(int(limit or 100), 500))
     with _conn() as conn:
         rows = conn.execute(
@@ -2459,6 +3062,9 @@ def order_log(limit: int = 100) -> dict:
 _STANDING_KEY = "terminal:standing"
 _STANDING_MAX = 100
 _VALID_KINDS = ("stopLoss", "takeProfit", "alertAbove", "alertBelow")
+_STOP_KINDS = ("stopLoss", "takeProfit")
+
+_STANDING_SOLD_KEY = "terminal:standing:sold"
 
 
 def standing_list() -> list[dict]:
@@ -2466,14 +3072,166 @@ def standing_list() -> list[dict]:
     return entries if isinstance(entries, list) else []
 
 
+def _standing_retired(e: dict) -> bool:
+    """Done for good: fired, failed out, or found nothing to sell. A stop the
+    user (or a blocked trigger) merely disarmed is NOT retired — it can be
+    re-armed, so it is never pruned."""
+    return bool(isinstance(e, dict) and e.get("firedAt"))
+
+
+def _standing_active_count(entries: list[dict]) -> int:
+    return sum(1 for e in entries if isinstance(e, dict) and not _standing_retired(e))
+
+
+def standing_remaining(e: dict) -> float:
+    """Contracts a stop/take-profit still has to sell: its size less what
+    earlier partial fills already sold."""
+    size = float(num(e.get("size")) or 0.0)
+    sold = float(num(e.get("soldSize")) or 0.0)
+    return max(0.0, round(size - sold, 6))
+
+
+def standing_sold_records() -> dict[str, dict]:
+    recs = term._kv_json(_STANDING_SOLD_KEY, {})
+    return recs if isinstance(recs, dict) else {}
+
+
+def _legacy_sold(instruction_id: str) -> float:
+    """What a stop that fired BEFORE sold sizes were recorded sold, by the rule
+    the agent rails used for it: every order it sent that was not a known
+    zero-fill. Errs high, which is the safe direction for a sell allowance."""
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(COALESCE(sent_size, requested_size)), 0) "
+                "FROM terminal_orders WHERE standing_id=? "
+                "AND status NOT IN ('unmatched', 'rejected')",
+                (str(instruction_id),)).fetchone()
+        return float(row[0] or 0.0)
+    except Exception as ex:  # noqa: BLE001
+        logger.debug("standing: legacy sold read for %s failed: %s", instruction_id, ex)
+        return 0.0
+
+
+def _record_stop_sale(e: dict, sold: float, order_id: Optional[str],
+                      confirmed: bool, *, final: bool) -> None:
+    """Add `sold` contracts to the durable record of instruction `e`."""
+    if sold <= 0:
+        return
+    recs = standing_sold_records()
+    iid = str(e.get("id") or "")
+    r = recs.get(iid) or {
+        "id": iid, "conditionId": e.get("conditionId"), "side": e.get("side"),
+        "kind": e.get("kind"), "origin": e.get("origin") or "manual",
+        "agentId": e.get("agentId"), "soldSize": 0.0, "orderIds": [],
+        "confirmed": True, "firedAt": None,
+    }
+    r["soldSize"] = round(float(r.get("soldSize") or 0.0) + float(sold), 6)
+    if order_id and order_id not in r["orderIds"]:
+        r["orderIds"].append(order_id)
+    r["confirmed"] = bool(r.get("confirmed", True)) and bool(confirmed)
+    if e.get("agentId") and not r.get("agentId"):
+        r["agentId"] = e.get("agentId")
+    r["updatedAt"] = _now_iso()
+    if final:
+        r["firedAt"] = r["updatedAt"]
+    recs[iid] = r
+    term._kv_put(_STANDING_SOLD_KEY, recs)
+
+
+def _archive_before_drop(e: dict) -> None:
+    """A fired stop is leaving the list (pruned or deleted). Make sure what it
+    sold survives it. Entries that fired before sold sizes were recorded have
+    no record yet, so one is written from the order log."""
+    if not isinstance(e, dict) or e.get("kind") not in _STOP_KINDS:
+        return
+    if not e.get("firedAt") and not float(num(e.get("soldSize")) or 0.0):
+        return
+    iid = str(e.get("id") or "")
+    if not iid or iid in standing_sold_records():
+        return
+    if e.get("retiredReason") is None and e.get("soldSize") is None:
+        sold, confirmed = _legacy_sold(iid), False
+    else:
+        sold, confirmed = float(num(e.get("soldSize")) or 0.0), True
+    _record_stop_sale(e, sold, None, confirmed, final=bool(e.get("firedAt")))
+
+
+def standing_sold_shares(cid: str, side: str, *, agent_id: Optional[str] = None,
+                         default_agent_id: Optional[str] = None,
+                         origin: Optional[str] = "ai") -> float:
+    """Contracts of (cid, side) that standing stops/take-profits have SOLD.
+
+    Durable: reads the sold record, which outlives the bounded instruction
+    list and a user deleting a fired entry. A stop that fired before sold
+    sizes were recorded and is still listed falls back to its order log.
+    `agent_id` filters by owner; a record with no agentId belongs to
+    `default_agent_id`. `origin=None` counts every stop."""
+    cid, side = str(cid), str(side)
+
+    def _match(x: dict) -> bool:
+        if str(x.get("conditionId") or "") != cid or str(x.get("side") or "") != side:
+            return False
+        if origin is not None and (x.get("origin") or "manual") != origin:
+            return False
+        if agent_id is not None and (x.get("agentId") or default_agent_id) != agent_id:
+            return False
+        return True
+
+    total = 0.0
+    recs = standing_sold_records()
+    for r in recs.values():
+        if isinstance(r, dict) and _match(r):
+            total += float(r.get("soldSize") or 0.0)
+    for e in standing_list():
+        if (isinstance(e, dict) and e.get("kind") in _STOP_KINDS
+                and e.get("firedAt") and str(e.get("id")) not in recs
+                and e.get("retiredReason") is None and e.get("soldSize") is None
+                and _match(e)):
+            total += _legacy_sold(str(e.get("id")))
+    return round(total, 6)
+
+
 def _standing_put(entries: list[dict]) -> None:
-    term._kv_put(_STANDING_KEY, entries[:_STANDING_MAX])
+    """Write the list, pruning only RETIRED entries, oldest first, when it is
+    over the cap. An armed or merely disarmed instruction is never evicted —
+    the cap is enforced where instructions are added, by refusing the add.
+    (It used to write `entries[:100]`, which silently dropped the OLDEST entry
+    whatever it was, armed stop on an open position included.)"""
+    entries = [e for e in entries if isinstance(e, dict)]
+    over = len(entries) - _STANDING_MAX
+    if over > 0:
+        retired = sorted(
+            (e for e in entries if _standing_retired(e)),
+            key=lambda e: str(e.get("firedAt") or e.get("createdAt") or ""))
+        drop = {id(e) for e in retired[:over]}
+        for e in retired[:over]:
+            _archive_before_drop(e)
+        entries = [e for e in entries if id(e) not in drop]
+    term._kv_put(_STANDING_KEY, entries)
 
 
-_TICK_FIELDS = ("lastCheckedAt", "firedAt", "note", "failures")
+_TICK_FIELDS = ("lastCheckedAt", "firedAt", "note", "failures", "soldSize",
+                "retiredReason")
 
 
 def _standing_merge_put(worked: list[dict]) -> list[dict]:
+    """Write a tick's results back WITHOUT clobbering what the user did meanwhile.
+
+    The tick reads the whole instruction list, then awaits the book, the
+    wallet and possibly an order — seconds of network — and the RPC handlers
+    (`standing_add` / `standing_cancel` / `standing_set_armed`) run as
+    concurrent tasks the whole time. A blind write-back of the list read at the
+    top therefore RESURRECTED an instruction cancelled mid-tick — armed, with
+    a live stop attached to it — and re-armed one the user had just disarmed.
+
+    So re-read, and merge per instruction:
+      * an instruction that no longer exists is NOT re-added;
+      * one added meanwhile is left exactly as the user wrote it;
+      * the tick's own fields are applied to the rows that survived;
+      * `armed` only ever moves True → False. The tick never arms anything, so
+        a user disarm during the tick stays a disarm.
+    """
     by_id = {str(e.get("id")): e for e in worked if isinstance(e, dict)}
     merged: list[dict] = []
     for cur in standing_list():
@@ -2507,15 +3265,26 @@ def standing_add(item: dict) -> dict:
             "The trigger is a PROBABILITY POINT between 0 and 100 — not a "
             "percentage move.")
     size = num(item.get("size"))
-    if kind in ("stopLoss", "takeProfit"):
+    slip = None
+    if kind in _STOP_KINDS:
         if size is None or size <= 0:
             raise TerminalTradeError(
                 "A stop or take-profit has to say how many contracts to close.")
         if size > MAX_MANUAL_CONTRACTS:
             raise TerminalTradeError(
                 f"Size is over the {MAX_MANUAL_CONTRACTS:,} manual ceiling.")
+        raw_slip = num(item.get("maxSlippageCents"))
+        slip = (DEFAULT_SELL_SLIPPAGE_CENTS if raw_slip is None
+                else max(0.0, min(float(MAX_SELL_SLIPPAGE_CENTS), float(raw_slip))))
     else:
         size = None
+
+    entries = standing_list()
+    if _standing_active_count(entries) >= _STANDING_MAX:
+        raise TerminalTradeError(
+            f"You already have {_STANDING_MAX} active standing instructions, "
+            f"which is the most this app keeps. Cancel ones you no longer need "
+            f"and add this one again — nothing was added.")
 
     entry = {
         "id": f"st_{uuid.uuid4().hex[:10]}",
@@ -2525,6 +3294,7 @@ def standing_add(item: dict) -> dict:
         "kind": kind,
         "triggerCents": round(trigger, 2),
         "size": size,
+        "maxSlippageCents": slip,
         "createdAt": _now_iso(),
         "armed": True,
         "lastCheckedAt": None,
@@ -2532,7 +3302,6 @@ def standing_add(item: dict) -> dict:
         "note": item.get("note") or None,
         "origin": "ai" if item.get("origin") == "ai" else "manual",
     }
-    entries = standing_list()
     entries.insert(0, entry)
     _standing_put(entries)
     return entry
@@ -2540,9 +3309,14 @@ def standing_add(item: dict) -> dict:
 
 def standing_cancel(instruction_id: str) -> list[dict]:
     iid = str(instruction_id or "")
-    entries = [e for e in standing_list() if e.get("id") != iid]
-    _standing_put(entries)
-    return entries
+    keep: list[dict] = []
+    for e in standing_list():
+        if e.get("id") == iid:
+            _archive_before_drop(e)
+            continue
+        keep.append(e)
+    _standing_put(keep)
+    return keep
 
 
 def standing_set_armed(instruction_id: str, armed: bool) -> list[dict]:
@@ -2550,11 +3324,67 @@ def standing_set_armed(instruction_id: str, armed: bool) -> list[dict]:
     for e in entries:
         if e.get("id") == str(instruction_id):
             e["armed"] = bool(armed)
+            if armed and e.get("retiredReason") == "failed":
+                e["firedAt"] = None
+                e["failures"] = 0
+                e["retiredReason"] = None
     _standing_put(entries)
     return entries
 
 
+def _stop_exit_limit(ref_bid_cents: float, slip_cents: float,
+                     tick: Optional[float]) -> float:
+    """The limit for a stop's marketable fill-and-kill: the reference bid less
+    the slippage budget, on the market's tick grid.
+
+    Rounded UP onto the grid, so the order never reaches further below the bid
+    than the budget allows; never above the bid itself; and never below one
+    tick — nor below 1¢, the least `preview()` and the order builder accept. A
+    FAK sells to every resting bid at or above this price, each at ITS price,
+    so the limit is the worst case, not the expected fill.
+    """
+    tc = float(tick or 0.01) * 100.0
+    if tc <= 0:
+        tc = 1.0
+    lo = max(1.0, tc)
+    hi = min(99.0, 100.0 - tc)
+    bid = float(ref_bid_cents)
+    floor = bid - max(0.0, float(slip_cents))
+    limit = math.ceil(floor / tc - 1e-9) * tc
+    top = math.floor(bid / tc + 1e-9) * tc
+    limit = min(limit, top)
+    return round(max(lo, min(hi, limit)), 4)
+
+
+def _stop_fill(res: dict, sent: float) -> tuple[float, bool]:
+    """How many contracts a stop's sell actually sold → (sold, confirmed).
+
+    A refusal, a kill with no fill, or a reported fill of zero sold nothing.
+    An accepted order whose fill size the venue did not report is assumed to
+    have sold the size sent — re-sending on that guess would risk selling the
+    same contracts twice — and is marked unconfirmed until it reconciles.
+    """
+    if not res.get("ok"):
+        return 0.0, True
+    filled = num(res.get("filledSize"))
+    status = str(res.get("status") or "").lower()
+    if status in ("unmatched", "killed", "canceled", "cancelled", "rejected"):
+        return max(0.0, float(filled or 0.0)), True
+    if filled is None:
+        return float(sent), False
+    return max(0.0, min(float(filled), float(sent))), True
+
+
 async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> dict:
+    """Evaluate every armed instruction once.
+
+    A stop loss is an instruction the user wrote down, so it executes under
+    exactly the rules a manual click passes: paper mode blocks it, the wallet
+    must be readable, and every order goes through `place()`. It is NOT held
+    to the automation master switch — the terminal is manual, the engines are
+    not. `allow_trading=False` remains available to a caller that wants to
+    hold fire explicitly.
+    """
     paper = bool(paper) or _paper_mode_on()
     entries = standing_list()
     if not entries:
@@ -2567,7 +3397,7 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
 
     holdings: Optional[dict[tuple[str, str], float]] = None
     if any(e.get("armed") and not e.get("firedAt")
-           and e.get("kind") in ("stopLoss", "takeProfit") for e in entries):
+           and e.get("kind") in _STOP_KINDS for e in entries):
         try:
             holdings = {}
             for pos in await api.get_positions(strict=True):
@@ -2577,7 +3407,7 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
                 key = (str(pos.get("ticker") or ""),
                        "yes" if signed > 0 else "no")
                 holdings[key] = holdings.get(key, 0.0) + abs(signed)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug("standing tick: position read failed: %s", e)
             holdings = None
 
@@ -2587,7 +3417,10 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
         cid = str(e.get("conditionId") or "")
         if cid not in by_market:
             try:
-                by_market[cid] = await term.market(cid)
+                m = await term.market(cid)
+                if m:
+                    await term.clob_quotes([m])
+                by_market[cid] = m
             except Exception:
                 by_market[cid] = None
         m = by_market.get(cid)
@@ -2615,6 +3448,7 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
 
         if kind in ("alertAbove", "alertBelow"):
             e["firedAt"] = _now_iso()
+            e["retiredReason"] = "alert"
             alerts.append({
                 "id": e["id"], "conditionId": cid,
                 "title": m.get("title"), "kind": kind,
@@ -2647,7 +3481,8 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
             })
             continue
 
-        want = float(e.get("size") or 0.0)
+        want = standing_remaining(e)
+        prior_sold = float(num(e.get("soldSize")) or 0.0)
         if holdings is None:
             e["note"] = (
                 f"Trigger hit at {price:g}¢ but your positions could not be "
@@ -2658,6 +3493,7 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
         if have <= 0:
             e["armed"] = False
             e["firedAt"] = _now_iso()
+            e["retiredReason"] = "fired" if prior_sold > 0 else "noPosition"
             e["note"] = (
                 f"Trigger hit at {price:g}¢, but you no longer hold this "
                 f"{side.upper()} position — nothing to sell, so the "
@@ -2668,48 +3504,128 @@ async def standing_tick(*, allow_trading: bool = True, paper: bool = False) -> d
                 "blocked": True, "result": e["note"],
             })
             continue
+        short_note = None
         if have < want:
-            e["note"] = (
+            short_note = (
                 f"Instruction was for {want:g} contract(s) but only {have:g} "
                 f"are held — sold {have:g}.")
             want = have
+        want = float(math.floor(want + 1e-9))
+        if want <= 0:
+            e["armed"] = False
+            e["firedAt"] = _now_iso()
+            e["retiredReason"] = "fired" if prior_sold > 0 else "noPosition"
+            e["note"] = (
+                f"Trigger hit at {price:g}¢, but less than one whole contract "
+                f"is left to sell — the smallest size an order can carry — so "
+                f"the instruction has been retired. The rest can only be "
+                f"closed by letting the market settle.")
+            alerts.append({
+                "id": e["id"], "conditionId": cid, "title": m.get("title"),
+                "kind": kind, "priceCents": price, "triggerCents": trig,
+                "blocked": True, "result": e["note"],
+            })
+            continue
 
+        slip = num(e.get("maxSlippageCents"))
+        slip = (DEFAULT_SELL_SLIPPAGE_CENTS if slip is None
+                else max(0.0, min(float(MAX_SELL_SLIPPAGE_CENTS), float(slip))))
+        yes_bid, yes_ask = num(m.get("bid")), num(m.get("ask"))
+        quote_bid = (yes_bid if side == "yes"
+                     else (round(100.0 - yes_ask, 4) if yes_ask is not None else None))
+        ref_bid = quote_bid if quote_bid is not None else float(price)
+        limit = _stop_exit_limit(ref_bid, slip, None)
         req = {
             "conditionId": cid, "side": side, "action": "sell",
-            "priceCents": max(1, min(99, int(round(trig)))),
-            "size": want, "orderType": "FAK",
+            "priceCents": limit, "size": want, "orderType": "FAK",
         }
         pv = await preview(req)
-        req["confirmUsd"] = pv.get("costUsd")
+        book_bid = num((pv or {}).get("bestBidCents"))
+        tick = num((pv or {}).get("tickSize"))
+        if book_bid is not None or tick is not None:
+            better = _stop_exit_limit(
+                book_bid if book_bid is not None else ref_bid, slip, tick)
+            if abs(better - limit) > 1e-9:
+                req["priceCents"] = limit = better
+                pv = await preview(req)
+        req["confirmUsd"] = (pv or {}).get("costUsd")
         res = await place(req, origin=e.get("origin") or "manual",
                           standing_id=e["id"])
-        note = " ".join(x for x in (e.get("note"), res.get("message")) if x)
+        sold, confirmed = _stop_fill(res, want)
+        venue_msg = str(res.get("message") or "")
+
+        if sold > 0:
+            total_sold = round(prior_sold + sold, 6)
+            e["soldSize"] = total_sold
+            e["failures"] = 0
+            remaining = round(want - sold, 6)
+            final = remaining <= 1e-9
+            try:
+                _record_stop_sale(e, sold, res.get("orderId"), confirmed,
+                                  final=final)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("standing: could not record stop sale %s: %s",
+                               e.get("id"), ex)
+            unconf = ("" if confirmed else
+                      " The venue did not report the fill size, so this assumes "
+                      "the whole order filled — Track shows the real fill once "
+                      "it reconciles.")
+            if final:
+                e["firedAt"] = _now_iso()
+                e["armed"] = False
+                e["retiredReason"] = "fired"
+                e["note"] = " ".join(x for x in (
+                    short_note,
+                    f"Sold {sold:g} contract(s) at {limit:g}¢ or better "
+                    f"(trigger {trig:g}¢).{unconf}", venue_msg) if x)
+                fired += 1
+            else:
+                e["note"] = " ".join(x for x in (
+                    short_note,
+                    f"Partly fired: sold {sold:g} of {want:g} at {limit:g}¢ or "
+                    f"better; the other {remaining:g} found no bid within "
+                    f"{slip:g}¢ and is STILL ARMED — it will retry.{unconf}",
+                    venue_msg) if x)
+            alerts.append({
+                "id": e["id"], "conditionId": cid, "title": m.get("title"),
+                "kind": kind, "priceCents": price, "triggerCents": trig,
+                "result": e["note"], "ok": True, "blocked": False,
+                "partial": not final, "soldSize": sold,
+                "remainingSize": max(0.0, remaining),
+                "limitCents": limit, "status": res.get("status"),
+            })
+            continue
 
         if res.get("ok"):
-            e["firedAt"] = _now_iso()
-            e["armed"] = False
-            e["failures"] = 0
-            e["note"] = note
-            fired += 1
+            why = (f"the sell at {limit:g}¢ (bid less {slip:g}¢ slippage) "
+                   f"matched nothing")
+        elif res.get("status") == "unknown":
+            why = "Polymarket did not confirm the sell"
         else:
-            fails = int(e.get("failures") or 0) + 1
-            e["failures"] = fails
-            if fails >= MAX_STANDING_FAILURES:
-                e["armed"] = False
-                e["firedAt"] = _now_iso()
-                e["note"] = (
-                    f"Tried {fails} times and the order was refused every time "
-                    f"— giving up so it stops re-sending. Last refusal: {note}")
-            else:
-                e["note"] = (
-                    f"Trigger hit but the order was refused (attempt {fails} of "
-                    f"{MAX_STANDING_FAILURES}) — still armed, will retry. {note}")
-
+            why = "the sell was refused"
+        fails = int(e.get("failures") or 0) + 1
+        e["failures"] = fails
+        tail = " ".join(x for x in (short_note, venue_msg) if x)
+        if fails >= MAX_STANDING_FAILURES:
+            e["armed"] = False
+            e["firedAt"] = _now_iso()
+            e["retiredReason"] = "fired" if prior_sold > 0 else "failed"
+            e["note"] = (
+                f"Did NOT fire: {why}. Tried {fails} times and nothing sold — "
+                f"giving up so it stops re-sending. Your position is still "
+                f"open; sell it from the Market page, or re-arm this. "
+                f"Last result: {tail}").strip()
+        else:
+            e["note"] = (
+                f"Trigger hit at {price:g}¢ but the stop did NOT fire: {why}, "
+                f"so nothing was sold (attempt {fails} of "
+                f"{MAX_STANDING_FAILURES}) — still armed, will retry. "
+                f"{tail}").strip()
         alerts.append({
             "id": e["id"], "conditionId": cid, "title": m.get("title"),
             "kind": kind, "priceCents": price, "triggerCents": trig,
-            "result": e["note"], "ok": res.get("ok"),
-            "blocked": not res.get("ok"),
+            "result": e["note"], "ok": False, "blocked": True,
+            "soldSize": 0.0, "limitCents": limit, "status": res.get("status"),
         })
 
     _standing_merge_put(entries)

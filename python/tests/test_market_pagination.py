@@ -1,3 +1,13 @@
+"""Gamma market pagination.
+
+Gamma caps every page at 100 rows regardless of the requested `limit`.
+fetch_markets used to emit a next-cursor only when `len(data) >= limit`, and
+callers request up to 500 — so `100 >= 500` was never true, the cursor was
+always empty, and fetch_all_open_markets returned ONE page no matter what
+`max_pages` said. That silently capped scanner.sync_markets() (and therefore
+the markets table the whale, momentum and decide_market paths all read) at
+100 markets out of ~1,200 available.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +18,7 @@ import polymarket_api as api
 
 
 def _fake_gamma(total: int, page_cap: int = 100):
+    """Stand-in for Gamma: honours `offset`, never returns more than page_cap."""
     calls: list[int] = []
 
     async def _get(url, params=None, **_kw):
@@ -29,6 +40,7 @@ def _fake_gamma(total: int, page_cap: int = 100):
 
 
 def test_page_cap_below_requested_limit_still_paginates(monkeypatch):
+    """The regression: request 500, get 100, and still advance."""
     get, calls = _fake_gamma(total=350)
     monkeypatch.setattr(api, "_get", get)
 
@@ -76,6 +88,7 @@ def test_exactly_one_full_page_then_empty(monkeypatch):
 
 
 def test_requested_limit_is_clamped_to_the_real_page_ceiling(monkeypatch):
+    """Asking for 500 must not make the cursor logic think a full page is 500."""
     seen: dict = {}
 
     async def _get(url, params=None, **_kw):

@@ -1,3 +1,15 @@
+"""Headless live-validation probe for the BTC 15m Price Momentum strategy.
+
+Runs the crypto15m executor loop directly (crypto15m_trader.run_tick) against the
+funded account, with the exact user-approved config passed in as an argument — no
+settings.json, no Electron UI. Two modes:
+
+    python probe_btc_momentum.py preflight   # READ-ONLY: snapshot + rule eval, no orders
+    python probe_btc_momentum.py live        # LIVE: places REAL orders (app MUST be closed)
+
+Approved params (2026-07-15): BTC only, 5 contracts/entry (Poly min ~$2-3), max 5
+concurrent, -$20 daily loss stop, hold-to-settlement, taker, 15m interval.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-os.environ.setdefault("KRYPT_POLYBOT_USERDATA", os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Krypt PolyBot"))
+os.environ.setdefault("KRYPT_POLYBOT_USERDATA", r"C:\Users\maxwe\AppData\Roaming\Krypt PolyBot")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import db
@@ -80,6 +92,9 @@ async def _warm_feeds() -> None:
 
 
 async def preflight() -> None:
+    """READ-ONLY. Safe to run while the Electron app is still open — it only
+    reads market data and evaluates the rule; it never calls run_tick, so it
+    places no orders and does not touch open positions."""
     db.init_db()
     cfg = cfgmod.merge_with_defaults(dict(CONFIG))
     print(f"[{_ts()}] creds_present={pa.credentials_present()} env={pa.get_env()}")
@@ -101,6 +116,8 @@ async def preflight() -> None:
 
 
 async def live() -> None:
+    """LIVE — places REAL orders. The Electron app MUST be closed (same account
+    + DB, or you double-trade)."""
     db.init_db()
     cfg = cfgmod.merge_with_defaults(dict(CONFIG))
     assert pa.credentials_present(), "no credentials on this account"

@@ -1,3 +1,34 @@
+"""TEMPORARY side-strategy: Polymarket volume farmer.
+
+REMOVE-ME LATER. Self-contained so it deletes in one step:
+    delete  python/volume_farm.py
+    delete  scripts/volume-farm.mjs
+    remove  the "py:volume" line from package.json
+    (optional) delete  <userData>/volume_farm_state.json
+
+WHAT IT DOES
+    Round-trips a tiny stake in a deep, tight-spread market (buy N shares, then
+    sell them straight back) to generate trading volume. Each trip pays the
+    bid/ask spread PLUS two taker fees (fee-v2: rate × p·(1−p) per share per
+    crossing side — ~1.75c/share each way at 50c in crypto, less in other
+    categories, 0 in geopolitics). Tracks cumulative volume toward a target
+    (default $10k) and total cost (spread + fees) toward a budget (default
+    $100), and stops at whichever it hits first — it can never knowingly
+    spend past the budget.
+
+    NOTE: Polymarket's referral/leaderboard volume can take HOURS to reflect
+    these trades — the on-book volume is real immediately; the dashboards lag.
+
+CAVEATS (still true)
+    Wash/self-reversing volume is against Polymarket's ToS and they can claw
+    back rewards / ban for artificial volume inflation. This is your call on
+    your own account. DRY-RUN is the default; nothing trades until --live --yes.
+
+USAGE
+    npm run py:volume                                    # dry-run projection
+    npm run py:volume -- --ticker 0x... --size 20        # dry-run a market
+    npm run py:volume -- --live --yes --target 10000 --budget 100
+"""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +57,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("volume_farm")
+
 
 
 @dataclass
@@ -80,7 +112,12 @@ def _save_progress(args, prog: Progress) -> None:
         log.warning(f"could not write state file: {e}")
 
 
+
 async def _yes_book(ticker: str) -> dict | None:
+    """True top-of-book for a market's YES token, read from the CLOB /book:
+    {bid, ask (cents), bid_size, ask_size, min_size}. The raw book gives a
+    genuine best bid < best ask plus resting depth (get_quote's /price source
+    rounds across the tick and can report a crossed bid/ask)."""
     meta = await api.get_market_meta(ticker)
     if not meta or not meta.get("yes_token"):
         return None
@@ -166,6 +203,7 @@ async def pick_market(args) -> dict | None:
     return best
 
 
+
 def _parse_order(order: dict) -> tuple[int, float, str]:
     def f(v):
         try:
@@ -176,7 +214,9 @@ def _parse_order(order: dict) -> tuple[int, float, str]:
     price = f(order.get("price"))
     avg_cents = price * 100
     raw = (order.get("status") or "").lower()
-    if "match" in raw:
+    if "unmatched" in raw or "killed" in raw:
+        status = "canceled"
+    elif "match" in raw:
         status = "filled"
     elif "cancel" in raw or "invalid" in raw:
         status = "canceled"
@@ -207,6 +247,7 @@ async def _poll_fill(order_id: str, target: int, timeout: float) -> tuple[int, f
     return filled, avg
 
 
+
 async def _place(ticker: str, action: str, count: int, price_cents: int) -> str | None:
     coid = f"krypt-vol-{uuid.uuid4().hex[:10]}"
     resp = await api.place_limit_order(
@@ -218,6 +259,7 @@ async def _place(ticker: str, action: str, count: int, price_cents: int) -> str 
 
 
 async def round_trip_live(mkt: dict, shares: int, args) -> tuple[float, float, float]:
+    """Buy->sell round trip on the live book. Returns (volume, cost, stuck)."""
     ticker = mkt["ticker"]
     bk = await _yes_book(ticker)
     if not bk:
@@ -300,7 +342,11 @@ async def round_trip_live(mkt: dict, shares: int, args) -> tuple[float, float, f
     return volume, cost, float(remaining)
 
 
+
 def _trip_fee_usd(mkt: dict, shares: int) -> float:
+    """Taker fees for one round trip (buy at the ask + sell at the bid),
+    fee-v2 per side. Category defaults to 'other' (0.05) when the market
+    row doesn't carry one — only geopolitics is actually free."""
     import backtest as bt
     cat = str(mkt.get("category") or "other")
     buy_p = float(mkt["ask"]) / 100.0
@@ -347,6 +393,7 @@ def project(mkt: dict, shares: int, prog: Progress, args) -> None:
               f" (top-of-book estimate; real slippage adds cost).")
     print(bar)
     print("\nHappy with this? Re-run with  --live --yes  to place real orders.\n")
+
 
 
 async def run(args) -> int:

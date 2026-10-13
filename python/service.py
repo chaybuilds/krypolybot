@@ -1,3 +1,36 @@
+"""Krypt PolyBot backend service.
+
+Spawned as a child process by the Electron main process. Communicates
+exclusively via JSON-line stdin/stdout (no HTTP server, no shared
+filesystem state besides the SQLite DB and the credential files in
+<userData>).
+
+Wire protocol — one JSON object per line:
+
+  Command         {"type": "rpc", "id": "<uuid>", "method": "...", "params": {...}}
+  Response (ok)   {"type": "rpc", "id": "<uuid>", "ok": true, "result": {...}}
+  Response (err)  {"type": "rpc", "id": "<uuid>", "ok": false, "error": "..."}
+  Event           {"type": "event", "name": "...", "data": {...}}
+  Log             {"type": "log", "level": "INFO", "source": "...", "msg": "..."}
+
+Methods (called from Electron main):
+  ping
+  setConfig          {config: {...}}
+  setCredentials     {privateKey, apiCreds?}
+  clearCredentials
+  credentialStatus
+  testCredentials
+  account
+  pnlSeries          {sinceHours?}
+  positions          {filter?}
+  signals            {filter?}
+  scannerStats
+  cancelAllOpen
+  flatten
+  runOnce            {action}                 -- syncMarkets|pollOrders|resolveAll|reconcilePositions|syncPositions|recomputePnl|reconcileFills|auditPnl
+  pause              {paused: bool}
+  shutdown
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +41,7 @@ import logging
 import logging.handlers
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -19,11 +53,19 @@ if __name__ == "__main__" and "--mcp" in sys.argv:
     import mcp_stdio
     sys.exit(mcp_stdio.main())
 
+if __name__ == "__main__" and "--backtest-child" in sys.argv:
+    import script_backtest_child
+    sys.exit(script_backtest_child.main())
+
+if __name__ == "__main__":
+    sys.modules.setdefault("service", sys.modules[__name__])
+
 
 _log_q: asyncio.Queue | None = None
 
 
 class _StdoutHandler(logging.Handler):
+    """Forward every log record up to the Electron parent as a JSON line."""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -73,38 +115,53 @@ def _setup_logging() -> None:
     sh = _StdoutHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
+    try:
+        import logscrub
+        logscrub.install(root)
+    except Exception:  # noqa: BLE001 — a missing scrubber is a selftest failure
+        pass
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 
 _setup_logging()
 logger = logging.getLogger("service")
 
 
-import db
-import polymarket_api
-import polymarket_auth
-import scanner
-import crypto15m
-import trader
-import crypto15m_trader
-import crypto15m_record
-import perps_api
-import perps_board
-import perps_maker
-import perps_ws
-import user_ws
-import data_v2
-import activity_ws
-import copy_trader
-import script_engine
-import script_sandbox
-import rtds_ws
-import spot_ws
-from config import DEFAULT_CONFIG, merge_with_defaults
+import db  # noqa: E402
+import polymarket_api  # noqa: E402
+import polymarket_auth  # noqa: E402
+import scanner  # noqa: E402
+import crypto15m  # noqa: E402
+import trader  # noqa: E402
+import crypto15m_trader  # noqa: E402
+import crypto15m_record  # noqa: E402
+import perps_api  # noqa: E402
+import perps_board  # noqa: E402
+import perps_maker  # noqa: E402
+import perps_ws  # noqa: E402
+import user_ws  # noqa: E402
+import data_v2  # noqa: E402
+import activity_ws  # noqa: E402
+import copy_trader  # noqa: E402
+import script_engine  # noqa: E402
+import script_sandbox  # noqa: E402
+import rtds_ws  # noqa: E402
+import spot_ws  # noqa: E402
+from config import DEFAULT_CONFIG, merge_with_defaults  # noqa: E402
 
 
 def _iso_utc(s: Any) -> Any:
+    """Normalise a SQLite naive-UTC timestamp ("YYYY-MM-DD HH:MM:SS") into
+    a real ISO 8601 UTC string ("YYYY-MM-DDTHH:MM:SSZ").
+
+    Why: SQLite's `datetime('now')` writes naive UTC strings without a Z.
+    JavaScript's Date parser then interprets those strings as LOCAL time
+    (Chrome behaviour), which made every "Started at" / "Resolved at"
+    field show up 7 hours off for users in PT. Tagging with Z makes JS
+    parse them correctly so `toLocaleString()` formats in the user's
+    real local zone."""
     if not s:
         return s
     if not isinstance(s, str):
@@ -115,6 +172,7 @@ def _iso_utc(s: Any) -> Any:
     if s.endswith("Z") or "+" in s[10:] or s.count("-") > 2:
         return s.replace(" ", "T")
     return s.replace(" ", "T") + "Z"
+
 
 
 class State:
@@ -132,6 +190,7 @@ class State:
 
 
 STATE = State()
+
 
 
 _stdout_lock = asyncio.Lock()
@@ -156,6 +215,17 @@ async def respond_ok(req_id: str, result: Any = None) -> None:
 
 async def respond_err(req_id: str, msg: str) -> None:
     await _send({"type": "rpc", "id": req_id, "ok": False, "error": msg})
+
+
+
+def _balance_persistable() -> bool:
+    """Whether this account snapshot may be written down as a balance point
+    (the P&L chart, the daily stop's input, transfer detection, the run row).
+    Not while /value keeps failing: that total is today's cash plus a stale
+    portfolio, and once persisted it becomes the reading the daily stop acts
+    on and the baseline the next real reading is measured against. The
+    snapshot still goes to the UI."""
+    return bool(STATE.auth_ok) and not trader.portfolio_stale()
 
 
 async def _build_account_snapshot() -> dict:
@@ -246,6 +316,7 @@ async def _build_account_snapshot() -> dict:
         "totalUsd": total,
         "balanceSyncing": balance_syncing,
         "tradingGeoblocked": polymarket_api.geoblock_active(),
+        "tradingRegion": polymarket_api.region_snapshot(refresh=bool(STATE.auth_ok)),
         "tradingRestriction": polymarket_api.trading_restriction(),
         "userFeed": user_ws.feed.status(),
         "startBankrollUsd": baseline,
@@ -290,7 +361,11 @@ async def _build_account_snapshot() -> dict:
     }
 
 
+
 def _live_pnl_usd(r: dict) -> float | None:
+    """Unrealized P&L for an OPEN filled position: held contracts valued at
+    the live mark price minus cost. None for resolved rows (use realized
+    pnl), unfilled rows, or rows without a mark yet."""
     if r.get("resolved"):
         return None
     mark = r.get("mark_price_cents")
@@ -424,6 +499,7 @@ def _signal_row_to_js(r: dict, source: str, traded: bool) -> dict:
     }
 
 
+
 _loop_task: asyncio.Task | None = None
 _loop_stop: asyncio.Event | None = None
 _watchdog_task: asyncio.Task | None = None
@@ -458,6 +534,11 @@ _bg_tasks: set[asyncio.Task] = set()
 
 
 def _fire_and_forget(coro) -> None:
+    """Run a coroutine as a detached background task so a slow call can never
+    stall the trading loop (the balance refresh after a fill goes through a
+    retry ladder that can take seconds — exactly when open positions need
+    their management cadence). Errors are swallowed; a strong reference is
+    kept so the task can't be garbage-collected mid-flight."""
     async def _quiet():
         try:
             await coro
@@ -476,6 +557,9 @@ _socket_whale_inflight: set[str] = set()
 
 
 def _whale_collection_on(cfg: dict) -> bool:
+    """Whale/momentum collection gate: scanning runs when the user collects
+    main-engine research data OR trading is on (the engine can't follow signals
+    it never sees) OR a user script consumes signals."""
     return (
         bool(cfg.get("main_record_signals", True))
         or bool(cfg.get("enable_trading"))
@@ -484,6 +568,10 @@ def _whale_collection_on(cfg: dict) -> bool:
 
 
 async def _emit_whale_batch(rows: list[dict]) -> None:
+    """Ship freshly-inserted whale rows to the renderer as ONE `signal:batch`.
+
+    Shared by the REST poll and the socket push so the renderer needs no idea
+    which one found the whale (a batch of one is fine)."""
     if not rows:
         return
     with db.get_db() as conn:
@@ -496,6 +584,8 @@ async def _emit_whale_batch(rows: list[dict]) -> None:
 
 
 async def _handle_socket_whale(trade: dict) -> None:
+    """Detect + insert + emit ONE socket-seen whale. Detached (fire-and-forget)
+    so a Gamma market lookup can never sit on the websocket read loop."""
     tid = str(trade.get("trade_id") or "")
     try:
         cnt, rows = await scanner.process_whale_trades(STATE.cfg, [trade])
@@ -511,16 +601,21 @@ async def _handle_socket_whale(trade: dict) -> None:
 
 
 def _wake_copy(reason: str = "") -> None:
+    """Nudge the copy loop out of its cadence wait. Safe from the socket's read
+    loop (Event.set is sync and never raises for a set Event)."""
     ev = _copy_wake
     if ev is None:
         return
     try:
         ev.set()
-    except Exception as e:
+    except Exception as e:      # pragma: no cover - defensive
         logger.debug(f"copy wake ({reason}) failed: {e}")
 
 
 def _wake_copy_if_followed(cfg: dict, raw: dict) -> None:
+    """Wake the copy loop when `raw` is a trade by a wallet we follow. Cheap:
+    a lowercase compare against the (small) follow list, on the socket's read
+    loop, for every frame on the tape."""
     try:
         wallets = cfg.get("copy_wallets") or []
         if not wallets or not cfg.get("copy_enabled"):
@@ -532,11 +627,13 @@ def _wake_copy_if_followed(cfg: dict, raw: dict) -> None:
             if str(x).strip().lower() == w:
                 _wake_copy("activity push")
                 return
-    except Exception as e:
+    except Exception as e:      # pragma: no cover - defensive
         logger.debug(f"copy wake check: {e}")
 
 
 def _on_activity_trade(raw: dict) -> None:
+    """Sync sink for EVERY trade on the RTDS tape. Runs on the socket's read
+    loop, so it does only cheap work and hands anything awaitable to a task."""
     try:
         cfg = STATE.cfg
         if hasattr(copy_trader, "on_activity_trade"):
@@ -563,6 +660,7 @@ _market_sync_task: asyncio.Task | None = None
 
 
 def _start_market_sync(max_pages: int = 10) -> bool:
+    """Start a background market sync. False if one is already in flight."""
     global _market_sync_task
     if _market_sync_task and not _market_sync_task.done():
         try:
@@ -595,6 +693,7 @@ _BLOCK_SLOW_SEC = 5.0
 
 @contextlib.asynccontextmanager
 async def _block(name: str, ceiling_sec: float = _BLOCK_CEILING_SEC):
+    """Time + ceiling one master-loop block. Swallows the ceiling timeout."""
     t0 = time.perf_counter()
     timed_out = False
     try:
@@ -619,6 +718,11 @@ async def _block(name: str, ceiling_sec: float = _BLOCK_CEILING_SEC):
 
 
 async def _on_crypto15m_auto_off(info: dict) -> None:
+    """The crypto15m engine hit its overall take-profit target and turned itself
+    off (it already flipped crypto15m_enabled in STATE.cfg, which it shares by
+    reference). Tell the host (Electron) so it PERSISTS crypto15m_enabled=False
+    and reflects it in the UI toggle, and push a fresh snapshot so the dashboard
+    updates at once."""
     try:
         STATE.cfg["crypto15m_enabled"] = False
     except Exception:
@@ -641,6 +745,7 @@ async def _on_crypto15m_auto_off(info: dict) -> None:
 
 
 async def _scanner_and_trader_loop() -> None:
+    """Single coroutine that runs every periodic task on its own cadence."""
     global _loop_heartbeat
     _loop_heartbeat = asyncio.get_event_loop().time()
     last_whale = 0.0
@@ -664,6 +769,8 @@ async def _scanner_and_trader_loop() -> None:
     last_paper = 0.0
     last_remote = 0.0
     last_mcp = 0.0
+    last_forecast = 0.0
+    last_autopilot = 0.0
 
     try:
         cnt = await scanner.sync_markets(max_pages=10)
@@ -916,7 +1023,7 @@ async def _scanner_and_trader_loop() -> None:
             async with _block("accountSnapshot"):
                 if now - last_account_emit >= 15:
                     snap = await _build_account_snapshot()
-                    if STATE.auth_ok:
+                    if _balance_persistable():
                         with db.get_db() as conn:
                             if now - last_pnl_persist >= 60:
                                 try:
@@ -964,9 +1071,9 @@ async def _scanner_and_trader_loop() -> None:
                 if now - last_standing >= 10:
                     last_standing = now
                     import terminal_trade
+                    from config import account_live
                     res = await terminal_trade.standing_tick(
-                        allow_trading=True,
-                        paper=bool(cfg.get("terminal_paper_mode")))
+                        allow_trading=True, paper=not account_live(cfg))
                     for a in res.get("alerts") or []:
                         await emit_event("terminal:standing", a)
                         try:
@@ -1016,10 +1123,39 @@ async def _scanner_and_trader_loop() -> None:
         except Exception as e:
             logger.debug(f"paper tick error: {e}")
 
+        try:
+            async with _block("forecasts"):
+                if now - last_forecast >= 300:
+                    last_forecast = now
+                    import forecast_ledger
+                    await forecast_ledger.resolve_pending()
+        except Exception as e:
+            logger.debug(f"forecast resolve error: {e}")
+
+        try:
+            async with _block("autopilot"):
+                if now - last_autopilot >= 30:
+                    last_autopilot = now
+                    acfg = merge_with_defaults(dict(STATE.cfg or {}))
+                    if acfg.get("autopilot_enabled"):
+                        import autopilot
+                        if autopilot.due(acfg) and autopilot.blocked_reason(acfg) is None:
+                            t = asyncio.create_task(autopilot.run_once(acfg, "schedule"))
+                            _bg_tasks.add(t)
+                            t.add_done_callback(_bg_tasks.discard)
+        except Exception as e:
+            logger.debug(f"autopilot schedule error: {e}")
+
         await asyncio.sleep(1)
 
 
+
 async def _engine_supervisor(name: str, body, heartbeat_attr: str) -> None:
+    """Run `body()` forever, restarting it on any crash with exponential
+    backoff. A trading engine that dies silently is the failure mode this file
+    is written against, so a crash is CRITICAL-logged; the heartbeat is
+    re-stamped across the backoff sleep so the watchdog doesn't also fire while
+    we are deliberately waiting."""
     delay = 1.0
     while not (_loop_stop and _loop_stop.is_set()):
         started = asyncio.get_event_loop().time()
@@ -1045,6 +1181,18 @@ async def _engine_supervisor(name: str, body, heartbeat_attr: str) -> None:
 
 
 async def _copy_loop() -> None:
+    """Copy trading on its own cadence, woken directly by the trade tape.
+
+    Cadence (unchanged from when this rode the master loop, minus the 0-10s it
+    used to spend queued behind the other blocks):
+      - activity_ws PUSH: a followed wallet's BUY/SELL sets `_copy_wake` from
+        the socket's read loop, so the tick starts within milliseconds
+        (debounced to 1s so a burst of frames is one tick),
+      - FAST (copy_fast_poll_sec) whenever we HOLD open copies (their sell has
+        to be mirrored quickly) or the hot window after a push is live,
+      - BASE (copy_poll_sec) otherwise - idle entry discovery.
+    The socket's LIFECYCLE stays on the master loop (it is shared with whale
+    detection); this loop only consumes it."""
     await _engine_supervisor("copy", _copy_loop_body, "_copy_heartbeat")
 
 
@@ -1109,6 +1257,7 @@ async def _copy_loop_body() -> None:
 
 
 async def _copy_sleep(seconds: float) -> None:
+    """Sleep, but return immediately when the trade tape wakes copy."""
     ev = _copy_wake
     if ev is None:
         await asyncio.sleep(seconds)
@@ -1122,6 +1271,14 @@ async def _copy_sleep(seconds: float) -> None:
 
 
 async def _crypto15m_loop() -> None:
+    """The 15-minute crypto executor on its own 4s cadence.
+
+    Places REAL orders (no paper mode). Gated on auth, NOT on
+    crypto15m_enabled: run_tick cheaply no-ops when the engine is off AND
+    nothing is open, but still MANAGES open positions to settlement after the
+    engine is turned off - a manual toggle or the overall take-profit
+    kill-switch must never strand an open bet. New entries are opened only when
+    crypto15m_enabled is on. Independent of the main bot's enable_trading."""
     await _engine_supervisor("crypto15m", _crypto15m_loop_body, "_crypto_heartbeat")
 
 
@@ -1183,10 +1340,19 @@ async def _crypto15m_loop_body() -> None:
 
 
 async def _perps_loop() -> None:
+    """The Perps market maker on its own cadence (`perps_poll_sec`). Gated on a
+    linked Perps account, not on the CLOB wallet session: once the proxy
+    credential exists the engine needs nothing else. With the engine off it
+    still ticks — to cancel any quotes it left behind and to keep the tab's
+    preview fresh — but never places an order."""
     await _engine_supervisor("perps", _perps_loop_body, "_perps_heartbeat")
 
 
 async def _perps_loop_body() -> None:
+    """A full tick (account + orders re-synced with the exchange) every
+    `perps_poll_sec`; between them, the live price feed wakes the loop the
+    moment a quoted market's mid moves and only those markets are requoted
+    from cached state."""
     global _perps_heartbeat
     loop = asyncio.get_event_loop()
     _perps_heartbeat = loop.time()
@@ -1225,6 +1391,9 @@ async def _perps_loop_body() -> None:
 
 
 async def _start_loop() -> None:
+    """Start every engine loop (master + copy + crypto15m + perps) and the
+    watchdog that supervises them. `_loop_stop` is shared: one Event stops
+    every loop, which is what factory-reset / clear-history / shutdown want."""
     global _loop_task, _loop_stop, _watchdog_task
     global _copy_task, _crypto_task, _copy_wake, _perps_task
     if _loop_task and not _loop_task.done():
@@ -1241,6 +1410,10 @@ async def _start_loop() -> None:
 
 
 async def _stop_loop() -> None:
+    """Stop the watchdog and every engine loop. Each is given the shared stop
+    Event first (so it exits its own `while` cleanly), then a bounded wait,
+    then a hard cancel — a task still pending at process exit is what produces
+    'Task was destroyed but it is pending!' on stderr."""
     global _loop_task, _loop_stop, _watchdog_task, _copy_task, _crypto_task, _perps_task
     if _loop_stop:
         _loop_stop.set()
@@ -1269,6 +1442,13 @@ async def _stop_loop() -> None:
 
 async def _restart_engine_loop(label: str, task_attr: str, factory_attr: str,
                                *, stalled: float | None = None) -> None:
+    """Cancel (if needed) and re-spawn ONE engine loop.
+
+    A restart is SAFE here: DB writes are synchronous, so a cancel can only land
+    on a network await (never mid-write), and any order that reached the exchange
+    is re-imported by the wallet-authoritative reconcile when the loop comes back
+    up. A false restart (e.g. a legitimately slow iteration during a network
+    outage) is harmless - it just re-enters the same idempotent loop."""
     task = globals().get(task_attr)
     if task is not None and not task.done():
         try:
@@ -1296,6 +1476,10 @@ async def _restart_engine_loop(label: str, task_attr: str, factory_attr: str,
 
 
 def _restart_allowed(label: str, now: float) -> float:
+    """0.0 if `label` may be restarted right now, else the seconds still to
+    wait. Exponential backoff so a loop that dies on every single start cannot
+    spin the watchdog restarting it forever; the ladder resets once a loop has
+    been up for a minute."""
     st = _loop_restart_state.get(label)
     if st is None:
         return 0.0
@@ -1321,6 +1505,13 @@ def _note_restart(label: str, now: float) -> None:
 
 
 async def _loop_watchdog() -> None:
+    """Force-restart any engine loop whose heartbeat goes stale (or whose task
+    ended), so open real-money positions never silently stop being managed if
+    some await hangs.
+
+    Watches every loop - master, copy, crypto15m, perps - independently: a
+    stalled copy loop restarts the copy loop only, leaving the master loop's
+    reconcile/settlement passes and the crypto engine untouched."""
     while not (_loop_stop and _loop_stop.is_set()):
         try:
             await asyncio.sleep(_WATCHDOG_CHECK_SEC)
@@ -1364,6 +1555,7 @@ async def _loop_watchdog() -> None:
                 logger.error(f"{label} loop restart failed: {e}", exc_info=True)
 
 
+
 async def _h_ping(_p: dict) -> dict:
     return {"pong": True, "ts": datetime.now(timezone.utc).isoformat()}
 
@@ -1371,6 +1563,11 @@ async def _h_ping(_p: dict) -> dict:
 async def _h_setConfig(p: dict) -> dict:
     cfg = merge_with_defaults(p.get("config") or {})
     STATE.cfg = cfg
+    if p.get("pruneAgentTokens"):
+        import mcp_server
+        gone = mcp_server.prune_tokens(cfg)
+        if gone:
+            logger.info(f"mcp: removed {len(gone)} deleted agent token(s)")
     import backtest as _bt
     _bt.set_taker_rebate(cfg.get("taker_rebate_pct"))
     crypto15m.set_taker_rebate(cfg.get("taker_rebate_pct"))
@@ -1422,12 +1619,15 @@ async def _h_setConfig(p: dict) -> dict:
             logger.warning(f"could not roll bot_run on env switch: {e}")
     try:
         await _mcp_sync()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"mcp sync failed: {e}")
     return {"ok": True}
 
 
 async def _h_setCredentials(p: dict) -> dict:
+    """Save the Polygon wallet private key (and optional pre-derived API
+    creds). The CLOB API credentials are derived on demand from the wallet
+    key, so normally only `privateKey` is needed."""
     p = p or {}
     private_key = p.get("privateKey") or p.get("apiKey") or ""
     api_creds = p.get("apiCreds")
@@ -1447,7 +1647,7 @@ async def _h_setCredentials(p: dict) -> dict:
             private_key, api_creds, env, funder=funder, signature_type=sig_type,
         )
     try:
-        polymarket_api._creds_derived = False
+        polymarket_api._creds_derived = False  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -1455,7 +1655,7 @@ async def _h_setCredentials(p: dict) -> dict:
     global _sig_type_reconciled
     _sig_type_reconciled = False
     try:
-        trader._balance_cache.pop(active_env, None)
+        trader._balance_cache.pop(active_env, None)  # type: ignore[attr-defined]
     except Exception:
         pass
     if active_env in (None, polymarket_auth.get_env()):
@@ -1516,6 +1716,21 @@ _sig_type_reconciled = False
 
 
 async def _reconcile_signature_type() -> None:
+    """Re-detect the deposit wallet's signing scheme once per launch and correct
+    a wrong stored value.
+
+    A shipped version of `detect_wallet_signature_type` concluded POLY_PROXY (1)
+    from the mere ABSENCE of an EIP-1271 selector, and `check_trading_ready`
+    persisted that — silently downgrading the current-generation deposit wallet
+    (the email/Google default) from POLY_1271 (3). Every order it then signed was
+    rejected with "the order signer address has to be the address of the api key".
+
+    Detection alone doesn't rescue those users: it only runs from the manual
+    Test/Save button. Someone who installs the fix and simply reopens the app
+    would keep the corrupt type and stay unable to trade. Run it on connect so the
+    repair lands with zero user action. Detection abstains (returns None) unless
+    the chain positively proves a type, so this can never introduce a wrong value.
+    """
     global _sig_type_reconciled
     if _sig_type_reconciled:
         return
@@ -1539,7 +1754,55 @@ async def _reconcile_signature_type() -> None:
         logger.debug(f"[wallet] signature-type reconcile skipped: {e}")
 
 
+async def _reconcile_signer_role() -> None:
+    """Ask the deposit wallet, on connect, whether the imported key is its owner
+    or a session signer — the form every POLY_1271 order must be signed in.
+
+    This used to be learned only by the manual Test button and held only in
+    memory, so after every restart a session key signed in the owner form and
+    every order (exits included) was rejected until the user clicked Test.
+    Read-only (two eth_calls at most); once the wallet has answered for this
+    key + wallet it isn't asked again this process. When the chain can't be read
+    the role saved by an earlier run is used instead, and a signature rejection
+    re-asks (polymarket_api.place_limit_order). Never raises.
+    """
+    try:
+        funder = polymarket_auth.get_funder()
+        if (not funder
+                or polymarket_auth.get_signature_type() != polymarket_auth.SIGNATURE_TYPE_POLY_1271):
+            return
+        signer = polymarket_auth.get_address()
+        if polymarket_auth.signer_role_for(signer, funder)[1] == "chain":
+            return
+        res = await polymarket_api.check_deposit_wallet_authorization()
+        role, source = polymarket_auth.signer_role_for(signer, funder)
+        if source == "chain":
+            if role == "SESSION_KEY":
+                logger.info(
+                    f"[wallet] imported key is a session signer of deposit {funder}; "
+                    "orders carry the session envelope"
+                )
+            if res.get("tested") and not res.get("ok"):
+                logger.warning(f"[wallet] {res.get('reason')}")
+        else:
+            logger.info(
+                f"[wallet] could not confirm the signer role on-chain "
+                f"({res.get('reason') or 'no answer'}); signing as {role} ({source})"
+            )
+    except Exception as e:
+        logger.debug(f"[wallet] signer-role check skipped: {e}")
+
+
 async def _establish_auth(retries: int = 3) -> bool:
+    """Verify the wallet is connected by deriving CLOB API credentials — the
+    real 'can this wallet authenticate' signal — with retries so a single
+    transient blip (RPC timeout, region 403, rate-limit) can't latch auth as
+    'disconnected'.
+
+    The balance read is best-effort and never decides the verdict: it hits
+    flaky public Polygon RPCs, and letting it fail the check was the cause of
+    spurious 'saved wallet could not connect to Polymarket' on the dashboard
+    (where the user then had to click Wallet → Test to clear it)."""
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
@@ -1552,16 +1815,23 @@ async def _establish_auth(retries: int = 3) -> bool:
                 await asyncio.sleep(1.5 * attempt)
             continue
         await _reconcile_signature_type()
-        try:
-            await polymarket_api.get_balance()
-        except Exception as be:
-            logger.debug(f"auth verify: balance warm failed (non-fatal): {be}")
+
+        async def _warm_balance() -> None:
+            try:
+                await polymarket_api.get_balance()
+            except Exception as be:
+                logger.debug(f"auth verify: balance warm failed (non-fatal): {be}")
+
+        await asyncio.gather(_reconcile_signer_role(), _warm_balance(),
+                             return_exceptions=True)
         return True
     logger.warning(f"auth verify failed after {retries} attempts: {last_exc}")
     return False
 
 
 async def _h_testCredentials(p: dict) -> dict:
+    """Verify the wallet by deriving CLOB API credentials from it and
+    fetching the account balance. Single network (mainnet)."""
     p = p or {}
     target_env = polymarket_auth.get_env()
     if not polymarket_auth.credentials_present(target_env):
@@ -1607,6 +1877,8 @@ async def _h_testCredentials(p: dict) -> dict:
         "approvalsOk": ready.get("approvalsOk"),
         "signerOk": ready.get("signerOk"),
         "issues": ready.get("issues", []),
+        "fatalIssues": ready.get("fatalIssues", []),
+        "region": ready.get("region"),
         "address": ready.get("address", ""),
     }
 
@@ -1837,11 +2109,30 @@ async def _h_runOnce(p: dict) -> dict:
 
 
 async def _h_pause(p: dict) -> dict:
+    """Pause the engine loop. Pausing also stops the AI agents and Autopilot
+    (trade mode off, persisted like the phone's /pause): they run on the MCP
+    server and Autopilot's own task, not this loop, so a pause that only froze
+    the loop let them keep trading — with approvals off, unseen. Unpausing
+    does NOT turn them back on; that is the AI Agents page's call."""
     STATE.paused = bool((p or {}).get("paused", False))
-    return {"paused": STATE.paused}
+    out: dict = {"paused": STATE.paused}
+    if STATE.paused:
+        try:
+            import remote
+            was = await remote.stop_agents()
+            out["agentsStopped"] = True
+            out["message"] = "Engines paused. " + remote.agents_stopped_text(was)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pause: could not stop the AI agents: %s", e)
+            out["agentsStopped"] = False
+            out["message"] = ("Engines paused, but the AI agents could NOT be "
+                              f"stopped ({type(e).__name__}). Turn them off on "
+                              "the AI Agents page.")
+    return out
 
 
 def _run_row_to_js(r: dict) -> dict:
+    """Serialise a `bot_runs` row for the renderer."""
     return {
         "id": int(r["id"]),
         "network": r.get("network") or "mainnet",
@@ -1871,6 +2162,8 @@ def _run_row_to_js(r: dict) -> dict:
 
 
 async def _h_botRuns(p: dict) -> dict:
+    """Return the most recent bot_runs rows for the History → Run
+    History tab. Optional params: env, limit."""
     env = (p or {}).get("env")
     limit = int((p or {}).get("limit") or 100)
     with db.get_db() as conn:
@@ -1894,6 +2187,18 @@ async def _h_shutdown(_p: dict) -> dict:
 
 
 async def _h_factoryReset(_p: dict) -> dict:
+    """Wipe ALL trade history, bot runs, P&L snapshots, signals, and
+    scanner state from the local DB. Public Polymarket market cache is
+    preserved (no PII, just public data).
+
+    The trader loop is STOPPED first — without this, a reconcile
+    cycle running mid-wipe will re-INSERT the live Polymarket positions
+    we just deleted, which is exactly what made earlier reset
+    attempts look like nothing happened. The active bot run (if any)
+    is closed; in-memory snapshot state is cleared so the dashboard
+    returns to a true zero. The loop is restarted and the next
+    reconcile re-imports live positions as fresh `external` rows.
+    """
     logger.warning("factory reset: STARTING — pausing trader loop")
     await _stop_loop()
 
@@ -1958,6 +2263,18 @@ async def _h_factoryReset(_p: dict) -> dict:
 
 
 async def _h_clearHistory(_p: dict) -> dict:
+    """Wipe trade history / P&L / sessions ONLY — keep all settings, the
+    wallet credentials, and the live signal feed. This is the targeted
+    "reset my stats" button on the History page (vs. `factoryReset`, which
+    also drops scanner/signal state).
+
+    Same loop-pause discipline as factory reset: a reconcile cycle running
+    mid-wipe would re-INSERT live Polymarket positions, so the loop is
+    stopped, the active run closed, the history cleared, then the loop and a
+    fresh session run are restarted with the user's current balance as the
+    new baseline. Open Polymarket positions are re-imported as `external`
+    rows on the next tick — only the resolved *history* is actually gone.
+    """
     logger.warning("clear history: STARTING — pausing trader loop")
     await _stop_loop()
 
@@ -2024,7 +2341,10 @@ async def _h_crypto15mStatus(_p: dict) -> dict:
     return await crypto15m_trader.status(STATE.cfg, authed=STATE.auth_ok)
 
 
+
 async def _h_perps_board(_p: dict) -> dict:
+    """Every Perps market with reward/competition/volume stats (public data;
+    works without a linked account)."""
     return await perps_board.snapshot(STATE.cfg)
 
 
@@ -2038,6 +2358,8 @@ async def _h_perps_status(_p: dict) -> dict:
 
 
 async def _h_perps_link(_p: dict) -> dict:
+    """Authorise a Perps proxy signer with the saved wallet key (one wallet
+    signature) and store it."""
     try:
         link = await perps_api.link_account()
     except perps_api.PerpsAPIError as e:
@@ -2048,6 +2370,8 @@ async def _h_perps_link(_p: dict) -> dict:
 
 
 async def _h_perps_unlink(_p: dict) -> dict:
+    """Forget the proxy credential. Our resting quotes are cancelled first —
+    without the credential nothing could cancel them afterwards."""
     c = perps_api.creds()
     if c:
         try:
@@ -2058,7 +2382,10 @@ async def _h_perps_unlink(_p: dict) -> dict:
     return {"ok": True, "message": "Perps account unlinked."}
 
 
+
 async def _h_data_user_pnl(p: dict) -> dict:
+    """Polymarket's own P&L for the connected wallet over a window —
+    including the rebates and rewards it pays out separately."""
     try:
         user = polymarket_auth.trading_address()
     except Exception:
@@ -2100,6 +2427,10 @@ _perps_bt_lock = asyncio.Lock()
 
 
 async def _h_perps_backtest(p: dict) -> dict:
+    """Replay the Perps market maker over the exchange's trade history (REST
+    backfill + the live recorder's tape). One at a time: a run can page
+    hundreds of history requests and shares the per-IP rate limit with the
+    live engine."""
     import perps_backtest
     if _perps_bt_lock.locked():
         return {"ok": False, "message": "A Perps backtest is already running."}
@@ -2133,6 +2464,7 @@ async def _h_perps_cancel_all(_p: dict) -> dict:
 
 
 async def _h_c15_history(p: dict) -> dict:
+    """Resolved 15m trades (with strategy attribution) for the History page."""
     limit = min(1000, max(1, int((p or {}).get("limit") or 200)))
     env = polymarket_auth.get_env()
     with db.get_db() as conn:
@@ -2141,18 +2473,28 @@ async def _h_c15_history(p: dict) -> dict:
 
 
 async def _h_c15_backtest(p: dict) -> dict:
+    """Replay the CURRENT (or supplied) 15m config over recorded ticks using
+    the live entry gates. Read-heavy — run off the event loop."""
     import replay
-    cfg = dict(STATE.cfg or {})
+    live = STATE.cfg or {}
+    cfg = dict(live)
     patch = (p or {}).get("config") or {}
     if isinstance(patch, dict):
         cfg.update(patch)
     cfg = merge_with_defaults(cfg)
     since = int((p or {}).get("sinceDays") or 60)
     env = str((p or {}).get("env") or polymarket_auth.get_env())
-    return await asyncio.to_thread(replay.replay, cfg, env=env, since_days=since)
+    return await asyncio.to_thread(
+        replay.replay, cfg, env=env, since_days=since,
+        recording_interval=crypto15m._interval(live),
+        recording_on=bool(live.get("crypto15m_record_signals", True)),
+    )
 
 
 async def _h_c15_parlay_generate(p: dict) -> dict:
+    """Run the per-hour parlay generator over the recorded corpus. Saves the
+    resulting schedule to the durable kv store (UNARMED — arming is a
+    separate explicit call) unless save=False."""
     import parlay_generator
     p = p or {}
     sched = await asyncio.to_thread(
@@ -2172,11 +2514,17 @@ async def _h_c15_parlay_generate(p: dict) -> dict:
 
 
 async def _h_c15_parlay_status(_p: dict) -> dict:
+    """The stored parlay schedule + armed flag (fresh read, not the cache),
+    and why it should be regenerated when it is stale."""
     armed, sched = crypto15m_trader.parlay_state(force=True)
-    return {"armed": armed, "schedule": sched}
+    return {"armed": armed, "schedule": sched,
+            "staleReason": crypto15m_trader.parlay_stale_reason(sched)}
 
 
 async def _h_c15_parlay_arm(p: dict) -> dict:
+    """Arm/disarm the stored schedule for live trading. While armed, the
+    parlay schedule OWNS crypto15m entries (seated hours trade their
+    generated config; unseated hours don't trade at all)."""
     import parlay_generator
     try:
         parlay_generator.set_armed(bool((p or {}).get("armed")))
@@ -2184,10 +2532,13 @@ async def _h_c15_parlay_arm(p: dict) -> dict:
         armed, sched = crypto15m_trader.parlay_state(force=True)
         return {"armed": armed, "hasSchedule": bool(sched), "error": str(e)}
     armed, sched = crypto15m_trader.parlay_state(force=True)
-    return {"armed": armed, "hasSchedule": bool(sched)}
+    return {"armed": armed, "hasSchedule": bool(sched),
+            "staleReason": crypto15m_trader.parlay_stale_reason(sched)}
 
 
 async def _h_main_backtest(p: dict) -> dict:
+    """Replay recorded whale/momentum signals through the live should_trade
+    gates with follower economics."""
     import replay
     cfg = dict(STATE.cfg or {})
     patch = (p or {}).get("config") or {}
@@ -2199,6 +2550,9 @@ async def _h_main_backtest(p: dict) -> dict:
 
 
 async def _h_collection_stats(_p: dict) -> dict:
+    """Inventory of the passively collected research data — what the Backtest
+    page's "view data" area shows. Counts + spans + a recent sample per
+    stream, all cheap indexed queries."""
     env = polymarket_auth.get_env()
 
     def _q() -> dict:
@@ -2211,6 +2565,13 @@ async def _h_collection_stats(_p: dict) -> dict:
             ticks = conn.execute(
                 "SELECT COUNT(*) FROM crypto15m_ticks WHERE network=?", (env,)
             ).fetchone()[0]
+            by_iv = conn.execute(
+                """SELECT COALESCE(interval, '15m') iv, COUNT(*) n,
+                          SUM(CASE WHEN resolved = 1 AND up_won IS NOT NULL
+                                   THEN 1 ELSE 0 END) r
+                   FROM crypto15m_signals WHERE network=?
+                   GROUP BY iv""", (env,)
+            ).fetchall()
             recent_c15 = conn.execute(
                 """SELECT ticker, asset, favorite, favorite_price, up_won,
                           resolved, close_time
@@ -2241,6 +2602,12 @@ async def _h_collection_stats(_p: dict) -> dict:
                 "ticks": int(ticks or 0),
                 "firstAt": c15["a"], "lastAt": c15["b"],
                 "recent": [dict(r) for r in recent_c15],
+                "byInterval": {
+                    str(r["iv"]): {"windows": int(r["n"] or 0),
+                                   "resolved": int(r["r"] or 0)}
+                    for r in by_iv
+                },
+                "recordingInterval": crypto15m._interval(STATE.cfg or {}),
             },
             "main": {
                 "whales": int(wh["n"] or 0), "whalesResolved": int(wh["r"] or 0),
@@ -2258,6 +2625,8 @@ async def _h_collection_stats(_p: dict) -> dict:
 
 
 async def _h_export_research(_p: dict) -> dict:
+    """Dump the collected research data as CSVs the user can analyze anywhere.
+    Written under data/exports/<stamp>/; the renderer reveals the folder."""
     import csv
 
     def _dump() -> dict:
@@ -2285,6 +2654,9 @@ async def _h_export_research(_p: dict) -> dict:
 
 
 async def _h_trading_status(_p: dict) -> dict:
+    """Ordered gate checklist for both engines — the "why isn't it trading"
+    panel. Each row: {id, label, state: ok|blocked|off, reason}. The first
+    blocked row is the answer."""
     cfg = STATE.cfg
     env = trader.get_env()
     main: list[dict] = []
@@ -2300,6 +2672,9 @@ async def _h_trading_status(_p: dict) -> dict:
     gate("auth", "Polymarket wallet", bool(STATE.auth_ok), "auth failed — check wallet credentials")
     enabled = bool(cfg.get("enable_trading"))
     gate("master", "Trading enabled", enabled, "master switch is OFF", off=not enabled)
+    from config import account_live as _account_live
+    gate("account", "Account is Live", _account_live(cfg),
+         "the account is in Paper — engines send nothing until you switch it to Live")
     try:
         blocked, why = trader._is_blocked_by_daily_risk(cfg, env)
         gate("dailyRisk", "Daily stop/take-profit", not blocked, why or "")
@@ -2342,11 +2717,36 @@ async def _h_copyStatus(_p: dict) -> dict:
     return await copy_trader.status(STATE.cfg, authed=STATE.auth_ok)
 
 
+
 def _sanitize_script_code(raw: Any) -> str:
+    """Scrub script text arriving from the renderer.
+
+    Text pasted out of a browser, PDF or chat window can carry LONE SURROGATES
+    (\\udc80-\\udcff) — what a smart quote turns into when it loses its encoding
+    on the way in. Python stores them happily and SQLite accepts them, but the
+    moment the row is serialized back to the renderer `.encode("utf-8")` raises
+    `UnicodeEncodeError: surrogates not allowed`, killing the RPC. The renderer
+    only sees `error invoking remote method "scripts:validate"`, which points
+    nowhere near the real cause.
+
+    Replacing them here means the worst case is an ordinary syntax error with a
+    line number, which the editor can actually show the user.
+    """
     return str(raw or "").encode("utf-8", "replace").decode("utf-8", "replace")
 
 
 def _script_status_js(r: dict) -> dict:
+    """The one thing the Scripts page needs and never had: whether this script
+    is ACTUALLY running, and if not, which gate is holding it.
+
+    The page used to show `enabled` plus shadow/live, neither of which answers
+    the question. A script can read ENABLED and be doing nothing because the
+    wallet is disconnected, because it's armed while the master switch is off,
+    because it's past the concurrency cap, or because its code failed to
+    compile — and the user's only clue was an empty ledger. Every gate is
+    evaluated here, in the process that applies them, so the line can't drift
+    from the truth the way a re-derivation in the renderer would.
+    """
     import script_engine
     sid = str(r.get("id") or "")
     st = script_engine.status_for(sid)
@@ -2354,11 +2754,21 @@ def _script_status_js(r: dict) -> dict:
     enabled = bool(r.get("enabled"))
     shadow = bool(r.get("dry_run", 1))
 
-    if not enabled:
+    if r.get("needs_review"):
+        state, detail = ("off",
+                         "Written by an AI agent and not yet reviewed. Read the "
+                         "code, then flip Enabled to approve it and start it in "
+                         "shadow.")
+    elif not enabled:
         state, detail = "off", "Not enabled — flip Enabled to start it."
     elif not STATE.auth_ok:
         state, detail = ("blocked",
                          "No wallet connected — connect one on the Dashboard.")
+    elif not shadow and not __import__("config").account_live(cfg):
+        state, detail = ("blocked",
+                         "Armed for real orders, but the account is in Paper — "
+                         "it is not running. Switch the account to Live, or set "
+                         "this script back to Shadow.")
     elif not shadow and not cfg.get("scripts_live_enabled"):
         state, detail = ("blocked",
                          'Armed for real orders, but the "Scripts live" master '
@@ -2409,6 +2819,8 @@ def _script_row_js(r: dict, stats: dict | None = None,
         "audit": script_audit.audit(code),
         "status": _script_status_js(r),
         "dryRun": bool(r.get("dry_run", 1)),
+        "author": str(r.get("author") or "") or "user",
+        "needsReview": bool(r.get("needs_review")),
         "shadowStats": (shadow_stats or {}).get(str(r.get("id"))) or None,
         "notes": r.get("notes") or "",
         "lastError": r.get("last_error"),
@@ -2428,17 +2840,37 @@ async def _h_scripts_list(_p: dict) -> dict:
     return {"scripts": [_script_row_js(r, stats, shadow) for r in rows]}
 
 
-async def _h_script_set_dry_run(p: dict) -> dict:
+async def _h_script_set_dry_run(p: dict, *, agent: str | None = None) -> dict:
+    """Arm a script for real orders (dryRun=False) or return it to shadow.
+
+    Arming is the moment a script can spend money, so it re-validates first
+    and refuses code that doesn't pass — the same gate as enabling.
+
+    Only the USER arms. `agent` is set by the MCP tools (never by the RPC
+    dispatcher, which passes params only): an agent may return a script to
+    shadow, never arm one. A script an agent wrote must be reviewed (enabled
+    by the user) before it can be armed."""
     sid = str(p.get("id") or "")
     dry = bool(p.get("dryRun"))
+    if agent and not dry:
+        raise ValueError("Only the user can arm a script for real orders, from "
+                         "the Scripts page.")
     with db.get_db() as conn:
         row = db.get_user_script(conn, sid)
         if not row:
             raise ValueError("script not found")
         if not dry:
+            if row.get("needs_review"):
+                raise ValueError("An AI agent wrote this script's code and it has not "
+                                 "been reviewed. Read it, flip Enabled to approve it, "
+                                 "then arm it.")
             errors = script_sandbox.validate(str(row.get("code") or ""))
             if errors:
                 raise ValueError("script does not validate: " + errors[0])
+            errors = _agent_code_errors(row)
+            if errors:
+                raise ValueError("this agent-written script breaks the agent-script "
+                                 "rules: " + errors[0])
         db.update_user_script(conn, sid, dry_run=1 if dry else 0)
         row = db.get_user_script(conn, sid)
         stats = db.script_live_stats(conn, polymarket_auth.get_env())
@@ -2450,6 +2882,7 @@ async def _h_script_set_dry_run(p: dict) -> dict:
 
 
 async def _h_script_shadow_orders(p: dict) -> dict:
+    """The shadow ledger for one script — what it would have traded."""
     with db.get_db() as conn:
         rows = db.list_script_shadow(conn, str(p.get("id") or ""),
                                      int(p.get("limit") or 200))
@@ -2468,13 +2901,57 @@ async def _h_script_shadow_orders(p: dict) -> dict:
     } for r in rows]}
 
 
-async def _h_script_save(p: dict) -> dict:
+def _is_agent_author(row: dict | None) -> bool:
+    return str((row or {}).get("author") or "").startswith("agent")
+
+
+def _agent_code_errors(row: dict | None) -> list[str]:
+    """The agent-script allowlist errors for a row an AI agent wrote ([] for
+    the user's own code, which is full Python by design)."""
+    if not _is_agent_author(row):
+        return []
+    import script_audit
+    return script_audit.validate_agent(_sanitize_script_code((row or {}).get("code")))
+
+
+async def _push_script_off(sid: str, reason: str) -> None:
+    """Tell the engine and the Scripts page that a script stopped: the
+    compiled module is dropped (a re-enable compiles the row fresh) and the
+    page hears it at once instead of on its next poll."""
+    try:
+        import script_engine
+        script_engine.forget(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await emit_event("script:status", {"id": sid, "enabled": False, "lastError": reason})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _h_script_save(p: dict, *, agent: str | None = None) -> dict:
+    """Create or update a script. Validation runs in the script's declared
+    trust mode; an invalid script still SAVES (so work isn't lost) but comes
+    back with the errors and is force-disabled.
+
+    `agent` names the AI agent saving it (set by mcp_tools, never by the RPC
+    dispatcher, which passes params only - the renderer's save is always the
+    user's). Code an agent writes or changes must pass the agent allowlist
+    (script_audit.validate_agent) and lands DISABLED, in SHADOW and marked
+    needs_review: it runs nowhere in this process until the user enables it
+    from the Scripts page, and only the user can arm it again."""
     sid = str(p.get("id") or "").strip() or os.urandom(8).hex()
     code = _sanitize_script_code(p.get("code"))
     meta = script_sandbox.parse_header(code)
     name = str(p.get("name") or "").strip() or meta.get("name") or "Untitled script"
     desc = str(p.get("description") or "").strip() or meta.get("description") or ""
     import script_audit
+    if agent:
+        bad = script_audit.validate_agent(code)
+        if bad:
+            raise ValueError("Scripts written by an AI agent may only use plain "
+                             "computation (see get_script_docs). Refused: "
+                             + "; ".join(bad[:5]))
     with db.get_db() as conn:
         existing = db.get_user_script(conn, sid)
         errors = script_sandbox.validate(code)
@@ -2482,10 +2959,18 @@ async def _h_script_save(p: dict) -> dict:
         code_changed = bool(existing) and str(existing.get("code") or "") != code
         force_off = (code_changed and bool(existing.get("enabled"))
                      and not audit["ok"])
+        agent_code = bool(agent) and (existing is None or code_changed)
+        was_armed = bool(existing) and not bool(existing.get("dry_run", 1))
+        was_enabled = bool(existing) and bool(existing.get("enabled"))
         db.upsert_user_script(conn, {
             "id": sid, "name": name, "description": desc, "code": code,
             "notes": str(p.get("notes") or ""),
         })
+        if agent_code:
+            db.update_user_script(conn, sid, enabled=0, dry_run=1, needs_review=1,
+                                  author=f"agent:{str(agent)[:60]}")
+        elif code_changed and not agent:
+            db.update_user_script(conn, sid, author="user", needs_review=0)
         if errors:
             db.update_user_script(conn, sid, enabled=0,
                                   last_error="; ".join(errors[:3])[:500])
@@ -2499,9 +2984,19 @@ async def _h_script_save(p: dict) -> dict:
         else:
             db.update_user_script(conn, sid, last_error=None)
         row = db.get_user_script(conn, sid)
+    disarmed = force_off or (agent_code and (was_armed or was_enabled))
+    if agent_code and existing is not None:
+        logger.warning(
+            f"[scripts] AI agent {agent} rewrote {name} ({sid[:8]}): disabled, "
+            f"back in SHADOW, waiting for your review"
+            f"{' (it was ARMED for real orders)' if was_armed else ''}")
+        await _push_script_off(sid, "Rewritten by an AI agent: disabled and in "
+                                    "shadow until you review it.")
+    elif force_off:
+        await _push_script_off(sid, "Code changed with critical audit findings.")
     return {"script": _script_row_js(row or {}), "errors": errors,
             "warnings": _script_warnings(code), "audit": audit,
-            "disarmed": force_off}
+            "disarmed": disarmed}
 
 
 def _script_warnings(code: str) -> list[str]:
@@ -2527,7 +3022,12 @@ async def _h_script_delete(p: dict) -> dict:
     return {"ok": True}
 
 
-async def _h_script_set_enabled(p: dict) -> dict:
+async def _h_script_set_enabled(p: dict, *, agent: str | None = None) -> dict:
+    """Enable / disable a script. The USER enabling a script an AI agent
+    wrote is the review step: it clears needs_review (they flipped it on in
+    the Scripts page, with the code in front of them). An agent (`agent` set
+    by mcp_tools, never by the RPC dispatcher) can never enable code that is
+    still waiting for that review."""
     sid = str(p.get("id") or "")
     enabled = bool(p.get("enabled"))
     with db.get_db() as conn:
@@ -2535,10 +3035,23 @@ async def _h_script_set_enabled(p: dict) -> dict:
         if not row:
             raise ValueError("script not found")
         if enabled:
+            if agent and row.get("needs_review"):
+                raise ValueError("An AI agent wrote this script and the user has not "
+                                 "reviewed it yet. Only the user can enable it, from "
+                                 "the Scripts page.")
             errors = script_sandbox.validate(str(row.get("code") or ""))
             if errors:
                 raise ValueError("script does not validate: " + errors[0])
-            db.update_user_script(conn, sid, enabled=1, last_error=None)
+            errors = _agent_code_errors(row)
+            if errors:
+                raise ValueError("this agent-written script breaks the agent-script "
+                                 "rules (edit it to make it yours, or delete it): "
+                                 + errors[0])
+            if agent:
+                db.update_user_script(conn, sid, enabled=1, last_error=None)
+            else:
+                db.update_user_script(conn, sid, enabled=1, last_error=None,
+                                      needs_review=0)
         else:
             db.update_user_script(conn, sid, enabled=0)
         row = db.get_user_script(conn, sid)
@@ -2546,6 +3059,11 @@ async def _h_script_set_enabled(p: dict) -> dict:
 
 
 async def _h_script_set_assets(p: dict) -> dict:
+    """Set a script's OWN coin scope (null/[] = every coin).
+
+    This replaces the crypto15m_assets coupling: which coins a script sees is
+    now its own property, so the 15m Crypto tab's asset checkboxes (and any
+    preset applied there) can never silently starve a script again."""
     import script_backtest
     sid = str(p.get("id") or "")
     scope = script_backtest.parse_asset_scope(p.get("assets"))
@@ -2560,6 +3078,8 @@ async def _h_script_set_assets(p: dict) -> dict:
 
 
 async def _h_script_validate(p: dict) -> dict:
+    """Validate code (editor button + the AI-output import path). Returns
+    parsed metadata so the import flow can prefill name/description."""
     import script_audit
     code = _sanitize_script_code(p.get("code"))
     errors = script_sandbox.validate(code)
@@ -2574,7 +3094,17 @@ async def _h_script_validate(p: dict) -> dict:
     }
 
 
-async def _h_script_backtest(p: dict) -> dict:
+async def _h_script_backtest(p: dict, *, agent: str | None = None) -> dict:
+    """Backtest a script (by id, or raw code from the editor) over the
+    recorded tick corpus. Never places orders — script_backtest is
+    structurally order-free.
+
+    Where the code came from decides where it runs. The user's own code runs
+    here, in-process, as it always has. Code an AI agent wrote — passed by
+    an agent (`agent`, set by mcp_tools only) or a saved row an agent last
+    changed, even when the USER clicks Backtest on it — runs in the
+    isolated child, and agent code must pass the agent allowlist first."""
+    import script_audit
     import script_backtest
     cfg = dict(STATE.cfg or {})
     patch = (p or {}).get("config") or {}
@@ -2585,18 +3115,129 @@ async def _h_script_backtest(p: dict) -> dict:
     env = str((p or {}).get("env") or polymarket_auth.get_env())
     code = _sanitize_script_code(p.get("code"))
     assets = (p or {}).get("assets")
-    if not code:
+    isolate = bool((p or {}).get("isolate")) or bool(agent)
+    row = None
+    if p.get("id"):
         with db.get_db() as conn:
             row = db.get_user_script(conn, str(p.get("id") or ""))
+    if not code:
         if not row:
             raise ValueError("script not found")
         code = _sanitize_script_code(row.get("code"))
         if assets is None:
             assets = row.get("assets")
+    agent_code = bool(agent and p.get("code")) or (
+        _is_agent_author(row) and code == _sanitize_script_code((row or {}).get("code")))
+    if agent_code:
+        isolate = True
+        bad = script_audit.validate_agent(code)
+        if bad:
+            raise ValueError("Scripts written by an AI agent may only use plain "
+                             "computation (see get_script_docs). Refused: "
+                             + "; ".join(bad[:5]))
+    if isolate:
+        return await _script_backtest_isolated(cfg, str(code), assets, env, since)
     return await asyncio.to_thread(
         script_backtest.run, cfg, str(code),
         assets=assets, env=env, since_days=since,
     )
+
+
+_SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL|AUTH", re.I)
+_PROFILE_ENV = ("KRYPT_POLYBOT_USERDATA", "KRYPT_POLYBOT_VAULT", "APPDATA",
+                "LOCALAPPDATA", "USERPROFILE", "HOME")
+
+
+def _backtest_child_env(tmp: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
+    for k in _PROFILE_ENV:
+        d = os.path.join(tmp, "profile", k.lower())
+        os.makedirs(d, exist_ok=True)
+        env[k] = d
+    env["PYTHONIOENCODING"] = "utf-8"
+    if not getattr(sys, "frozen", False):
+        paths = [str(Path(__file__).resolve().parent)]
+        paths += [p for p in sys.path if p and "site-packages" in p]
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
+def _backtest_child_cmd() -> list[str]:
+    """The child's command line. The frozen backend is one process (a
+    PyInstaller onedir build runs Python in-process). A Windows venv's
+    python.exe is a LAUNCHER that starts the base interpreter as a second
+    process, which the child's job object (one process, no children) refuses,
+    so dev and tests start the base interpreter directly."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--backtest-child"]
+    exe = sys.executable
+    base = getattr(sys, "_base_executable", None)
+    if sys.platform == "win32" and base and sys.prefix != sys.base_prefix:
+        exe = base
+    return [exe, str(Path(__file__).resolve()), "--backtest-child"]
+
+
+async def _script_backtest_isolated(
+    cfg: dict, code: str, assets, env: str, since: int, *, db_file: str | None = None,
+) -> dict:
+    """Run a script backtest in a child backend process with no credentials
+    (script_backtest_child.py): how an AI agent's backtest_script runs the
+    code it wrote. Killed if it outlives the backtest's own wall-clock cap.
+
+    The child never sees the real database: `db_file` (default: the app's
+    DB) is only the SOURCE of a read-only extract built here, in the child's
+    own temporary directory. On Windows the child runs in a Job Object that
+    forbids it starting any process."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    import script_backtest
+    import script_backtest_child
+    cmd = _backtest_child_cmd()
+    tmp = tempfile.mkdtemp(prefix="kp-backtest-")
+    job = None
+    try:
+        src = Path(db_file) if db_file else db.db_path()
+        extract = Path(tmp) / "data" / "backtest-extract.db"
+        await asyncio.to_thread(
+            script_backtest_child.build_extract, src, extract, int(since), str(env),
+            src.with_name(db.RESEARCH_ARCHIVE_NAME))
+        child_env = _backtest_child_env(tmp)
+        safe_cfg = {k: v for k, v in cfg.items()
+                    if not k.startswith(("mcp_", "remote_", "ai_", "autopilot_"))}
+        payload = json.dumps({
+            "db": str(extract), "cfg": safe_cfg, "code": code,
+            "assets": assets, "env": env, "sinceDays": since,
+        }, default=str).encode("utf-8")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=child_env, cwd=tmp,
+            creationflags=flags,
+        )
+        try:
+            job = script_backtest_child.contain(proc.pid)
+        except OSError as e:
+            logger.warning(f"[scripts] backtest child not contained in a job object: {e}")
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(payload), timeout=script_backtest.MAX_RUN_SECS + 60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"scriptError": "the backtest ran past its time limit and was stopped",
+                    "n": 0, "trades": [], "caveats": ["Stopped: over the time limit."]}
+        try:
+            return json.loads(out.decode("utf-8"))
+        except ValueError:
+            tail = err.decode("utf-8", "replace").strip().splitlines()[-3:]
+            return {"scriptError": "the isolated backtest exited without a result"
+                                   + (f": {' | '.join(tail)}" if tail else ""),
+                    "n": 0, "trades": [], "caveats": []}
+    finally:
+        script_backtest_child.release(job)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def _h_script_context_pack(_p: dict) -> dict:
@@ -2608,6 +3249,9 @@ async def _h_script_context_pack(_p: dict) -> dict:
 
 
 async def _h_script_api_docs(_p: dict) -> dict:
+    """Structured script-API reference for the in-app docs panel. Rendered
+    FROM the live modules (same sources as the context pack) so the panel can
+    never drift from what the engine/backtester actually do."""
     import replay
     import script_docs
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
@@ -2643,6 +3287,7 @@ async def _h_polymarketUrl(p: dict) -> dict:
         env=str(p.get("env") or "mainnet"),
     )
     return {"url": url}
+
 
 
 async def _h_terminal_discover(p: dict) -> dict:
@@ -2698,6 +3343,12 @@ async def _h_terminal_related(p: dict) -> dict:
 
 
 async def _h_terminal_cross_venue(p: dict) -> dict:
+    """Compare this Polymarket market with its Kalshi counterpart.
+
+    Read-only on both venues. The first call warms Kalshi's series index
+    (~11,800 rows, a few seconds) and later ones are nearly free — which is
+    why this is opt-in from the market page rather than part of any poll.
+    """
     import cross_venue
     return await cross_venue.compare(
         str(p.get("conditionId") or ""), str(p.get("interval") or "1d"))
@@ -2733,6 +3384,12 @@ async def _h_terminal_preview(p: dict) -> dict:
 
 
 async def _h_terminal_place(p: dict) -> dict:
+    """Send a hand-placed order.
+
+    Gated on the SAME live-trading switch as every engine. A terminal that
+    would place an order while the app says PAUSED is lying about its own
+    state, and the user would have no way to stop it.
+    """
     import terminal_trade
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     if cfg.get("terminal_paper_mode"):
@@ -2757,6 +3414,14 @@ async def _h_terminal_place(p: dict) -> dict:
 
 
 async def _h_terminal_flatten_wallet(p: dict) -> dict:
+    """Sell every open position in the wallet — or, with ``preview``, price it.
+
+    The preview half is read-only, so it is not gated: showing a user what
+    they hold and what it would fetch spends nothing. The half that SENDS is
+    gated exactly like `_h_terminal_place` — paper mode, the live-trading
+    switch, a connected wallet — because one button that closes everything is
+    still one button that signs orders.
+    """
     import terminal_trade
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     if (p or {}).get("preview"):
@@ -2784,6 +3449,14 @@ async def _h_terminal_flatten_wallet(p: dict) -> dict:
 
 
 async def _h_terminal_sell_preview(p: dict) -> dict:
+    """Price a one-click exit out of one position. Read-only, so ungated:
+    showing a user what a position would fetch spends nothing.
+
+    The `paper` flag is forced from the CONFIG, never trusted from the
+    renderer — the panel must price the same book the Sell button will send
+    against, and a renderer that disagreed with Settings about which mode it
+    is in would show paper numbers over a live sell.
+    """
     import terminal_trade
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     req = dict(p.get("order") or {})
@@ -2792,6 +3465,13 @@ async def _h_terminal_sell_preview(p: dict) -> dict:
 
 
 async def _h_terminal_sell_position(p: dict) -> dict:
+    """Send the one-click exit. Gated exactly like `_h_terminal_place`.
+
+    Paper mode is not a refusal here — it is a ROUTE: the panel's button says
+    "Sell paper" and the order goes to the simulator. What must never happen
+    is the two disagreeing, so the mode is read from the config in main and
+    the renderer's flag is ignored.
+    """
     import terminal_trade
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     paper = bool(cfg.get("terminal_paper_mode"))
@@ -2812,6 +3492,8 @@ async def _h_terminal_sell_position(p: dict) -> dict:
 
 
 async def _h_terminal_paper_place(p: dict) -> dict:
+    """Simulate a hand-placed order. Needs no wallet and no live-trading
+    switch: the entire point is to practise before funding anything."""
     import terminal_paper
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     return await terminal_paper.place(p.get("order") or {}, cfg)
@@ -2844,6 +3526,10 @@ async def _h_terminal_cancel(p: dict) -> dict:
 
 
 async def _h_terminal_orders(p: dict) -> dict:
+    """Resting orders. With a `conditionId` the list is narrowed to that
+    market and each row carries the touch it would have to reach to fill —
+    what the Market page's working-order rows show. Without one it is the
+    Track-wide list, unchanged and with no extra book reads."""
     import terminal_trade
     cid = str((p or {}).get("conditionId") or "").strip() or None
     return await terminal_trade.resting_orders(cid)
@@ -2855,6 +3541,12 @@ async def _h_terminal_portfolio(_p: dict) -> dict:
 
 
 async def _h_terminal_settled(_p: dict) -> dict:
+    """The settled RECORD from the fill ledger — deliberately its own call.
+
+    Kept off `terminalPortfolio` so the 5 s positions poll stays a wallet read
+    and never pays for the ledger walk; this one runs when the user opens the
+    settled table.
+    """
     import terminal_trade
     return await terminal_trade.settled_record()
 
@@ -2890,7 +3582,10 @@ async def _h_terminal_standing(p: dict) -> dict:
     return {"instructions": terminal_trade.standing_list(), "error": None}
 
 
+
 async def _remote_sync() -> dict:
+    """Start or stop each bot to match config. Idempotent — safe to call on
+    every config change and on a timer."""
     import bot_discord
     import bot_telegram
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
@@ -2919,6 +3614,8 @@ async def _h_remote_status(_p: dict) -> dict:
 
 
 async def _h_remote_set_token(p: dict) -> dict:
+    """Verify a token BEFORE storing it, so a typo fails on the setup screen
+    rather than as a bot that silently never connects."""
     import bot_discord
     import bot_secrets
     import bot_telegram
@@ -2953,6 +3650,8 @@ async def _h_remote_unpair(p: dict) -> dict:
 
 
 async def _h_remote_add_paired(p: dict) -> dict:
+    """Add an id by hand — the Discord path, where the user can copy their own
+    user id out of the client in two clicks."""
     import remote
     try:
         rows = remote.add_paired(
@@ -2968,42 +3667,357 @@ async def _h_remote_sync(_p: dict) -> dict:
     return await _remote_sync()
 
 
+
 async def _mcp_sync() -> dict:
     import mcp_server
     return await mcp_server.sync(merge_with_defaults(dict(STATE.cfg or {})))
 
 
 async def _h_mcp_status(_p: dict) -> dict:
+    import mcp_rails
     import mcp_server
-    return mcp_server.status(merge_with_defaults(dict(STATE.cfg or {})))
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    st = mcp_server.status(cfg)
+    mode = mcp_rails.trade_mode(cfg)
+    if mode in ("paper", "live"):
+        try:
+            loss = await asyncio.wait_for(mcp_rails.day_loss(mode, cfg), 8.0)
+            st["lossTodayUsd"] = (None if loss.get("positionsUnreadable")
+                                  else loss.get("lossUsd"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"mcp status: loss read failed: {e}")
+    return st
 
 
 async def _h_mcp_sync(_p: dict) -> dict:
     return await _mcp_sync()
 
 
-async def _h_mcp_rotate_token(_p: dict) -> dict:
-    import mcp_server
-    mcp_server.rotate_token()
-    return mcp_server.status(merge_with_defaults(dict(STATE.cfg or {})))
+def _agent_id_arg(p: dict) -> str:
+    """An agent id from the renderer, validated, never defaulted to another
+    agent by accident: absent means Default, malformed is refused."""
+    import mcp_agents
+    aid = str((p or {}).get("agentId") or mcp_agents.DEFAULT_ID)
+    if aid != mcp_agents.DEFAULT_ID and not mcp_agents.valid_id(aid):
+        raise ValueError("bad agent id")
+    return aid
 
 
-async def _h_mcp_reveal_token(_p: dict) -> dict:
+async def _h_mcp_rotate_token(p: dict) -> dict:
+    import mcp_agents
     import mcp_server
-    return {"token": mcp_server.ensure_token()}
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    aid = _agent_id_arg(p)
+    if mcp_agents.get(cfg, aid) is None:
+        raise ValueError("no such agent")
+    mcp_server.rotate_token(aid)
+    return mcp_server.status(cfg)
+
+
+async def _h_mcp_http_snippet(p: dict) -> dict:
+    """curl + Python for the HTTP API, carrying one agent's token. The ONLY
+    RPC whose answer holds a token: Electron main puts the text on the
+    clipboard and hands the renderer {ok} — the renderer never sees it."""
+    import mcp_agents
+    import mcp_server
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    aid = _agent_id_arg(p)
+    agent = mcp_agents.get(cfg, aid)
+    if agent is None:
+        raise ValueError("no such agent")
+    token = await asyncio.to_thread(mcp_server.ensure_token, aid)
+    return {"text": mcp_server.http_snippet(int(cfg.get("mcp_port") or 47615), token,
+                                            agent["name"])}
+
+
+async def _h_mcp_seen(_p: dict) -> dict:
+    """Agent clients seen this session. Memory only: no disk, no network, so
+    onboarding may poll it."""
+    import mcp_server
+    return mcp_server.seen()
+
+
+async def _h_mcp_agent_close_paper(p: dict) -> dict:
+    """The USER closes one agent's paper positions at the bid (e.g. after
+    deleting or switching it off). Not an MCP tool: no agent can reach it."""
+    import mcp_rails
+    return await mcp_rails.close_agent_paper(_agent_id_arg(p))
+
+
+async def _h_paper_status(_p: dict) -> dict:
+    """The ACCOUNT's paper book (the terminal's 'manual' book) for the
+    Paper | Live panel."""
+    import terminal_paper
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    with terminal_paper.using_book("manual"):
+        pf = await terminal_paper.portfolio(cfg)
+        resting = sum(1 for o in terminal_paper.orders(500)["orders"]
+                      if o["status"] in ("resting", "partial"))
+    try:
+        has_wallet = bool(polymarket_auth.credentials_present())
+    except Exception:  # noqa: BLE001
+        has_wallet = False
+    return {
+        "accountMode": cfg.get("account_mode"),
+        "bankrollUsd": pf.get("bankrollUsd"),
+        "nextBankrollUsd": cfg.get("terminal_paper_bankroll_usd"),
+        "cashUsd": pf.get("cashUsd"),
+        "equityUsd": pf.get("equityUsd"),
+        "realizedPnlUsd": pf.get("realizedPnlUsd"),
+        "openPositions": len(pf.get("positions") or []),
+        "restingOrders": resting,
+        "hasWalletKey": has_wallet,
+        "fetchedAt": pf.get("fetchedAt"),
+    }
+
+
+async def _h_paper_reset(_p: dict) -> dict:
+    """Wipe the account's paper book back to its bankroll. Agents' own paper
+    books are untouched (mcpPaper resets those)."""
+    import terminal_paper
+    with terminal_paper.using_book("manual"):
+        res = terminal_paper.reset()
+    return {"ok": True, **res}
+
+
+
+async def _health_wallet(deep: bool, cfg: dict) -> dict:
+    import health
+    from config import account_live
+    st = await asyncio.to_thread(polymarket_auth.credentials_status)
+    live = account_live(cfg)
+    if not (deep and st.get("hasWalletKey")):
+        return health.check_wallet(st, STATE.auth_ok, account_live=live)
+    try:
+        await asyncio.wait_for(_h_testCredentials({}), 45.0)
+    except Exception as e:  # noqa: BLE001
+        return health.check_wallet(st, STATE.auth_ok, account_live=live, probed=True,
+                                   probe_ok=False, probe_error=e)
+    return health.check_wallet(st, STATE.auth_ok, account_live=live, probed=True,
+                               probe_ok=True)
+
+
+async def _health_ai(deep: bool, cfg: dict) -> list:
+    """Guarded throughout: the provider check is ai_analysis.check_provider
+    (Settings' "Test connection", free endpoints only) when this build has
+    it, else ai_providers.check, else no probe at all. Only the SELECTED
+    provider is ever contacted."""
+    import health
+    try:
+        import ai_providers as prov_mod  # type: ignore
+    except Exception:  # noqa: BLE001
+        prov_mod = None
+    import ai_analysis
+    import ai_secrets
+    providers = list(getattr(prov_mod, "PROVIDERS", None) or getattr(ai_analysis, "PROVIDERS", ()))
+    active = str(cfg.get("ai_provider") or (providers[0] if providers else "anthropic"))
+    check = None
+    _cp = (getattr(ai_analysis, "check_provider", None)
+           or getattr(prov_mod, "check_provider", None))
+    if callable(_cp):
+
+        def check(p, c):  # noqa: F811
+            return _cp(p, c)
+    elif prov_mod is not None and callable(getattr(prov_mod, "check", None)):
+        _ck = prov_mod.check
+
+        def check(p, c):  # noqa: F811
+            return _ck(p, ai_secrets.load_key(p) if ai_secrets.has_key(p) else None,
+                       str(c.get("ai_model") or "") or None)
+    can_probe = check is not None
+
+    def _is_local(p: str) -> bool:
+        nk = getattr(ai_analysis, "needs_key", None) or getattr(prov_mod, "needs_key", None)
+        if callable(nk):
+            return not nk(p)
+        caps = getattr(prov_mod, "capabilities", None)
+        if callable(caps):
+            return not caps(p).get("needsKey", True)
+        return False
+    out = []
+    for prov in providers:
+        try:
+            local = _is_local(prov)
+        except Exception:  # noqa: BLE001
+            local = False
+        if local and prov != active:
+            continue
+        try:
+            has = True if local else bool(ai_secrets.has_key(prov))
+        except Exception:  # noqa: BLE001
+            has = False
+        needed = prov == active and bool(cfg.get("autopilot_enabled"))
+        if not (deep and has and can_probe):
+            out.append(health.check_ai(prov, active=prov == active, has_key=has,
+                                       can_probe=can_probe, local=local, needed=needed))
+            continue
+        if prov != active:
+            out.append(health.check_ai(prov, active=False, has_key=True, can_probe=True,
+                                       local=local, idle=True))
+            continue
+        try:
+            import inspect
+            if inspect.iscoroutinefunction(check):
+                res = await asyncio.wait_for(check(prov, cfg), 30.0)
+            else:
+                res = await asyncio.wait_for(asyncio.to_thread(check, prov, cfg), 30.0)
+            out.append(health.check_ai(prov, active=True, has_key=True, can_probe=True,
+                                       probed=True, local=local,
+                                       probe=res if isinstance(res, dict) else {}))
+        except Exception as e:  # noqa: BLE001
+            out.append(health.check_ai(prov, active=True, has_key=True, can_probe=True,
+                                       probed=True, probe_error=e, local=local))
+    return out
+
+
+async def _health_agents(deep: bool, cfg: dict) -> list:
+    import health
+    import mcp_agents
+    import mcp_server
+    st = await asyncio.to_thread(mcp_server.status, cfg)
+    seen = mcp_server.seen().get("clients") or []
+    st["lastSeen"] = {"client": seen[0]["client"], "at": seen[0]["at"]} if seen else None
+    rows = [health.check_mcp(st)]
+    probe = None
+    if deep and st.get("enabled") and st.get("httpEnabled") and st.get("running"):
+        token = None
+        for a in mcp_agents.agents(cfg):
+            if a.get("enabled", True):
+                token = await asyncio.to_thread(mcp_server.load_token, a["id"])
+                if token:
+                    break
+        probe = (await health.probe_http(int(st["port"]), token) if token
+                 else {"ok": False, "status": 401, "error": "no token"})
+    rows.append(health.check_http(st, probed=probe is not None, probe=probe))
+    return rows
+
+
+def _clob_feed_stats() -> dict | None:
+    try:
+        import clob_ws
+        f = clob_ws.feed
+        task = getattr(f, "_task", None)
+        running = task is not None and not task.done()
+        now = time.monotonic()
+        ages = [now - float(b.get("ts") or 0.0) for b in list(getattr(f, "_books", {}).values())]
+        fresh = sum(1 for a in ages if a < 60)
+        return {"connected": running, "books": fresh,
+                "lastMsgAgeSec": round(min(ages), 1) if ages and running else None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _health_local(cfg: dict) -> list:
+    import health
+    import remote
+    from config import engine_on
+    rows = []
+    try:
+        import autopilot  # type: ignore
+        ap = autopilot.status(cfg)
+    except Exception:  # noqa: BLE001
+        ap = None
+    rows.append(health.check_autopilot(ap))
+    rs = remote.status()
+    for which in ("discord", "telegram"):
+        d = rs.get(which) or {}
+        rows.append(health.check_remote(
+            which, enabled=bool(cfg.get("remote_enabled")) and bool(cfg.get(f"remote_{which}_enabled")),
+            has_token=bool(d.get("hasToken")), paired=bool(d.get("paired")),
+            bot={"connected": bool(d.get("connected")), "running": bool(d.get("connected")),
+                 "lastError": d.get("lastError"),
+                 "botName": d.get("botUsername")}))
+    needed = any(engine_on(cfg, k) for k in ("enable_trading", "crypto15m_enabled",
+                                             "copy_enabled", "scripts_live_enabled"))
+    rows.append(health.check_feed(_clob_feed_stats(), needed=needed))
+    try:
+        import spot_ws
+        spot = spot_ws.stats()
+    except Exception:  # noqa: BLE001
+        spot = None
+    rows.append(health.check_feed(spot, needed=engine_on(cfg, "crypto15m_enabled"),
+                                  rid="spot", label="Crypto spot feed"))
+    return rows
+
+
+async def _h_health_check(p: dict) -> dict:
+    import health
+    deep = (p or {}).get("deep") is True
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+
+    async def _guard(label: str, coro) -> list:
+        try:
+            r = await coro
+            return r if isinstance(r, list) else [r]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[health] {label} check failed: {type(e).__name__}: {e}")
+            return [health.row(label.lower().replace(" ", "-"), label, health.FAIL,
+                               f"The check itself failed: {type(e).__name__}.",
+                               "Copy diagnostics from the Logs page if this persists.")]
+
+    async def _local() -> list:
+        return await asyncio.to_thread(_health_local, cfg)
+
+    parts = await asyncio.gather(
+        _guard("Wallet", _health_wallet(deep, cfg)),
+        _guard("AI providers", _health_ai(deep, cfg)),
+        _guard("AI agents", _health_agents(deep, cfg)),
+        _guard("Local services", _local()),
+    )
+    rows = [r for part in parts for r in part]
+    if deep:
+        bad = [r["id"] for r in rows if r["status"] in (health.FAIL, health.WARN)]
+        logger.info(f"[health] checks run: {len(rows)} rows, attention: {bad or 'none'}")
+    return {"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "deep": deep, "rows": rows, "counts": health.summarize(rows)}
 
 
 async def _h_mcp_paper(p: dict) -> dict:
+    """One agent's paper account, for the AI Agents page."""
+    import mcp_agents
     import terminal_paper
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
-    with terminal_paper.using_book("ai"):
+    with terminal_paper.using_book(mcp_agents.paper_book(_agent_id_arg(p))):
         if (p or {}).get("reset"):
             terminal_paper.reset()
         return {"portfolio": await terminal_paper.portfolio(cfg),
                 "orders": terminal_paper.orders(int((p or {}).get("limit") or 50))}
 
 
+async def _h_mcp_decide(p: dict) -> dict:
+    """The user's answer to a live agent order waiting for approval."""
+    import mcp_rails
+    try:
+        rid = int((p or {}).get("id"))
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "No such agent order."}
+    return await mcp_rails.decide(rid, bool((p or {}).get("approve")), via="app")
+
+
+async def _h_mcp_settle_unknown(p: dict) -> dict:
+    """The user settles one live agent order booked 'unknown': Polymarket is
+    asked what became of it, and it is booked at that (mcp_rails.settle_unknown)."""
+    import mcp_rails
+    return await mcp_rails.settle_unknown((p or {}).get("id"))
+
+
+async def _h_mcp_activity(p: dict) -> dict:
+    """Every agent order (paper and live, sent, refused, queued) and the
+    approvals waiting, newest first."""
+    import mcp_rails
+    limit = max(1, min(500, int((p or {}).get("limit") or 100)))
+    return {"orders": mcp_rails.activity(limit), "pending": mcp_rails.pending()}
+
+
+async def _h_ai_scoreboard(p: dict) -> dict:
+    """The agents' forecast record against the market's own price."""
+    import forecast_ledger
+    return forecast_ledger.scoreboard(recent=max(1, min(200, int((p or {}).get("recent") or 40))))
+
+
 async def _h_remote_test(_p: dict) -> dict:
+    """Push a line to every paired account, so the user can confirm the round
+    trip works before relying on it."""
     import remote
     n = await remote.push(
         "Test from Krypt PolyBot. If you can read this, remote control is "
@@ -3016,10 +4030,18 @@ async def _h_remote_test(_p: dict) -> dict:
 
 async def _h_ai_status(_p: dict) -> dict:
     import ai_analysis
-    return ai_analysis.status(STATE.cfg or {})
+    return ai_analysis.status(merge_with_defaults(dict(STATE.cfg or {})))
 
 
 async def _h_ai_analyze(p: dict) -> dict:
+    """Analyse one market with the configured provider.
+
+    On-demand only — there is no scheduler, no tick and no engine path that
+    reaches this, because every call spends the user's own provider credit.
+
+    The ai_enabled gate lives in ai_analysis.analyze, next to the code that
+    would do the sending, rather than being re-asserted here.
+    """
     import ai_analysis
     import terminal
     cfg = STATE.cfg or {}
@@ -3036,29 +4058,43 @@ async def _h_ai_analyze(p: dict) -> dict:
 
 
 async def _h_ai_set_key(p: dict) -> dict:
+    """Verify a key BEFORE storing it, so a typo fails on the setup screen
+    rather than as a feature that silently never works. Same rule as the
+    chat-bot tokens."""
     import ai_analysis
     import ai_secrets
-    provider = str(p.get("provider") or "")
+    provider = str(p.get("provider") or "").strip().lower()
     key = str(p.get("key") or "").strip()
     if provider not in ai_analysis.PROVIDERS:
-        return {"ok": False, "message": f"Unknown provider {provider!r}."}
+        return {"ok": False, "provider": provider, "hasKey": False,
+                "message": f"Unknown provider {provider!r}."}
+    if not ai_secrets.stores_key(provider):
+        return {"ok": False, "provider": provider, "hasKey": False,
+                "message": f"{provider} runs on this machine and takes no key."}
     if not key:
         ai_secrets.clear_key(provider)
-        return {"ok": True, "message": "Key cleared.", "models": []}
+        logger.info(f"[ai] {provider} API key cleared")
+        return {"ok": True, "provider": provider, "hasKey": False,
+                "message": "Key cleared.", "models": [], "masked": None}
 
     previous = ai_secrets.load_key(provider)
     ai_secrets.save_key(provider, key)
-    try:
-        models = await ai_analysis.list_models(provider)
-    except Exception as e:
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    res = await asyncio.to_thread(ai_analysis.check_provider, provider, cfg)
+    if not res.get("ok") and res.get("reason") != "model":
         if previous:
             ai_secrets.save_key(provider, previous)
         else:
             ai_secrets.clear_key(provider)
-        reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
-        return {"ok": False, "message": f"{provider} rejected that key — {reason}"}
+        return {"ok": False, "provider": provider,
+                "hasKey": ai_secrets.has_key(provider),
+                "message": res.get("message") or f"{provider} rejected that key."}
+    logger.info(f"[ai] {provider} API key saved")
+    models = res.get("models") or []
     return {
         "ok": True,
+        "provider": provider,
+        "hasKey": True,
         "message": f"Key verified. {len(models)} models available.",
         "models": models,
         "masked": ai_secrets.masked(provider),
@@ -3066,15 +4102,69 @@ async def _h_ai_set_key(p: dict) -> dict:
 
 
 async def _h_ai_list_models(p: dict) -> dict:
+    """{ok, provider, models: [id], modelInfo: [{id, tools, context,
+    maxContext, loaded}], message?}. Free listing endpoints only; local
+    providers say honestly that their server is not running."""
     import ai_analysis
-    provider = str(p.get("provider") or "")
+    import ai_providers
+    provider = str(p.get("provider") or "").strip().lower()
     if provider not in ai_analysis.PROVIDERS:
-        return {"ok": False, "message": f"Unknown provider {provider!r}.", "models": []}
+        return {"ok": False, "provider": provider,
+                "message": f"Unknown provider {provider!r}.", "models": [], "modelInfo": []}
     try:
-        return {"ok": True, "models": await ai_analysis.list_models(provider)}
-    except Exception as e:
+        models = await ai_analysis.list_models(provider)
+    except Exception as e:  # noqa: BLE001
         reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
-        return {"ok": False, "message": reason, "models": []}
+        return {"ok": False, "provider": provider, "message": reason,
+                "models": [], "modelInfo": []}
+    info = [m.public() for m in ai_providers.cached_models(provider) if m.id in models]
+    return {"ok": True, "provider": provider, "models": models, "modelInfo": info}
+
+
+async def _h_ai_check_provider(p: dict) -> dict:
+    """Settings' "Test connection". The renderer names a provider id; the
+    host, the key and the endpoint are all chosen here. Free endpoints only
+    (model listings), so pressing it never bills the user."""
+    import ai_analysis
+    provider = str((p or {}).get("provider") or "").strip().lower()
+    if provider not in ai_analysis.PROVIDERS:
+        return {"ok": False, "provider": provider,
+                "message": f"Unknown AI provider: {provider or '—'}"}
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    res = await asyncio.to_thread(ai_analysis.check_provider, provider, cfg)
+    logger.info(f"[ai] connection check {provider}: {'ok' if res.get('ok') else 'failed'}")
+    return res
+
+
+async def _h_autopilot_status(_p: dict) -> dict:
+    """kryptrader's AutopilotStatus: the run state, budgets, today's usage,
+    the agent it runs as, and the last 30 runs."""
+    import autopilot
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    st = await asyncio.to_thread(autopilot.status, cfg)
+    st["runs"] = await asyncio.to_thread(autopilot.runs, 30)
+    return st
+
+
+async def _h_autopilot_run_now(_p: dict) -> dict:
+    """A run on the user's click. Started in the background: the renderer gets
+    an answer now and watches the run on the status poll. Every refusal —
+    deleted/disabled agent, missing key, a budget, a model that cannot call
+    tools — comes back HERE as the reason, before anything is recorded."""
+    import autopilot
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    if autopilot.STATE.running:
+        return {"ok": False, "message": "Autopilot is already running."}
+    why = autopilot.blocked_reason(cfg)
+    if not why:
+        why = await asyncio.to_thread(autopilot.tool_refusal, cfg)
+    if why:
+        autopilot.STATE.last_error = why
+        return {"ok": False, "message": why}
+    t = asyncio.create_task(autopilot.run_once(cfg, "manual"))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return {"ok": True, "message": "Autopilot run started."}
 
 
 _HANDLERS = {
@@ -3083,6 +4173,9 @@ _HANDLERS = {
     "aiAnalyze": _h_ai_analyze,
     "aiSetKey": _h_ai_set_key,
     "aiListModels": _h_ai_list_models,
+    "aiCheckProvider": _h_ai_check_provider,
+    "autopilotStatus": _h_autopilot_status,
+    "autopilotRunNow": _h_autopilot_run_now,
     "crypto15m": _h_crypto15m,
     "crypto15mStatus": _h_crypto15mStatus,
     "perpsBoard": _h_perps_board,
@@ -3137,8 +4230,17 @@ _HANDLERS = {
     "mcpStatus": _h_mcp_status,
     "mcpSync": _h_mcp_sync,
     "mcpRotateToken": _h_mcp_rotate_token,
-    "mcpRevealToken": _h_mcp_reveal_token,
+    "mcpHttpSnippet": _h_mcp_http_snippet,
+    "mcpSeen": _h_mcp_seen,
+    "mcpAgentClosePaper": _h_mcp_agent_close_paper,
+    "paperStatus": _h_paper_status,
+    "paperReset": _h_paper_reset,
+    "healthCheck": _h_health_check,
     "mcpPaper": _h_mcp_paper,
+    "mcpDecide": _h_mcp_decide,
+    "mcpSettleUnknown": _h_mcp_settle_unknown,
+    "mcpActivity": _h_mcp_activity,
+    "aiScoreboard": _h_ai_scoreboard,
     "remoteTest": _h_remote_test,
     "terminalHealth": _h_terminal_health,
     "terminalWatchlist": _h_terminal_watchlist,
@@ -3182,11 +4284,32 @@ _HANDLERS = {
 
 
 def _sync_terminal_offline() -> None:
+    """Push the user's offline-mode switch into the terminal provider layer.
+
+    Done on dispatch rather than only on setConfig so the switch is honoured
+    even if the backend restarted, or the config arrived by some path that did
+    not go through setConfig. Cheap: a dict read and a bool assignment.
+    """
     try:
         import terminal
         cfg = STATE.cfg or {}
         terminal.set_offline(bool(cfg.get("terminal_offline_mode", False)))
     except Exception:
+        pass
+
+
+_SECRET_CHANGING_RPCS = frozenset({
+    "setCredentials", "clearCredentials", "testCredentials", "aiSetKey",
+    "remoteSetToken", "mcpRotateToken", "mcpHttpSnippet", "perpsLink",
+    "perpsUnlink", "factoryReset",
+})
+
+
+def _refresh_log_scrubber() -> None:
+    try:
+        import logscrub
+        logscrub.refresh_known_secrets()
+    except Exception:  # noqa: BLE001 — never let scrubber upkeep break an RPC
         pass
 
 
@@ -3202,12 +4325,15 @@ async def _dispatch_request(req: dict) -> None:
         return
     try:
         result = await h(params)
+        if method in _SECRET_CHANGING_RPCS:
+            _refresh_log_scrubber()
         await respond_ok(rid, result)
     except Exception as e:
         logger.debug(
             f"RPC {method} failed: {e}\n{traceback.format_exc(limit=3)}"
         )
         await respond_err(rid, f"{type(e).__name__}: {e}")
+
 
 
 async def _stdin_reader() -> None:
@@ -3330,7 +4456,25 @@ async def _shutdown() -> None:
     os._exit(0)
 
 
+
 async def _startup_authed_sync() -> tuple[Any, Any]:
+    """The authed startup round trips, in the fewest serial hops that are safe.
+
+    Order is NOT free here:
+      • cancel-all-resting FIRST, alone. Cancelling a resting GTC both takes it
+        off the book and releases its collateral, so the two calls after it
+        depend on it having finished — the reconcile would otherwise inherit a
+        still-resting stale order as an unmanaged external position, and the
+        balance would report collateral that is about to come back as cash.
+      • reconcile + refresh_balance are independent of EACH OTHER (one reads
+        /portfolio/positions and writes local rows, the other reads /balance +
+        /value; neither consumes the other's result), so they go out together
+        — four serial round trips at startup become three.
+
+    Returns the two gathered results (an exception instance instead of a value
+    for whichever failed); the caller keeps each one's own error handling, so a
+    failed balance can't swallow the reconcile's events or vice versa.
+    """
     try:
         n = await trader.cancel_all_resting_orders("startup stale-order sweep")
         if n:
@@ -3354,6 +4498,9 @@ async def _main() -> None:
     db.init_db()
     crypto15m_trader.set_auto_off_callback(_on_crypto15m_auto_off)
     script_engine.set_event_callback(emit_event)
+    import mcp_server as _mcp_server
+    _mcp_server.set_event_callback(emit_event)
+    _refresh_log_scrubber()
     logger.info("Krypt PolyBot backend starting")
 
     stdin_task = asyncio.create_task(_stdin_reader(), name="stdin_reader")
@@ -3446,19 +4593,46 @@ def _perps_hash_check() -> None:
 
 
 def _selftest() -> int:
+    """Frozen-build smoke test: confirm the core deps AND the deposit-wallet
+    order signer are importable + functional in THIS build. Prints a short
+    report; exit 0 = all good, 1 = something's missing (e.g. the PyInstaller
+    bundle dropped py_clob_client_v2 → the app couldn't sign a single order).
+    Run:  krypt-polybot-backend(.exe) --selftest"""
+    import shutil
+    import tempfile
+    iso = tempfile.mkdtemp(prefix="kp-selftest-profile-")
+    os.environ["KRYPT_POLYBOT_USERDATA"] = os.path.join(iso, "userdata")
+    os.environ["KRYPT_POLYBOT_VAULT"] = os.path.join(iso, "vault")
+    try:
+        return _selftest_checks()
+    finally:
+        try:
+            db.close_thread_connection()
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(iso, ignore_errors=True)
+
+
+def _selftest_checks() -> int:
     checks: list[tuple[str, bool, str]] = []
 
     def _try(name: str, fn) -> None:
         try:
             fn()
             checks.append((name, True, ""))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — report every failure mode
             checks.append((name, False, f"{type(e).__name__}: {e}"))
 
     _try("import eth_account", lambda: __import__("eth_account"))
     _try("import httpx", lambda: __import__("httpx"))
     _try("import cryptography", lambda: __import__("cryptography"))
-    _try("sign POLY_1271 order (offline)", polymarket_auth.verify_signer)
+    _try("sign EOA + POLY_1271 orders = known vectors (offline)", polymarket_auth.verify_signer)
+
+    def _session_envelope_check() -> None:
+        w = polymarket_auth.wrap_session_signer_signature("0x" + "ab" * 20, "0x" + "11" * 65)
+        if not w.endswith(polymarket_auth.SESSION_SIGNER_MAGIC.hex()):
+            raise RuntimeError("session envelope lacks the 0x6492 magic")
+    _try("session-key order envelope (eth_abi)", _session_envelope_check)
     _try("import websockets (CLOB WS feed)", lambda: __import__("websockets"))
     _try("import clob_ws", lambda: __import__("clob_ws"))
     _try("import indicators + compute", lambda: __import__("indicators").compute([1.0, 2.0]))
@@ -3535,6 +4709,12 @@ def _selftest() -> int:
     _try("import bot_secrets", lambda: __import__("bot_secrets"))
 
     def _remote_auth_check() -> None:
+        """The gate that decides whether a stranger can move your money.
+
+        An unpaired sender must reach NO command, and remote trading must
+        require BOTH switches. If either regresses the build stops here — this
+        is not something to discover from a user's chat log.
+        """
         r = __import__("remote")
         assert not r.is_allowed("discord", "999999"),             "an unpaired id was allowed"
         assert not r.is_allowed("telegram", ""), "an empty id was allowed"
@@ -3553,6 +4733,13 @@ def _selftest() -> int:
     _try("import cross_venue", lambda: __import__("cross_venue"))
 
     def _cross_venue_polarity_check() -> None:
+        """The guard that stops a fictional arbitrage.
+
+        Caught live: "Fed INCREASE rates by 25bps" matched Kalshi's "CUT
+        25bps" at high confidence and printed a 33c spread between two
+        mutually exclusive markets. If the polarity rule regresses, that comes
+        straight back — so the build stops here.
+        """
         t = __import__("terminal")
         assert t.polarity("Fed will increase rates") == "up"
         assert t.polarity("Fed will cut rates") == "down"
@@ -3570,10 +4757,20 @@ def _selftest() -> int:
 
     _try("import ai_secrets", lambda: __import__("ai_secrets"))
     _try("import ai_analysis", lambda: __import__("ai_analysis"))
+    _try("import ai_providers", lambda: __import__("ai_providers"))
+    _try("import autopilot", lambda: __import__("autopilot"))
     _try("import anthropic SDK", lambda: __import__("anthropic"))
     _try("import openai SDK", lambda: __import__("openai"))
 
     def _ai_no_estimate_check() -> None:
+        """The rule the AI panel rests on, proven in THIS build.
+
+        The model must never return a probability or a fair value, and the
+        guarantee is structural: a closed schema with no numeric field, so
+        the provider's own structured-output layer refuses one. If a numeric
+        property is ever added, a language model's made-up price starts
+        rendering next to real quotes — so the build stops here.
+        """
         ai = __import__("ai_analysis")
         assert ai._SCHEMA.get("additionalProperties") is False,             "AI response schema is open — the model could invent a probability field"
         for name, spec in ai._SCHEMA["properties"].items():
@@ -3591,10 +4788,27 @@ def _selftest() -> int:
         blob = __import__("json").dumps(payload).lower()
         for token in ("position", "wallet", "contracts", "balance"):
             assert token not in blob, f"AI payload leaked {token!r}"
+        assert ai._conform({"lean": "cheap", "probability": "high"}),             "a reply with an extra field passed the schema check"
+        assert ai._conform({"reasoning": ["x"], "lean": "cheap", "confidence": "low",
+                            "summary": 0.7}), "a numeric field passed the schema check"
+        assert ai._conform({"drivers": ["a", 70]}), "a number in a list passed the schema check"
+        assert ai._conform({"summary": "s", "lean": "fair"}) is None,             "a clean reply failed the schema check"
+        assert set(ai.PROVIDERS) == {"anthropic", "openai", "openrouter", "gemini",
+                                     "ollama", "lmstudio"}, "AI provider set changed"
+        gs = __import__("ai_providers").gemini_schema(ai._SCHEMA)
+        for name, spec in gs["properties"].items():
+            assert spec.get("type") not in ("number", "integer"),                 f"Gemini response schema exposes a numeric field: {name}"
 
     _try("AI analysis: no-estimate + no-account-leak", _ai_no_estimate_check)
 
     def _terminal_honesty_check() -> None:
+        """The honest-null rule, proven in THIS build.
+
+        These are the two behaviours the whole terminal rests on, and both
+        have failed silently before in other products: a missing metric
+        coerced to zero, and a filter that hides the row it could not
+        evaluate. If either regresses, the build stops here.
+        """
         t = __import__("terminal")
         assert t.num("") is None and t.num(None) is None and t.num("x") is None,             "num() coerced an unknown to a number"
         assert t.num(0) == 0.0, "num() lost a real zero"
@@ -3617,27 +4831,109 @@ def _selftest() -> int:
     _try("terminal honest-null + filter rules", _terminal_honesty_check)
 
     def _mcp_check() -> None:
+        """The AI-agent server's safety rails, proven in THIS build.
+
+        A frozen build that dropped mcp_tools would answer every agent with
+        "unknown tool"; one where the loopback checks regressed would let a
+        web page in the browser reach the wallet.
+        """
         srv = __import__("mcp_server")
         tools = __import__("mcp_tools")
+        rails = __import__("mcp_rails")
+        agents = __import__("mcp_agents")
         __import__("mcp_stdio")
+        __import__("forecast_ledger")
         listed = {t["name"]: t for t in tools.list_tools()}
-        for name in ("get_status", "place_order", "backtest_crypto15m",
-                     "save_script", "pause_all_engines", "update_config",
-                     "research_data", "close_position"):
+        for name in ("get_status", "get_my_agent", "record_forecast",
+                     "place_order", "backtest_crypto15m", "save_script",
+                     "pause_all_engines", "update_config", "research_data",
+                     "close_position"):
             assert name in listed, f"MCP tool missing: {name}"
         assert len(listed) <= 40, "over 40 MCP tools — some clients drop the rest"
-        assert listed["place_order"]["inputSchema"]["required"][0] == "mode",             "place_order must not default its mode"
+        assert "forecastId" in listed["place_order"]["inputSchema"]["properties"], \
+            "place_order lost its forecast citation"
         assert srv._host_ok("127.0.0.1:47615") and srv._host_ok("localhost")
         assert not srv._host_ok("evil.example:47615"), "DNS-rebinding guard regressed"
-        cfg = {"mcp_live_trading_enabled": False, "mcp_scripts_enabled": False}
-        for gate in ("live", "scripts"):
+        cfg = {"mcp_allow_live_switches": False, "mcp_scripts_enabled": False}
+        for gate in ("switches", "scripts"):
             try:
                 tools._require(cfg, gate)
             except tools.Refused:
                 continue
             raise AssertionError(f"MCP '{gate}' gate is open with its switch off")
+        a = agents.default_agent("live")
+        assert agents.effective_mode("paper", a) == "paper"
+        assert rails.trade_mode({"mcp_trade_mode": "live",
+                                 "terminal_paper_mode": True}) == "paper"
+        loose = {**a, "rules": agents.clean_rules({"minEdgeCents": 0, "maxOrderUsd": 1e6})}
+        er = agents.effective_rails({"maxOrderUsd": 25.0, "dailySpendUsd": 100.0,
+                                     "minEdgeCents": 3.0}, loose)
+        assert er["maxOrderUsd"] == 25.0 and er["minEdgeCents"] == 3.0, \
+            "an agent's rules widened a global rail"
 
     _try("MCP server: tools, loopback guard, gates", _mcp_check)
+
+    def _agent_doors_check() -> None:
+        """The HTTP API, the tool-call stream, the log scrubber, health and
+        the account gate, proven in THIS build. Each module is lazy-imported,
+        so a bundle that dropped one would fail only when a user reached it."""
+        srv = __import__("mcp_server")
+        ls = __import__("logscrub")
+        hl = __import__("health")
+        tools = __import__("mcp_tools")
+        cfgmod = __import__("config")
+        code, body, _ = asyncio.run(srv.handle_api("GET", "/api/v1/tools", b"", {}, "default"))
+        assert code == 403 and body.get("ok") is False, "HTTP API answered while switched off"
+        marker = "selftest-free-text-must-not-leak"
+        ev = srv.build_call_event(
+            name="record_forecast",
+            args={"conditionId": marker, "rationale": marker, "model": marker + " kp_" + "Q7x" * 15,
+                  "fairValueCents": 42},
+            session={"client": "selftest", "agent": "default"}, res={"ok": True},
+            outcome="ok", reason=None, started=time.monotonic(), mode="paper")
+        assert marker not in json.dumps(ev), "tool-call stream forwarded a raw argument"
+        assert ev["conditionId"] is None, "a non-conditionId passed the shape check"
+        ev = srv.build_call_event(
+            name="search_markets", args={"query": marker}, session={"client": "selftest"},
+            res={"markets": []}, outcome="ok", reason=None, started=time.monotonic(), mode=None)
+        assert marker not in json.dumps(ev), "search query reached the stream"
+        tok = "kp_" + "Zx9" * 14
+        assert tok not in ls.scrub(f"Authorization: Bearer {tok}"), "bearer token logged"
+        assert ls.looks_secret(tok.upper()), "case-folded token not recognised"
+        assert ls.scrub("conditionId 0x" + "ab" * 32) == "conditionId 0x" + "ab" * 32, \
+            "the scrubber ate a conditionId"
+        assert tools.classify("account_mode") == "protected"
+        assert tools.classify("terminal_paper_mode") == "protected"
+        unclassified = [k for k in cfgmod.DEFAULT_CONFIG if tools.classify(k) == "unknown"]
+        assert not unclassified, f"unclassified config keys: {unclassified[:5]}"
+        paper = cfgmod.merge_with_defaults({"account_mode": "paper", "enable_trading": True})
+        assert paper["terminal_paper_mode"] is True and not cfgmod.engine_on(paper, "enable_trading")
+        assert hl.check_http({"enabled": True, "httpEnabled": False})["status"] == hl.OFF
+
+    _try("agent doors: HTTP API off, stream whitelist, log scrub, account gate",
+         _agent_doors_check)
+    _try("import health", lambda: __import__("health"))
+    _try("import logscrub", lambda: __import__("logscrub"))
+
+    def _isolated_backtest_check() -> None:
+        db.init_db()
+        db.close_thread_connection()
+        f = str(db.db_path())
+        code = "\n".join([
+            "def on_start(state):",
+            "    import socket",
+            "    socket.create_connection(('example.com', 80))",
+            "",
+            "def decide(ctx):",
+            "    return None",
+            "",
+        ])
+        res = asyncio.run(_script_backtest_isolated(
+            merge_with_defaults({}), code, None, "mainnet", 7, db_file=f))
+        err = str(res.get("scriptError") or "")
+        assert "network is off" in err, f"child did not refuse the network: {err or res}"
+
+    _try("agent backtest runs isolated (child process, no network)", _isolated_backtest_check)
 
     ok = all(c[1] for c in checks)
     print("=== krypt-polybot backend selftest ===")

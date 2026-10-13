@@ -1,3 +1,12 @@
+"""A freshly booted machine has a SMALL monotonic clock, pinned.
+
+time.monotonic() counts from boot. Every `.get(key, 0.0)` default against a
+monotonic "last miss" timestamp therefore reads as "missed a moment ago" for
+the first TTL seconds after boot — on every CI runner, and on every user's
+PC for the first minutes of a session. The ledger resolved nothing in that
+window and the whole settled record read "unknown". Found because GitHub's
+runners are fresh VMs and the local dev box had been up for days.
+"""
 from __future__ import annotations
 
 import asyncio

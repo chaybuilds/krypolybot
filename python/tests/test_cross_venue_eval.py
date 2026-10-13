@@ -1,3 +1,55 @@
+"""The cross-venue matcher, measured — not asserted about in the abstract.
+
+`test_cross_venue.py` pins the individual rules. This file answers the only
+question the user actually asked: *does it find the Kalshi market when one
+exists, and does it stay quiet when one does not?*
+
+IT RUNS THROUGH `compare()`, WHICH IS THE RPC ENTRY POINT, and that is not a
+detail. An earlier version of this file called `find_match` directly and
+scored 1.00 while the shipped app found nothing for the September 2026 Fed
+question: `compare()` was the one caller that fetched the market with its raw
+Gamma row attached, the matcher read Gamma's `startDate` — the LISTING date,
+four months before settlement — as the settlement day, and every internal
+function still behaved perfectly on the dicts this file was handing it. An
+evaluation that does not exercise the real entry point measures the harness.
+
+Two frozen fixtures:
+
+* ``cross_venue_truth.json`` — real Polymarket questions pulled from the
+  Discover columns on 2026-09-02/03, each hand-labelled with the ONE Kalshi
+  market that asks the same question, or with ``null``. The labels are
+  deliberately conservative: a near miss (Kalshi's 15-minute BTC window
+  against Polymarket's 5-minute one, "by Dec 31" against "at this event") is
+  labelled ``null``, because pairing those would be exactly the confident
+  wrong claim this module exists to prevent. Around half have no counterpart
+  at all, which is the honest shape of the two venues' overlap.
+* ``cross_venue_kalshi_snapshot.json.gz`` — the Kalshi side of that same
+  moment: the full series index plus the open events, with their markets, of
+  every series the retrieval routes reach. Public, read-only data.
+
+Frozen on purpose. Measured against the live API these numbers drift by the
+hour as fixtures settle and 15-minute windows roll, and a bar that moves is
+not a bar.
+
+The recorded result on 2026-09-02/03, over these same questions:
+
+    retrieval                       recall   precision
+    series titles + market sweep     0.10      1.00      (live, 3 / 31)
+    this module                      1.00      1.00      (frozen, 33 / 33)
+
+Two labelled counterparts are excluded from recall: the Getafe and Flamengo
+markets had no quote left when the snapshot was taken, and a market with no
+resting order is skipped by design rather than compared. They are still
+required not to produce some OTHER match.
+
+The bars below sit well under the achieved figures, and deliberately so:
+these rules were developed against this fixture, so a perfect score on it is
+not evidence of a perfect matcher. It is a floor to regress against, and the
+live check (`npm run py:live`) is what samples fresh markets.
+
+PRECISION IS THE ONE THAT MUST NOT SLIP: a missed match is a quiet panel, a
+wrong match is a fictional arbitrage with a number under it.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +86,12 @@ def snapshot() -> dict:
 
 @pytest.fixture(autouse=True)
 def frozen_venues(monkeypatch, snapshot):
+    """Serve the recorded read instead of the network, on BOTH sides.
+
+    Patched at the boundary functions only, so everything above them —
+    `compare`, `find_match`, the row normalisation, the strike fields, the
+    event join, the spread gate — is the real code path and not a stub.
+    """
     rows = [dict(r, settlementSources=[], contractUrl=None)
             for r in snapshot["series"]]
 
@@ -93,6 +151,11 @@ def run_compare(case: dict, monkeypatch) -> dict:
 
 
 def quoted_tickers(snapshot: dict) -> set[str]:
+    """Every Kalshi market in the snapshot that actually had a two-sided
+    quote. A market with no resting order cannot be compared to anything —
+    the matcher skips it by design — so a labelled counterpart that was
+    unquoted at capture time is not a fair test of RETRIEVAL, and it is
+    excluded from the recall denominator rather than quietly counted."""
     out = set()
     for events in snapshot["events"].values():
         for ev in events:
@@ -105,6 +168,7 @@ def quoted_tickers(snapshot: dict) -> set[str]:
 
 @pytest.fixture(scope="function")
 def measured(truth, snapshot, monkeypatch) -> dict:
+    """Run every case through `compare()` and tally it."""
     quoted = quoted_tickers(snapshot)
     tp = fp = fn = tn = 0
     detail = []
@@ -159,6 +223,9 @@ def test_recall_clears_the_bar(measured):
 
 
 def test_precision_never_slips(measured):
+    """A missed match is a quiet panel. A wrong match is a confident,
+    entirely fictional edge with a price under it, which is the failure this
+    whole module is built around."""
     bad = [d for d in measured["detail"]
            if d["outcome"] in ("fictional-match", "wrong-candidate-preferred")]
     assert measured["precision"] >= MIN_PRECISION, (
@@ -167,6 +234,8 @@ def test_precision_never_slips(measured):
 
 
 def test_nothing_is_invented_for_a_question_kalshi_does_not_list(measured):
+    """About half the set has no counterpart. Every one of them must come back
+    as no match — not as the nearest thing on the exchange."""
     invented = [d for d in measured["detail"]
                 if d["outcome"] == "fictional-match"]
     assert not invented, "; ".join(
@@ -174,6 +243,11 @@ def test_nothing_is_invented_for_a_question_kalshi_does_not_list(measured):
 
 
 def test_the_listing_date_is_never_read_as_a_settlement_date(measured):
+    """The regression that reached the owner. Every case above is handed a
+    Gamma row whose `startDate` is May 2026; if that is read as the settlement
+    day again, the September Fed question loses its Kalshi event by four
+    months and this file's recall collapses. Named explicitly so the failure
+    says what it is."""
     fed = [d for d in measured["detail"]
            if "Fed increase interest rates by 25 bps" in d["case"]["title"]]
     assert fed, "the Fed regression case is missing from the fixture"
@@ -195,6 +269,8 @@ def test_every_reported_match_carries_its_reasoning(measured):
 
 
 def test_a_match_against_the_no_side_says_so(measured):
+    """An inverted comparison is allowed — Kalshi lists plenty of levels from
+    the other direction — but never silently."""
     for d in measured["detail"]:
         m = d["result"].get("match")
         if m and m["comparedSides"]["kalshi"] == "no":
@@ -213,6 +289,10 @@ def test_a_spread_only_ever_prints_under_a_strong_match(measured):
 
 
 def test_a_family_we_understand_gets_a_note_that_says_what_is_different(measured):
+    """"No Kalshi market looks like this question" is true and useless on the
+    timed crypto markets: the user knows both venues list Bitcoin up/down. The
+    note has to say the windows do not line up, and which one Kalshi is
+    actually quoting."""
     checked = 0
     for d in measured["detail"]:
         want = d["case"].get("expectedNoteContains")

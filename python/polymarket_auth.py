@@ -1,3 +1,37 @@
+"""Wallet + request signing for the Polymarket CLOB trading API.
+
+Polymarket trading is on-chain (Polygon, chain id 137). Unlike a centralized REST exchange's
+RSA-PSS-over-REST model, authenticating to the Polymarket CLOB has two
+levels:
+
+  L1 — Ethereum private key. An EIP-712 "ClobAuth" message signed by the
+       wallet proves control of the address. Used once to *derive* (or
+       create) the L2 API credentials.
+  L2 — API key / secret / passphrase (an HMAC scheme on top of L1). Every
+       authenticated CLOB request carries an HMAC-SHA256 signature plus the
+       api-key/passphrase headers.
+
+Orders are EIP-712 structs signed by the same wallet key and POSTed to the
+CLOB.
+
+Krypt PolyBot stores credentials at:
+
+    <userData>/credentials/wallet.mainnet.key      hex private key (0x…)
+    <userData>/credentials/apicreds.mainnet.json   {apiKey, secret, passphrase}
+
+The path to <userData> is provided via the KRYPT_POLYBOT_USERDATA env var
+(set by the Electron main process on backend spawn). In dev / standalone
+mode it falls back to `./credentials/` next to this file. Both files are
+encrypted at rest: on Windows with the user account key (DPAPI); on
+macOS/Linux with a random master key held in the OS keychain (macOS Keychain
+/ Linux Secret Service). If no backend is usable they fall back to
+plaintext-0600 and warn.
+
+There is a single network — Polygon mainnet. The `env` argument is kept on
+the public functions purely for call-site compatibility with the rest of
+the bot (which threads an env string through everything); it is always
+"mainnet".
+"""
 from __future__ import annotations
 
 import base64
@@ -77,12 +111,13 @@ if sys.platform == "win32":
         ):
             raise OSError("CryptUnprotectData failed")
         return _from_blob(out)
-else:
+else:  # pragma: no cover - non-Windows fallback
     def _dpapi_encrypt(data: bytes) -> bytes:
         raise OSError("DPAPI not available")
 
     def _dpapi_decrypt(data: bytes) -> bytes:
         raise OSError("DPAPI not available")
+
 
 
 def _keyring_set(account: str, value: str) -> bool:
@@ -108,6 +143,9 @@ def _fernet(key: bytes):
 
 
 def _get_master_key() -> Optional[bytes]:
+    """Fetch (or, on first use, create) the Fernet master key from the OS
+    keychain. Returns None when no keychain backend is usable — the caller then
+    falls back to plaintext. The key never touches the credential directory."""
     global _keyring_master_cache
     if _keyring_master_cache is not None:
         return _keyring_master_cache
@@ -149,6 +187,8 @@ def _keyring_decrypt(token: bytes) -> bytes:
 
 
 def _chmod_600(path: Path) -> None:
+    """Best-effort owner-only perms on POSIX (no-op / not meaningful on Windows,
+    where DPAPI + NTFS ACLs already scope the file to the user)."""
     if os.name == "posix":
         try:
             os.chmod(path, 0o600)
@@ -157,6 +197,10 @@ def _chmod_600(path: Path) -> None:
 
 
 def _atomic_write_600(path: Path, tmp: Path, data: bytes) -> None:
+    """Write `data` to `tmp` as an OWNER-ONLY file (0600 from CREATION on POSIX),
+    then atomically replace `path`. Creating the temp file 0600 up front means the
+    (plaintext-fallback) key is never briefly world-readable — not in the pre-chmod
+    window, and no 0644 crash-residue if the process dies before the replace."""
     try:
         if tmp.exists():
             tmp.unlink()
@@ -175,6 +219,9 @@ def _atomic_write_600(path: Path, tmp: Path, data: bytes) -> None:
 
 
 def _write_secret_bytes(path: Path, data: bytes) -> None:
+    """Atomically write `data`, encrypted with the best available backend
+    (DPAPI → OS keychain → plaintext). Every branch writes via a 0600-from-creation
+    temp file so even the plaintext fallback key is never world-readable at rest."""
     global _warned_plaintext, _plaintext_error_logged
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "posix":
@@ -207,6 +254,9 @@ def _write_secret_bytes(path: Path, data: bytes) -> None:
 
 
 def _read_secret_bytes(path: Path, upgrade: bool = True) -> bytes:
+    """Read a credential file, decrypting DPAPI- or keychain-wrapped content.
+    Legacy plaintext is returned as-is and (when a backend is available)
+    re-encrypted in place on this read."""
     raw = path.read_bytes()
     if raw.startswith(_DPAPI_MARKER):
         return _dpapi_decrypt(base64.b64decode(raw[len(_DPAPI_MARKER):]))
@@ -221,6 +271,9 @@ def _read_secret_bytes(path: Path, upgrade: bool = True) -> bytes:
 
 
 def _is_plaintext_secret_file(path: Path) -> bool:
+    """True iff `path` holds a secret written WITHOUT at-rest encryption (neither
+    the DPAPI nor the keychain marker prefix). Derives the state from the file
+    itself, so it's durable across restarts and can't go stale like a saved flag."""
     try:
         if not path.exists():
             return False
@@ -232,6 +285,9 @@ def _is_plaintext_secret_file(path: Path) -> bool:
 
 
 def key_stored_unencrypted(env: Optional[str] = None) -> bool:
+    """Durable, queryable flag: is the wallet private key sitting on disk in
+    CLEARTEXT (plaintext-0600 fallback, because no DPAPI/keychain backend was
+    usable)? Surfaced in `credentials_status()` so the UI can warn the user."""
     try:
         return _is_plaintext_secret_file(_wallet_key_file(env or _current_env))
     except Exception:
@@ -239,6 +295,9 @@ def key_stored_unencrypted(env: Optional[str] = None) -> bool:
 
 
 def _log_plaintext_at_rest_once() -> None:
+    """Log at ERROR (once per process = once per startup) when the wallet key is
+    stored unencrypted. Loud + repeated-every-launch, unlike the buried one-time
+    warning at write time that the user never sees."""
     global _plaintext_error_logged
     if _plaintext_error_logged:
         return
@@ -304,16 +363,18 @@ def get_env() -> str:
 
 
 def reset_credential_cache() -> None:
+    """Drop cached wallet + API creds. Call after the user saves new keys."""
     global _cached_account, _cached_api_creds
     _cached_account = None
     _cached_api_creds = None
 
 
+
 def _eth_account():
     try:
-        from eth_account import Account
+        from eth_account import Account  # type: ignore
         return Account
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         raise RuntimeError(
             "eth-account is required for Polymarket signing. "
             "Install it with `pip install eth-account`."
@@ -351,7 +412,9 @@ def _load_account():
 
 
 def get_address() -> str:
+    """The wallet (EOA) address derived from the saved private key."""
     return _load_account().address
+
 
 
 def _load_api_creds() -> Optional[dict]:
@@ -380,6 +443,7 @@ def has_api_creds(env: Optional[str] = None) -> bool:
 
 
 def set_api_creds(creds: dict, env: Optional[str] = None) -> None:
+    """Persist derived L2 API credentials {apiKey, secret, passphrase}."""
     global _cached_api_creds
     e = env or _current_env
     _write_secret_bytes(
@@ -390,6 +454,10 @@ def set_api_creds(creds: dict, env: Optional[str] = None) -> None:
 
 
 def clear_api_creds(env: Optional[str] = None) -> None:
+    """Delete the derived L2 API creds (keep the wallet key). Used to force a
+    re-derive when the CLOB rejects the current creds (stale after a key change,
+    or otherwise invalid) — so the bot self-heals instead of needing a manual
+    Wallet → Test."""
     global _cached_api_creds
     e = env or _current_env
     f = _api_creds_file(e)
@@ -400,6 +468,7 @@ def clear_api_creds(env: Optional[str] = None) -> None:
             pass
     if e == _current_env:
         _cached_api_creds = None
+
 
 
 def _perps_creds_file(env: str = NETWORK) -> Path:
@@ -434,6 +503,8 @@ def clear_perps_creds(env: Optional[str] = None) -> None:
 
 
 def sign_typed_data(typed_data: dict) -> str:
+    """Sign EIP-712 typed data with the WALLET key (not a proxy). Public alias
+    of the L1 signer for callers outside this module (perps proxy creation)."""
     return _eip712_sign(typed_data)
 
 
@@ -443,13 +514,21 @@ SIGNATURE_TYPE_POLY_1271 = 3
 
 
 class WalletMetaError(RuntimeError):
-    pass
+    """The wallet meta sidecar exists but could not be read or parsed."""
 
 
 _wallet_meta_cache: dict[str, dict] = {}
 
 
 def get_wallet_meta(env: Optional[str] = None) -> dict:
+    """The {funder, signatureType} sidecar, or {} for a raw-EOA wallet.
+
+    An ABSENT file means raw EOA. An UNREADABLE one does not: returning {} there
+    would silently drop a configured deposit wallet, and every order signed after
+    that carries the signer EOA as `maker` — which Polymarket rejects outright
+    ("maker address not allowed"). So an unreadable-but-present sidecar falls back
+    to the last known-good value, and raises when there isn't one. Fail closed:
+    the order path must never guess the maker address."""
     e = env or _current_env
     f = _wallet_meta_file(e)
     if not f.exists():
@@ -484,6 +563,7 @@ def set_wallet_meta(
 
 
 def get_funder(env: Optional[str] = None) -> str:
+    """The deposit-wallet (funder) address, or "" when trading as a raw EOA."""
     return (get_wallet_meta(env).get("funder") or "").strip()
 
 
@@ -495,14 +575,20 @@ def get_signature_type(env: Optional[str] = None) -> int:
 
 
 def trading_address(env: Optional[str] = None) -> str:
+    """The address that actually holds funds + positions: the funder when a
+    deposit wallet is configured, otherwise the signer EOA."""
     return get_funder(env) or get_address()
 
 
+
 def credentials_present(env: Optional[str] = None) -> bool:
+    """True once a wallet key is saved. API creds are derived on demand, so
+    only the wallet key is required to consider the account 'connected'."""
     return _wallet_key_file(env or _current_env).exists()
 
 
 def credentials_status(env: Optional[str] = None) -> dict:
+    """Diagnostic info for the UI — never returns secret material."""
     e = env or _current_env
     wf = _wallet_key_file(e)
     meta_error = ""
@@ -536,6 +622,7 @@ def credentials_status(env: Optional[str] = None) -> dict:
 
 
 def credentials_status_all() -> dict:
+    """Single-network status (mainnet)."""
     return {
         "current": _current_env,
         "mainnet": credentials_status(NETWORK),
@@ -546,6 +633,16 @@ def save_credentials(
     private_key: str, api_creds: Optional[dict] = None, env: Optional[str] = None,
     funder: Optional[str] = None, signature_type: Optional[int] = None,
 ) -> None:
+    """Save a wallet private key (and optionally pre-derived API creds) for
+    `env` (always mainnet). Validates the key parses to an address.
+
+    `funder` is the deposit-wallet address for a Polymarket account wallet.
+    When supplied we START at signatureType 3 (POLY_1271); the real scheme is
+    then auto-detected on-chain (`polymarket_api.detect_wallet_signature_type`,
+    run by `check_trading_ready`) and corrected to POLY_PROXY (1, Magic/email) or
+    POLY_GNOSIS_SAFE (2, MetaMask) when the deposit wallet is one of those —
+    otherwise every order for those accounts is rejected. Without a funder the
+    wallet trades as a raw EOA (signatureType 0)."""
     e = env or _current_env
     pk = _normalize_priv(private_key)
     if not pk:
@@ -575,8 +672,13 @@ def save_credentials(
 
 
 def clear_credentials(env: Optional[str] = None) -> None:
+    """Delete the wallet key + derived API creds for `env`. The Perps proxy
+    credential goes with them: it was authorised by THIS wallet, and leaving it
+    behind would keep a removed wallet's account trading. The saved signer role
+    goes too: it describes this key."""
     e = env or _current_env
-    for p in (_wallet_key_file(e), _api_creds_file(e), _perps_creds_file(e)):
+    for p in (_wallet_key_file(e), _api_creds_file(e), _perps_creds_file(e),
+              _signer_role_file(e)):
         if p.exists():
             try:
                 p.unlink()
@@ -587,6 +689,8 @@ def clear_credentials(env: Optional[str] = None) -> None:
 
 
 def migrate_legacy_credentials(target_env: str) -> bool:
+    """No legacy layout to migrate for PolyBot. Kept for call-site
+    compatibility with the service bootstrap."""
     return False
 
 
@@ -614,7 +718,9 @@ _CLOB_AUTH_MESSAGE = "This message attests that I control the given wallet"
 
 
 def _eip712_sign(typed_data: dict) -> str:
-    from eth_account.messages import encode_typed_data
+    """Sign an EIP-712 typed-data dict with the wallet key, returning a
+    0x-prefixed 65-byte signature."""
+    from eth_account.messages import encode_typed_data  # type: ignore
     acct = _load_account()
     signable = encode_typed_data(full_message=typed_data)
     signed = acct.sign_message(signable)
@@ -623,6 +729,7 @@ def _eip712_sign(typed_data: dict) -> str:
 
 
 def l1_headers(nonce: int = 0) -> dict:
+    """Headers for POST /auth/api-key and GET /auth/derive-api-key."""
     ts = str(now_ts())
     addr = get_address()
     typed = {
@@ -656,6 +763,7 @@ def l1_headers(nonce: int = 0) -> dict:
     }
 
 
+
 def _b64url_decode(s: str) -> bytes:
     s = s.replace("-", "+").replace("_", "/")
     return base64.b64decode(s + "=" * (-len(s) % 4))
@@ -666,6 +774,11 @@ def _b64url_encode(b: bytes) -> str:
 
 
 def l2_headers(method: str, path: str, body: str = "") -> dict:
+    """HMAC-SHA256 auth headers for an authenticated CLOB request.
+
+    The signed payload is `timestamp + METHOD + path + body`. The secret is
+    base64url-decoded; the signature is base64url-encoded.
+    """
     creds = _load_api_creds()
     if not creds:
         raise RuntimeError("Polymarket API credentials not derived yet")
@@ -691,52 +804,179 @@ def _round_amt(x: float) -> int:
 
 
 def _load_private_key() -> str:
+    """The raw 0x hex private key (for libraries that need the key, not a
+    LocalAccount). Same source as `_load_account`."""
     f = _wallet_key_file(_current_env)
     if not f.exists():
         raise FileNotFoundError(f"Polymarket wallet key not configured ({f})")
     return _normalize_priv(_read_secret_bytes(f).decode("utf-8", "replace"))
 
 
-def verify_signer() -> str:
-    from eth_account import Account
-    from py_clob_client_v2.signer import Signer
-    from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2
-    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderDataV2
-    from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2
-    from py_clob_client_v2.order_utils.model.side import Side
+SIGNER_VECTOR = {
+    "key": "0x" + "11" * 32,
+    "tokenId": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+    "makerAmount": "420000", "takerAmount": "1000000",
+    "salt": 123456789, "timestamp": 1760000000000,
+}
+_SIGNER_VECTOR_EOA_SIG = (
+    "0x68078a0aa59c264f1d15039321a2a298ce4d486351bbf5c2183b22b1a0d66a98"
+    "1483e2a2c3446dfe8476afa089bb4ce227fa605efad7d87bd1f1126a2dbdbbc21c")
+_SIGNER_VECTOR_1271_SIG = (
+    "0x"
+    "00c5eb26b9895598fbdbb87edbffc020b3fa4faa139db6f3bbe902bdefd7c864"
+    "7bbbf6e4db4fd610808c36be98d5fa710cb56181c64733d7be1943713284d4ce1b"
+    "3264e159346253e26a64e00b69032db0e7d32f94628de3e6eecb50304d7af3d2"
+    "80d5844a20f0a9faf95147d1c8903b994b9811ee00197356abcff7e76c322d0b"
+    "4f726465722875696e743235362073616c742c61646472657373206d616b65722c616464"
+    "72657373207369676e65722c75696e7432353620746f6b656e49642c75696e7432353620"
+    "6d616b6572416d6f756e742c75696e743235362074616b6572416d6f756e742c75696e74"
+    "3820736964652c75696e7438207369676e6174757265547970652c75696e743235362074"
+    "696d657374616d702c62797465733332206d657461646174612c62797465733332206275"
+    "696c6465722900ba")
 
-    test_key = "0x" + "11" * 32
-    addr = Account.from_key(test_key).address
-    signer = Signer(test_key, CHAIN_ID)
-    builder = ExchangeOrderBuilderV2(EXCHANGE_ADDRESS, CHAIN_ID, signer)
-    od = OrderDataV2(
-        maker=addr, signer=addr, tokenId="1",
-        makerAmount="1000000", takerAmount="2000000",
-        side=Side.BUY, signatureType=SignatureTypeV2.POLY_1271, expiration="0",
-    )
-    s = builder.build_signed_order(od)
-    sig = getattr(s, "signature", None)
-    if not sig or not str(sig).startswith("0x") or len(str(sig)) < 132:
-        raise RuntimeError(f"signer produced no/short signature: {sig!r}")
-    return str(sig)
+
+def verify_signer() -> str:
+    """Offline self-test of the order signers. Imports the lazy
+    `py_clob_client_v2` chain and signs the fixed SIGNER_VECTOR order with a
+    throwaway key — no network, no stored credentials — through both the EOA
+    and the deposit-wallet (POLY_1271) signer, and compares each against the
+    known-good bytes. Proves the signer is bundled AND still signs what the
+    exchange expects in THIS build (esp. the frozen PyInstaller backend, where
+    these are lazy-imported and trivially missed). Returns the POLY_1271
+    signature hex; raises on any failure or drift."""
+    from eth_account import Account
+    from py_clob_client_v2.signer import Signer  # type: ignore
+    from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderDataV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.side import Side  # type: ignore
+
+    v = SIGNER_VECTOR
+    addr = Account.from_key(v["key"]).address
+    signer = Signer(v["key"], CHAIN_ID)
+
+    def _sign(sig_type) -> str:
+        builder = ExchangeOrderBuilderV2(EXCHANGE_ADDRESS, CHAIN_ID, signer,
+                                         generate_salt=lambda: str(v["salt"]))
+        s = builder.build_signed_order(OrderDataV2(
+            maker=addr, signer=addr, tokenId=v["tokenId"],
+            makerAmount=v["makerAmount"], takerAmount=v["takerAmount"],
+            side=Side.BUY, signatureType=sig_type,
+            timestamp=str(v["timestamp"]), expiration="0",
+        ))
+        return str(getattr(s, "signature", "") or "")
+
+    for name, sig_type, want in (
+        ("EOA", SignatureTypeV2.EOA, _SIGNER_VECTOR_EOA_SIG),
+        ("POLY_1271", SignatureTypeV2.POLY_1271, _SIGNER_VECTOR_1271_SIG),
+    ):
+        sig = _sign(sig_type)
+        if sig != want:
+            raise RuntimeError(
+                f"{name} order signature drifted from the known-good vector "
+                f"(got {sig[:18]}…, len {len(sig)}) — this build signs orders "
+                f"the exchange will not accept")
+    return sig
 
 
 SESSION_SIGNER_MAGIC = bytes.fromhex(
     "6492649264926492649264926492649264926492649264926492649264926492")
 _signer_role = "OWNER"
+_signer_role_for: Optional[tuple] = None
 
 
-def set_signer_role(role: str) -> None:
-    global _signer_role
-    _signer_role = "SESSION_KEY" if str(role).upper() == "SESSION_KEY" else "OWNER"
+def _signer_role_file(env: str = NETWORK) -> Path:
+    return _credentials_dir() / f"wallet.{_validate_env(env)}.signer.json"
+
+
+def _role_identity(signer: str, funder: str) -> tuple:
+    return ((signer or "").strip().lower(), (funder or "").strip().lower())
+
+
+def _normalize_role(role: str) -> str:
+    return "SESSION_KEY" if str(role).upper() == "SESSION_KEY" else "OWNER"
+
+
+def _load_saved_signer_role() -> Optional[dict]:
+    """The saved {signer, funder, role} hint, or None. Never raises: it is only a
+    fallback, so an absent or unreadable file simply means "no hint"."""
+    try:
+        f = _signer_role_file(_current_env)
+        if not f.exists():
+            return None
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_signer_role(identity: tuple, role: str) -> None:
+    saved = _load_saved_signer_role() or {}
+    if (_role_identity(saved.get("signer", ""), saved.get("funder", "")) == identity
+            and _normalize_role(saved.get("role", "")) == role):
+        return
+    try:
+        f = _signer_role_file(_current_env)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(f.suffix + ".tmp")
+        tmp.write_text(json.dumps({
+            "signer": identity[0], "funder": identity[1], "role": role,
+            "checkedAt": int(time.time()),
+        }), encoding="utf-8")
+        tmp.replace(f)
+    except Exception as e:
+        logger.debug(f"[wallet] could not save the signer role: {e}")
+
+
+def set_signer_role(role: str, signer: str = "", funder: str = "") -> None:
+    """Record the role the deposit wallet itself reported for `signer`.
+
+    With both addresses the role is bound to exactly that pair (and saved as the
+    restart fallback); orders signed for any other key or wallet ignore it."""
+    global _signer_role, _signer_role_for
+    _signer_role = _normalize_role(role)
+    identity = _role_identity(signer, funder)
+    if not (identity[0] and identity[1]):
+        _signer_role_for = None
+        return
+    _signer_role_for = identity
+    _save_signer_role(identity, _signer_role)
 
 
 def get_signer_role() -> str:
     return _signer_role
 
 
+def signer_role_for(signer: str, funder: str) -> tuple:
+    """(role, source) for exactly this signer + deposit wallet. `source` is
+    "chain" (the wallet answered in this process), "saved" (the sidecar from an
+    earlier run) or "default" (nothing known: OWNER)."""
+    identity = _role_identity(signer, funder)
+    if _signer_role_for is not None and _signer_role_for == identity:
+        return _signer_role, "chain"
+    saved = _load_saved_signer_role()
+    if saved and _role_identity(saved.get("signer", ""), saved.get("funder", "")) == identity:
+        return _normalize_role(saved.get("role", "")), "saved"
+    return "OWNER", "default"
+
+
+def current_signer_role() -> str:
+    """The role the next order will be signed with: "OWNER" / "SESSION_KEY" for a
+    POLY_1271 deposit wallet, "" for every other wallet mode (they never carry the
+    envelope) or when the wallet isn't readable."""
+    try:
+        if get_signature_type() != SIGNATURE_TYPE_POLY_1271:
+            return ""
+        funder = get_funder()
+        if not funder:
+            return ""
+        return signer_role_for(get_address(), funder)[0]
+    except Exception:
+        return ""
+
+
 def wrap_session_signer_signature(session_signer: str, signature: str) -> str:
-    from eth_abi import encode as abi_encode
+    from eth_abi import encode as abi_encode  # type: ignore
     signer_id = bytes.fromhex(session_signer[2:] if session_signer.startswith("0x") else session_signer)
     sig = bytes.fromhex(signature[2:] if signature.startswith("0x") else signature)
     payload = abi_encode(["bytes32", "bytes32", "bytes"],
@@ -748,14 +988,27 @@ def _create_signed_order_1271(
     *, token_id: str, side: str, price: float, size: float,
     neg_risk: bool, expiration: int,
 ) -> dict:
+    """Build + sign a deposit-wallet (signatureType 3 / POLY_1271) order.
+
+    The order's maker AND signer are the deposit wallet (funder); the wallet
+    KEY signs an ERC-7739 "TypedDataSign" wrapper that the deposit wallet's
+    ERC-1271 `isValidSignature` validates on-chain. We delegate the (intricate,
+    money-critical) signing to Polymarket's official `py_clob_client_v2`
+    ExchangeOrderBuilderV2 — verified to recover to a valid signature against
+    the live deposit wallet. Returns the `order` dict for the V2 /order body.
+
+    This is THE supported deposit-wallet path: a Polymarket account created via
+    Gmail/email signup, with the private key exported FROM Polymarket and the
+    Profile/deposit address used as the funder. That pairing is signatureType 3.
+    """
     funder = get_funder()
     if not funder:
         raise RuntimeError("POLY_1271 order requested but no funder (deposit wallet) configured")
-    from py_clob_client_v2.signer import Signer
-    from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2
-    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderDataV2
-    from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2
-    from py_clob_client_v2.order_utils.model.side import Side
+    from py_clob_client_v2.signer import Signer  # type: ignore
+    from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderDataV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.side import Side  # type: ignore
 
     side_u = side.upper()
     if side_u == "BUY":
@@ -776,8 +1029,9 @@ def _create_signed_order_1271(
     )
     s = builder.build_signed_order(od)
     signature = s.signature
-    if _signer_role == "SESSION_KEY":
-        signature = wrap_session_signer_signature(get_address(), str(signature))
+    signer_addr = get_address()
+    if signer_role_for(signer_addr, funder)[0] == "SESSION_KEY":
+        signature = wrap_session_signer_signature(signer_addr, str(signature))
     return {
         "salt": int(s.salt),
         "maker": s.maker,
@@ -806,6 +1060,22 @@ def create_signed_order(
     salt: Optional[int] = None,
     ts_ms: Optional[int] = None,
 ) -> dict:
+    """Build + EIP-712-sign a CLOB **V2** limit order. Returns the JSON-ready
+    order object (including the signature) for POST /order.
+
+    V2 order struct (11 fields): salt, maker, signer, tokenId, makerAmount,
+    takerAmount, side, signatureType, timestamp(ms), metadata, builder.
+    `taker`, `nonce`, `feeRateBps` were removed vs V1; fees are protocol-set
+    at match time (taker-only) and not user-configurable.
+
+    Signature schemes:
+      • POLY_1271 (3): smart-contract wallet — delegates to `_create_signed_order_1271`
+        (maker = signer = the deposit wallet; validated on-chain via EIP-1271).
+      • EOA (0) / POLY_PROXY (1) / POLY_GNOSIS_SAFE (2): the EOA signs the same
+        EIP-712 order inline below — `signer` = the EOA, `maker` = the funder
+        (the proxy/safe for 1/2, or the EOA itself for 0), `signatureType` tags
+        the scheme so the CLOB authorizes the EOA against the right proxy.
+    """
     if get_signature_type() == SIGNATURE_TYPE_POLY_1271:
         return _create_signed_order_1271(
             token_id=token_id, side=side, price=price, size=size,
@@ -885,7 +1155,6 @@ def create_signed_order(
         "salt": int(salt),
         "maker": maker,
         "signer": addr,
-        "taker": ZERO_ADDRESS,
         "tokenId": str(int(token_id)),
         "makerAmount": str(int(maker_amount)),
         "takerAmount": str(int(taker_amount)),
@@ -899,7 +1168,39 @@ def create_signed_order(
     }
 
 
+def order_hash(order: dict, *, neg_risk: bool = False) -> str:
+    """The CLOB id of a signed V2 order: the EIP-712 hash of its Order struct
+    under the exchange's domain (the exchange contract's `hashOrder`).
+
+    The struct is the same in every wallet mode (only the signature around it
+    differs), so the id is known before the order is sent. That is what lets
+    an ambiguous POST /order failure be looked up instead of guessed at.
+    Computed by Polymarket's own SDK from the JSON-body `order` dict that
+    `create_signed_order` returns; it reads the order, never re-signs it."""
+    from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderV2  # type: ignore
+    from py_clob_client_v2.order_utils.model.side import Side  # type: ignore
+    from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2  # type: ignore
+
+    exchange = NEG_RISK_EXCHANGE_ADDRESS if neg_risk else EXCHANGE_ADDRESS
+    builder = ExchangeOrderBuilderV2(exchange, CHAIN_ID, None)
+    o = OrderV2(
+        salt=str(int(order["salt"])), maker=order["maker"], signer=order["signer"],
+        tokenId=str(int(order["tokenId"])), makerAmount=str(int(order["makerAmount"])),
+        takerAmount=str(int(order["takerAmount"])),
+        side=Side.BUY if str(order["side"]).upper() == "BUY" else Side.SELL,
+        signatureType=SignatureTypeV2(int(order["signatureType"])),
+        timestamp=str(int(order["timestamp"])),
+        metadata=order.get("metadata") or ZERO_BYTES32,
+        builder=order.get("builder") or ZERO_BYTES32,
+        expiration=str(order.get("expiration") or "0"),
+    )
+    return builder.build_order_hash(builder.build_order_typed_data(o))
+
+
 def prime_credentials(sync_time: bool = True) -> bool:
+    """Load the wallet key (and API creds if present). Does not derive — the
+    API client derives lazily on first authenticated call."""
     _load_account()
     _load_api_creds()
     return True

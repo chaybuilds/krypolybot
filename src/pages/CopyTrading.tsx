@@ -27,7 +27,7 @@ export function CopyTradingPage() {
       const s = await window.krypt.copy.status();
       cachedStatus = s;
       setStatus(s);
-    } catch {}
+    } catch { }
   }
 
   useEffect(() => {
@@ -181,9 +181,13 @@ export function CopyTradingPage() {
                 <div key={w} className="flex items-center gap-3 rounded-lg border border-krypt-border bg-krypt-surface2 px-3 py-2">
                   <Wallet className="h-4 w-4 shrink-0 text-krypt-purple" />
                   <span className="font-mono text-xs text-white">{ws?.short ?? `${w.slice(0, 6)}…${w.slice(-4)}`}</span>
-                  <span className="text-[11px] text-krypt-muted">
-                    {ws ? `${ws.positions} open · ${fmtUsd(ws.valueUsd)}` : 'fetching…'}
-                  </span>
+                  {ws?.error ? (
+                    <span className="text-[11px] text-krypt-warn">{ws.error}</span>
+                  ) : (
+                    <span className="text-[11px] text-krypt-muted">
+                      {ws ? `${ws.positions} open · ${fmtUsd(ws.valueUsd)}` : 'fetching…'}
+                    </span>
+                  )}
                   <button
                     onClick={() => void removeWallet(w)}
                     disabled={busy}

@@ -1,8 +1,23 @@
+"""Tests for the durable drawdown circuit-breakers and fixed-sizing backstop.
+
+Covers the money-safety fixes:
+
+  - DB corruption recovery restores the newest backup instead of coming up
+    with an empty schema (db.init_db).
+  - A durable, wipe-surviving LIFETIME cumulative realized-loss guard that
+    pauses new entries once total drawdown reaches a fraction of the bankroll
+    (crypto15m + copy engines).
+  - The daily-loss figure survives a mid-day history wipe (so clearing stats
+    can't re-arm trading past the daily limit).
+  - The crypto15m daily breaker includes the committed cost of still-open
+    TODAY positions, so a settlement wave can't overshoot the cap.
+  - 'fixed'-mode sizing can't put most of the account on a single bet.
+"""
 from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -10,6 +25,7 @@ import copy_trader
 import crypto15m_trader as ct
 import db
 from config import merge_with_defaults
+
 
 
 @pytest.fixture
@@ -29,6 +45,8 @@ def _now_str() -> str:
 
 def seed_c15(pnl=None, *, cost=0.0, status="settled", open_today=False,
              entry_cents=90, contracts=5):
+    """Insert a crypto15m position. When pnl is not None it's resolved (with
+    resolved_at = now). When open_today, it stays open (resolved=0)."""
     uid = uuid.uuid4().hex[:12]
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, {
@@ -74,6 +92,7 @@ def base_cfg(**over):
     return c
 
 
+
 def test_init_db_restores_backup_on_corruption(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -99,6 +118,7 @@ def test_init_db_restores_backup_on_corruption(tmp_path, monkeypatch):
         row = conn.execute("SELECT v FROM app_kv WHERE k='canary'").fetchone()
     assert row is not None and row[0] == "restored", "backup was not restored"
     assert list(data_dir.glob("krypt-polybot.db.corrupt-*"))
+
 
 
 def test_crypto15m_lifetime_guard_trips_at_pct(fresh_db):
@@ -144,6 +164,7 @@ def test_copy_lifetime_guard_trips(fresh_db):
     assert tripped and "lifetime loss limit" in why
 
 
+
 def test_lifetime_counter_survives_clear_trade_history(fresh_db):
     seed_c15(-60.0)
     cfg = base_cfg(crypto15m_lifetime_loss_limit_pct=0.5)
@@ -180,6 +201,7 @@ def test_banking_is_cumulative_across_repeated_wipes(fresh_db):
         assert db.lifetime_realized_pnl(conn, "crypto15m", ENV) == pytest.approx(-55.0)
 
 
+
 def test_daily_pnl_survives_wipe(fresh_db):
     seed_copy(-40.0)
     with db.get_db() as conn:
@@ -200,6 +222,7 @@ def test_crypto15m_today_pnl_survives_wipe(fresh_db):
         assert db.crypto15m_today_pnl(conn, ENV) == pytest.approx(-35.0)
 
 
+
 def test_today_open_cost_counts_open_positions(fresh_db):
     seed_c15(open_today=True, status="filled", cost=30.0)
     seed_c15(open_today=True, status="filled", cost=12.0)
@@ -213,6 +236,7 @@ def test_today_open_cost_values_resting_notional(fresh_db):
              entry_cents=80, contracts=5)
     with db.get_db() as conn:
         assert db.crypto15m_today_open_cost(conn, ENV) == pytest.approx(4.0)
+
 
 
 def test_fixed_sizing_caps_single_entry_fraction(fresh_db):
@@ -244,6 +268,7 @@ def test_explicit_max_loss_still_applies(fresh_db):
     assert n == 20
 
 
+
 def seed_main(pnl, *, source="whale"):
     uid = uuid.uuid4().hex[:12]
     with db.get_db() as conn:
@@ -269,6 +294,9 @@ def test_main_lifetime_guard_trips_at_pct(fresh_db):
 
 
 def test_main_lifetime_guard_ignores_external_and_copy_rows(fresh_db):
+    """The breaker gates BOT entries, so reconcile-imported 'external' rows
+    (the 2026-07 double-import artifacts booked -$800 there) and copy-engine
+    rows must not trip it."""
     import trader
     seed_main(-500.0, source="external")
     seed_copy(-500.0)
@@ -292,6 +320,7 @@ def test_main_lifetime_guard_disabled(fresh_db):
     seed_main(-500.0)
     cfg = base_cfg(lifetime_loss_limit_pct=0.0, lifetime_loss_limit_usd=0.0)
     assert trader._lifetime_loss_tripped_main(cfg, ENV) == (False, "")
+
 
 
 def test_transfer_adjustment_total_sums_all_days(fresh_db):
@@ -329,3 +358,40 @@ def test_transfer_recorded_per_run_and_adjusts_session(fresh_db):
         assert db.transfer_adjustment_run(conn, ENV, run_id) == pytest.approx(-250.0)
         assert db.transfer_adjustment_run(conn, ENV, run_id + 1) == 0.0
         assert db.transfer_adjustment_run(conn, ENV, 0) == 0.0
+
+
+def _snap_at(conn, total, days_ago, env=ENV):
+    conn.execute(
+        "INSERT INTO pnl_snapshots (at, network, cash_usd, portfolio_usd, total_usd) "
+        "VALUES (datetime('now', ?), ?, ?, 0, ?)", (f"-{days_ago} days", env, total, total))
+
+
+def test_alltime_baseline_survives_the_45_day_prune(fresh_db):
+    with db.get_db() as conn:
+        _snap_at(conn, 1000.0, 60)
+        _snap_at(conn, 1500.0, 10)
+    db.cleanup_old_data()
+    with db.get_db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pnl_snapshots WHERE network=?", (ENV,)).fetchone()[0] == 1
+        assert db.earliest_pnl_total(conn, ENV) == pytest.approx(1000.0)
+        assert db.effective_start_bankroll(conn, ENV) == pytest.approx(1000.0)
+
+
+def test_the_baseline_is_pinned_by_the_first_snapshot(fresh_db):
+    with db.get_db() as conn:
+        db.insert_pnl_snapshot(conn, cash_usd=700, portfolio_usd=300, realized_pnl_usd=0,
+                               wins=0, losses=0, open_positions=0, env=ENV)
+        db.insert_pnl_snapshot(conn, cash_usd=900, portfolio_usd=300, realized_pnl_usd=0,
+                               wins=0, losses=0, open_positions=0, env=ENV)
+        conn.execute("DELETE FROM pnl_snapshots")
+        assert db.earliest_pnl_total(conn, ENV) == pytest.approx(1000.0)
+
+
+def test_transfers_before_the_baseline_do_not_count(fresh_db):
+    with db.get_db() as conn:
+        _snap_at(conn, 1500.0, 10)
+        old = (datetime.now(timezone.utc) - timedelta(days=50)).strftime("%Y-%m-%d")
+        new = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        db.kv_set(conn, f"transfers:{ENV}:{old}", "1000.0")
+        db.kv_set(conn, f"transfers:{ENV}:{new}", "-25.0")
+        assert db.transfer_adjustment_total(conn, ENV) == pytest.approx(-25.0)

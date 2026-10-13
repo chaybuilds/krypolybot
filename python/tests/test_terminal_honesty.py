@@ -1,3 +1,12 @@
+"""The terminal's honesty rules, pinned.
+
+Every assertion here is a behaviour that would be INVISIBLE if it regressed:
+a missing number silently becoming zero, a filter quietly hiding the rows it
+could not judge, a chart bridging a hole in the tape. Green screenshots do not
+catch any of them, which is exactly why they are unit tests.
+
+Pure logic only — no network, no clock. These run in CI.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,9 +20,12 @@ import terminal_trade as tt
 
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
+    """An isolated DB carrying the real schema — including the terminal's own
+    tables, which is what the cost-basis tests below read."""
     monkeypatch.setattr(db, "db_path", lambda: tmp_path / "terminal.db")
     db.init_db()
     return tmp_path
+
 
 
 def test_num_returns_none_for_unknowable_input():
@@ -37,6 +49,7 @@ def test_cents_scales_and_preserves_none():
     assert t.cents(1) == 100.0
     assert t.cents(None) is None
     assert t.cents("") is None
+
 
 
 def test_row_put_ignores_none():
@@ -73,6 +86,12 @@ def test_unknown_reason_is_dropped_once_the_field_is_known():
 
 
 def test_empty_book_sentinels_are_not_prices():
+    """Gamma reports bestBid 0 / bestAsk 1 for a market with no resting
+    orders. Polymarket only accepts 1c..99c, so neither extreme is a price
+    anyone could trade — passing them through produced "bid 0c, ask 100c,
+    spread 100c" on every freshly-listed market, which is a specific and
+    confident lie. Found by the live check against a real just-listed
+    market; no fixture would have caught it."""
     raw = {
         "conditionId": "0xabc", "question": "Just listed?",
         "active": True, "closed": False,
@@ -157,6 +176,7 @@ def test_probability_bounds_skip_unpriced_rows():
     assert len(kept) == 1 and skipped == 1
 
 
+
 def test_history_is_sorted_and_deduped():
     pts = t._dedupe_points([
         {"t": 3, "p": 30.0}, {"t": 1, "p": 10.0},
@@ -192,6 +212,7 @@ def test_book_levels_ignore_zero_and_malformed_rows():
     assert len(levels) == 1 and levels[0]["priceCents"] == 40.0
 
 
+
 def test_fee_uses_the_markets_own_schedule_over_the_category_table():
     fee = tt._fee_per_share(50.0, "crypto", {"enabled": True, "rate": 0.02, "exponent": 1})
     assert abs(fee - 0.02 * 0.25) < 1e-9
@@ -215,6 +236,7 @@ def test_fee_is_symmetric_and_vanishes_at_the_extremes():
     assert abs(tt._fee_per_share(20.0, "crypto", None)
                - tt._fee_per_share(80.0, "crypto", None)) < 1e-9
     assert tt._fee_per_share(1.0, "crypto", None) < 0.001
+
 
 
 def test_walking_an_unreadable_book_reports_unknown_not_zero():
@@ -249,6 +271,7 @@ def test_walk_never_reports_more_than_requested():
     levels = [{"priceCents": 50.0, "size": 1000.0}]
     fillable, avg = tt._walk_book(levels, 7, 50, is_buy=True)
     assert fillable == 7.0 and avg == 50.0
+
 
 
 def _seed_fills(rows):
@@ -297,6 +320,7 @@ def test_an_unknown_fee_marks_the_whole_group_unknown(fresh_db):
     assert st["fees_known"] is False
 
 
+
 def _run(coro):
     import asyncio
     return asyncio.new_event_loop().run_until_complete(coro)
@@ -309,6 +333,10 @@ def test_empty_watchlist_says_it_is_empty(monkeypatch):
 
 
 def test_unloadable_watchlist_does_not_claim_to_be_empty(monkeypatch):
+    """The bug this pins: a starred market that SETTLES stops being returned
+    by Gamma (it defaults to closed=false), the column renders empty, and the
+    note told the user they had never starred anything — so it looks like the
+    app lost their list. An unloadable list must say so."""
     monkeypatch.setattr(
         t, "watchlist_list",
         lambda: [{"conditionId": "0xdead", "title": "x", "addedAt": "", "note": None}])
@@ -341,7 +369,9 @@ def test_partially_loadable_watchlist_reports_the_shortfall(monkeypatch):
     assert "1 of your 2 watched market(s) could not be loaded" in r["note"]
 
 
+
 def _cursor_pages(pages):
+    """Fake CLOB /data/trades that hands back `pages` in cursor order."""
     calls = {"n": 0}
 
     async def _req(method, path, *, params=None, **kw):
@@ -355,6 +385,9 @@ def _cursor_pages(pages):
 
 
 def test_fill_walk_follows_the_cursor_to_the_end(monkeypatch):
+    """A single un-paginated call only ever saw the newest page, so any
+    position opened before that window could never be reconciled — it stayed
+    `unreconciled` forever, excluded from every total, with no way to backfill."""
     pages = [[{"id": "a"}], [{"id": "b"}], [{"id": "c"}]]
     req, calls = _cursor_pages(pages)
     monkeypatch.setattr(tt.api, "_authed_request", req)
@@ -374,11 +407,80 @@ def test_fill_walk_reports_incomplete_when_it_hits_the_page_cap(monkeypatch):
 
 
 def test_fill_walk_stops_on_a_repeated_cursor(monkeypatch):
+    """A provider that echoes the same cursor would otherwise spin until the
+    page cap, burning the rate budget for nothing."""
     async def _stuck(method, path, *, params=None, **kw):
         return {"data": [{"id": "x"}], "next_cursor": "same"}
     monkeypatch.setattr(tt.api, "_authed_request", _stuck)
     rows, complete = _run(tt._walk_trades(max_pages=20))
     assert complete is True and len(rows) == 2
+
+
+def _long_history(monkeypatch, n_pages):
+    """A wallet whose /data/trades runs to `n_pages` one-fill pages, newest
+    first, behind offset-style cursors c1, c2, … — and a market to file them
+    under."""
+    import time as _time
+    now = _time.time()
+
+    async def _req(method, path, *, params=None, **kw):
+        cur = (params or {}).get("next_cursor") or "c0"
+        if not cur.startswith("c"):
+            raise RuntimeError(f"400 bad cursor {cur}")
+        i = int(cur[1:])
+        return {"data": [_trade(f"t{i:02d}", ts=now - i * 60)],
+                "next_cursor": "LTE=" if i + 1 >= n_pages else f"c{i + 1}"}
+
+    async def _summaries(_ids):
+        return [{"conditionId": "0xabc", "title": "T", "category": "crypto",
+                 "_raw": {"feesEnabled": False}}]
+    monkeypatch.setattr(tt.api, "_authed_request", _req)
+    monkeypatch.setattr(tt.term, "_summaries_for", _summaries)
+
+
+def test_a_history_past_the_page_cap_is_imported_over_later_passes(
+        monkeypatch, fresh_db):
+    """Every pass used to start again at the newest fill, so a wallet past
+    the cap re-read the same newest pages forever — older fills (and the
+    winners redeemed in them) could never be imported, while the note said
+    "run this again to continue"."""
+    monkeypatch.setattr(tt, "_FILL_MAX_PAGES", 4)
+    _long_history(monkeypatch, 10)
+    r1 = _run(tt.reconcile_fills())
+    assert r1["complete"] is False and "continues" in (r1["note"] or "")
+    assert len(_fills()) == 4
+    _run(tt.reconcile_fills())
+    assert len(_fills()) == 8
+    r3 = _run(tt.reconcile_fills())
+    assert len(_fills()) == 10, "the older history was never reached"
+    assert r3["complete"] is True
+    assert r3["inserted"] == 2, "an overlapping stretch was counted twice"
+    r4 = _run(tt.reconcile_fills())
+    assert r4["complete"] is True and "continues" not in (r4["note"] or "")
+
+
+def test_a_saved_cursor_the_venue_refuses_does_not_cost_the_newest_fills(
+        monkeypatch, fresh_db):
+    monkeypatch.setattr(tt, "_FILL_MAX_PAGES", 4)
+    _long_history(monkeypatch, 10)
+    with db.get_db() as conn:
+        db.kv_set(conn, tt._fill_resume_key(), "stale")
+    r = _run(tt.reconcile_fills())
+    assert len(_fills()) == 4 and r["complete"] is False
+    _run(tt.reconcile_fills())
+    _run(tt.reconcile_fills())
+    assert len(_fills()) == 8
+
+
+def test_an_overlapping_backfill_counts_each_fill_once(monkeypatch, fresh_db):
+    """A saved cursor is a position in a list that moves; when the stretch it
+    points at overlaps the newest pages, each trade is still one fill."""
+    monkeypatch.setattr(tt, "_FILL_MAX_PAGES", 4)
+    _long_history(monkeypatch, 10)
+    with db.get_db() as conn:
+        db.kv_set(conn, tt._fill_resume_key(), "c2")
+    r = _run(tt.reconcile_fills())
+    assert len(_fills()) == 6 and r["inserted"] == 6
 
 
 def test_fill_walk_accepts_the_legacy_list_shape(monkeypatch):
@@ -387,6 +489,7 @@ def test_fill_walk_accepts_the_legacy_list_shape(monkeypatch):
     monkeypatch.setattr(tt.api, "_authed_request", _list)
     rows, complete = _run(tt._walk_trades())
     assert len(rows) == 2 and complete is True
+
 
 
 def _trade(tid, *, ts, taker="", makers=(), price="0.60", size="10"):
@@ -416,6 +519,12 @@ def _fills():
 
 def test_a_wipe_stops_history_being_re_imported_as_someone_elses(
         monkeypatch, fresh_db):
+    """The walk has NO cursor — it re-reads the venue's whole history every
+    time and attributes each fill by matching it to a local order row. Wipe
+    terminal_orders and every one of your own historical fills becomes
+    unmatchable and comes back stamped 'external', permanently: the import is
+    idempotent on the venue's trade id, so nothing ever corrects it. "Start my
+    stats fresh" left the Track screen fuller than it found it."""
     import time as _time
     db.clear_trade_history()
     r = _reconcile(monkeypatch, [
@@ -428,6 +537,8 @@ def test_a_wipe_stops_history_being_re_imported_as_someone_elses(
 
 
 def test_with_no_wipe_the_whole_history_still_reconciles(monkeypatch, fresh_db):
+    """The floor is a wipe artefact, not a retention policy: a user who never
+    reset must still be able to backfill positions from years ago."""
     import time as _time
     r = _reconcile(monkeypatch,
                    [_trade("ancient", ts=_time.time() - 86_400 * 900)])
@@ -437,6 +548,11 @@ def test_with_no_wipe_the_whole_history_still_reconciles(monkeypatch, fresh_db):
 
 def test_an_unattributable_fill_has_an_unknown_fee_not_a_zero_one(
         monkeypatch, fresh_db):
+    """"Not proven to be the taker" is not the claim "was the maker". A fill
+    we could not match to any local order tells us nothing about which side of
+    the match we were on, so its fee is unknown — and this module's one rule
+    is that a value nobody could produce is null. (The aggregate treatment of
+    that null is pinned by the ledger-basis test above.)"""
     import time as _time
     now = _time.time()
     with db.get_db() as conn:
@@ -457,6 +573,101 @@ def test_an_unattributable_fill_has_an_unknown_fee_not_a_zero_one(
     assert by_id["ext"]["origin"] == "external"
     assert by_id["mine"]["fees_usd"] == 0.0
     assert by_id["mine"]["origin"] == "manual"
+
+
+def _taker_walk(monkeypatch, trades, gamma):
+    """A walk of TAKER fills on a crypto market whose Gamma read can fail."""
+    async def _req(method, path, *, params=None, **kw):
+        return {"data": [dict(t, trader_side="TAKER") for t in trades],
+                "next_cursor": "LTE="}
+
+    async def _summaries(_ids):
+        if not gamma["up"]:
+            return []
+        return [{"conditionId": "0xabc", "title": "T", "category": "crypto",
+                 "_raw": {}}]
+    monkeypatch.setattr(tt.api, "_authed_request", _req)
+    monkeypatch.setattr(tt.term, "_summaries_for", _summaries)
+
+
+def test_a_failed_market_lookup_does_not_wipe_a_known_taker_fee(
+        monkeypatch, fresh_db):
+    """A taker fee needs the market's Gamma schedule. One reconcile pass whose
+    lookup failed (parked host, timeout, offline mode) re-derived every fee
+    as NULL and wrote it over the known one — and a single NULL fee turns the
+    Track headline from net to gross: on the owner's ledger, a $64 loss shown
+    as an $11 gain."""
+    import time as _time
+    gamma = {"up": True}
+    _taker_walk(monkeypatch, [_trade("tk", ts=_time.time())], gamma)
+    _run(tt.reconcile_fills())
+    known = _fills()[0]["fees_usd"]
+    assert known is not None and abs(known - 0.07 * 0.6 * 0.4 * 10) < 1e-9
+
+    gamma["up"] = False
+    _run(tt.reconcile_fills())
+    assert _fills()[0]["fees_usd"] == known, "the failed lookup wiped the fee"
+    assert tt._ledger_basis()[("0xabc", "yes")]["fees_known"] is True
+
+
+def test_a_fill_re_derived_onto_another_price_does_not_keep_its_old_fee(
+        monkeypatch, fresh_db):
+    """The fee belongs to the fill as read. If this pass reads it at another
+    price and cannot price the fee, the old figure is not this fill's fee."""
+    import time as _time
+    now = _time.time()
+    gamma = {"up": True}
+    _taker_walk(monkeypatch, [_trade("tk", ts=now, price="0.60")], gamma)
+    _run(tt.reconcile_fills())
+    gamma["up"] = False
+    _taker_walk(monkeypatch, [_trade("tk", ts=now, price="0.30")], gamma)
+    _run(tt.reconcile_fills())
+    assert _fills()[0]["fees_usd"] is None
+
+
+@pytest.mark.parametrize("failed", ["FAILED", "TRADE_STATUS_FAILED"])
+def test_a_failed_trade_is_not_booked_as_a_fill(monkeypatch, fresh_db, failed):
+    """A FAILED trade matched but never settled; settlement is atomic, so
+    nothing changed hands. Booked anyway, it inflated size and cost and later
+    settled as a phantom win or loss."""
+    import time as _time
+    now = _time.time()
+    r = _reconcile(monkeypatch, [
+        dict(_trade("ok", ts=now), status="CONFIRMED"),
+        dict(_trade("bad", ts=now, size="200"), status=failed),
+    ])
+    assert [f["trade_id"] for f in _fills()] == ["ok"]
+    assert r["failed"] == 1
+
+
+def test_a_fill_whose_trade_later_failed_is_taken_back_out(monkeypatch, fresh_db):
+    """Reconcile runs 3s after an order, while its trade is still MATCHED.
+    If that trade then fails on-chain, the next pass must undo the import and
+    the order row must stop claiming the fill."""
+    import time as _time
+    now = _time.time()
+    with db.get_db() as conn:
+        conn.execute(
+            """INSERT INTO terminal_orders
+                 (condition_id, title, side, action, order_type,
+                  requested_size, requested_price_cents, order_id, status,
+                  origin, network)
+               VALUES ('0xabc','T','yes','buy','FAK',10,60,'oid_tk','placed',
+                       'manual','mainnet')""")
+    _reconcile(monkeypatch, [dict(_trade("tk", ts=now, taker="oid_tk"),
+                                  status="MATCHED")])
+    assert [f["trade_id"] for f in _fills()] == ["tk"]
+
+    r = _reconcile(monkeypatch, [dict(_trade("tk", ts=now, taker="oid_tk"),
+                                      status="FAILED")])
+    assert _fills() == []
+    assert r["unwound"] == 1 and "FAILED" in (r["note"] or "")
+    with db.get_db() as conn:
+        o = conn.execute("SELECT status, reconciled, filled_size FROM terminal_orders "
+                         "WHERE order_id='oid_tk'").fetchone()
+    assert o["filled_size"] is None and o["reconciled"] == 0
+    assert o["status"] != "filled"
+
 
 
 def _fake_portfolio(monkeypatch, *, resolved, side, redeemable=False, cur_price=0.97):
@@ -516,6 +727,11 @@ def test_redeemable_positions_are_counted_and_explained(monkeypatch, fresh_db):
 
 def test_an_unreadable_wallet_is_flagged_not_reported_as_empty(
         monkeypatch, fresh_db):
+    """`portfolio()` degrades a failed wallet read to an empty list plus a
+    note, which is right for a screen and dangerous for anything that acts on
+    it: "we could not ask" and "you hold nothing" are opposite instructions to
+    a seller. The flag is what lets the two be told apart without matching on
+    the note's wording."""
     async def _boom(*_a, **_kw):
         raise RuntimeError("rpc down")
 
@@ -532,12 +748,16 @@ def test_a_wallet_that_answers_is_marked_readable(monkeypatch, fresh_db):
 
 
 def test_a_settled_position_with_no_basis_still_reports_unknown_pnl(monkeypatch, fresh_db):
+    """Knowing the OUTCOME does not mean knowing the P&L. Without a cost basis
+    there is nothing to measure the settlement against, and guessing one would
+    be exactly the lie the ledger exists to prevent."""
     _fake_portfolio(monkeypatch, resolved="yes", side="yes")
     p = _run(tt.portfolio())["positions"][0]
     assert p["markCents"] == 100.0
     assert p["avgCostCents"] is None
     assert p["unrealizedPnlUsd"] is None
     assert p["unreconciled"] is True
+
 
 
 def test_offline_mode_makes_no_requests(monkeypatch):
@@ -558,6 +778,10 @@ def test_offline_mode_makes_no_requests(monkeypatch):
 
 
 def test_offline_reason_beats_a_column_specific_note(monkeypatch):
+    """The bug this pins: 'New' explained an empty column with "just-listed
+    markets have no book yet" and 'Resolving' with "none of the 0 most
+    recently closed markets is awaiting settlement". Both are confident claims
+    about Polymarket, made after asking nobody."""
     t.set_offline(True)
     try:
         for column in ("new", "volatility", "volume", "closing"):
@@ -571,6 +795,8 @@ def test_offline_reason_beats_a_column_specific_note(monkeypatch):
 
 
 def test_offline_mode_does_not_serve_stale_cache(monkeypatch):
+    """Serving a cached answer while the user believes the app is offline is
+    its own small lie — the point of the switch is that it is verifiable."""
     key = t._cache_key("gamma", "/markets", {"limit": 1})
     t._cache[key] = (t.time.monotonic() + 999, [{"conditionId": "0x1"}], t._now_iso())
     t.set_offline(True)
@@ -592,6 +818,10 @@ def test_health_reports_the_switch_state():
 
 
 def test_a_thin_all_or_none_order_warns_rather_than_blocks(monkeypatch):
+    """An all-or-none order that crosses nothing is KILLED by the venue and
+    reported as a clean zero fill — it costs nothing. Refusing to submit it
+    made that outcome unreachable, and paper mode could not simulate the kill
+    an FOK exists for."""
     async def _market(cid, include_raw=False):
         m = {"conditionId": cid, "title": "x", "category": "crypto",
              "status": "open", "spread": 1.0, "liquidityUsd": 1e6,
@@ -616,7 +846,9 @@ def test_a_thin_all_or_none_order_warns_rather_than_blocks(monkeypatch):
     assert any("killed" in w for w in pv["warnings"])
 
 
+
 def _thin_book(monkeypatch, *, asks=(), bids=()):
+    """A fee-free market whose book holds exactly the levels given."""
     async def _market(cid, include_raw=False):
         m = {"conditionId": cid, "title": "x", "category": "crypto",
              "status": "open", "spread": 1.0, "liquidityUsd": 1e6,
@@ -636,6 +868,9 @@ def _thin_book(monkeypatch, *, asks=(), bids=()):
 
 
 def test_a_fak_costs_what_it_can_actually_spend(monkeypatch):
+    """3 asks at 60¢, FAK buy of 100 at 65¢. The remainder is KILLED, so the
+    most this order can spend is 3 × 60¢ = $1.80. The old ticket said $60.00 —
+    a figure that also drove the fee, the max loss and the confirmation gate."""
     _thin_book(monkeypatch, asks=[(60.0, 3)])
     pv = _run(tt.preview({"conditionId": "0xabc", "side": "yes",
                           "action": "buy", "priceCents": 65, "size": 100,
@@ -648,6 +883,9 @@ def test_a_fak_costs_what_it_can_actually_spend(monkeypatch):
 
 
 def test_a_gtc_costs_its_real_worst_case(monkeypatch):
+    """Same book, same order, GTC: 3 cross at 60¢ and the other 97 REST at the
+    65¢ limit, so the worst case is $1.80 + $63.05 = $64.85 — not the $60.00
+    the fillable-slice average produced, and more than the user was shown."""
     _thin_book(monkeypatch, asks=[(60.0, 3)])
     pv = _run(tt.preview({"conditionId": "0xabc", "side": "yes",
                           "action": "buy", "priceCents": 65, "size": 100,
@@ -658,6 +896,8 @@ def test_a_gtc_costs_its_real_worst_case(monkeypatch):
 
 
 def test_an_order_that_crosses_nothing_costs_nothing_only_if_it_is_killed(monkeypatch):
+    """The two order types diverge completely on an untouchable book: the FAK
+    spends zero, the GTC rests the whole size at the limit."""
     _thin_book(monkeypatch, asks=[(70.0, 500)])
     fak = _run(tt.preview({"conditionId": "0xabc", "side": "yes",
                            "action": "buy", "priceCents": 65, "size": 100,
@@ -671,6 +911,8 @@ def test_an_order_that_crosses_nothing_costs_nothing_only_if_it_is_killed(monkey
 
 
 def test_sell_proceeds_follow_the_same_rule(monkeypatch):
+    """Proceeds are the mirror image: an FAK banks only what crosses, a GTC
+    assumes the resting remainder fills at the limit and no better."""
     _thin_book(monkeypatch, bids=[(60.0, 3)])
     fak = _run(tt.preview({"conditionId": "0xabc", "side": "yes",
                            "action": "sell", "priceCents": 55, "size": 100,
@@ -685,6 +927,8 @@ def test_sell_proceeds_follow_the_same_rule(monkeypatch):
 
 
 def test_an_unreadable_book_prices_the_whole_order_at_the_limit(monkeypatch):
+    """No walk to lean on. The only safe direction to be wrong in is UP, so
+    the whole size is priced at the limit rather than left at zero."""
     async def _market(cid, include_raw=False):
         m = {"conditionId": cid, "title": "x", "category": "crypto",
              "status": "open", "spread": 1.0, "liquidityUsd": 1e6,
@@ -707,7 +951,11 @@ def test_an_unreadable_book_prices_the_whole_order_at_the_limit(monkeypatch):
     assert pv["costUsd"] == 65.00
 
 
+
 def _standing(monkeypatch, *, positions, prob=30.0, placed=None):
+    """One armed stop at 40c on a market currently at `prob`, on a Live
+    account (the backend's raw default config reads Paper)."""
+    monkeypatch.setattr(tt, "_paper_mode_on", lambda: False)
     entries = [{
         "id": "st_1", "conditionId": "0xabc", "title": "T", "side": "yes",
         "kind": "stopLoss", "triggerCents": 40.0, "size": 100,
@@ -740,6 +988,9 @@ def _standing(monkeypatch, *, positions, prob=30.0, placed=None):
 
 
 def test_a_stop_retires_itself_when_the_position_is_gone(monkeypatch):
+    """Without this the venue rejects the sell, the attempt lands in the order
+    log as an error, and the instruction stays armed and does it again on
+    every single tick."""
     placed = []
     entries = _standing(monkeypatch, positions=[], placed=placed)
     r = _run(tt.standing_tick(allow_trading=True))
@@ -750,6 +1001,8 @@ def test_a_stop_retires_itself_when_the_position_is_gone(monkeypatch):
 
 
 def test_a_stop_holds_fire_when_positions_cannot_be_read(monkeypatch):
+    """An unreadable wallet is NOT the same as holding nothing. Selling blind
+    is worse than waiting, so it stays armed and retries."""
     placed = []
     entries = _standing(monkeypatch, positions=None, placed=placed)
     _run(tt.standing_tick(allow_trading=True))
@@ -771,6 +1024,40 @@ def test_a_stop_sells_only_what_is_actually_held(monkeypatch):
     assert "only 30" in entries[0]["note"]
 
 
+def _gamma_lags_the_book(monkeypatch, *, gamma, bid, ask):
+    """Gamma's copy of the market says `gamma`; the live book says bid/ask."""
+    async def _market(cid, include_raw=False):
+        return {"conditionId": cid, "title": "T", "probability": gamma,
+                "yesTokenId": "tok_yes", "resolvedOutcome": None}
+    monkeypatch.setattr(tt.term, "market", _market)
+    monkeypatch.setattr(tt.term, "_live_quote", lambda tok: None)
+
+    async def _tops(tokens):
+        return {t: (bid, ask, "2026-10-11T00:00:00+00:00") for t in tokens}
+    monkeypatch.setattr(tt.term, "_clob_tops", _tops)
+
+
+def test_a_stop_fires_on_the_live_book_when_gamma_lags(monkeypatch):
+    """Gamma sits 20-67c behind the book near a close. A position that has
+    already collapsed on the book must not wait for Gamma to notice."""
+    placed = []
+    _standing(monkeypatch, positions=[{"ticker": "0xabc", "position_fp": 100.0}],
+              placed=placed)
+    _gamma_lags_the_book(monkeypatch, gamma=60.0, bid=28.0, ask=32.0)
+    _run(tt.standing_tick(allow_trading=True))
+    assert len(placed) == 1, "the stop waited on Gamma's stale 60c"
+
+
+def test_a_stop_holds_when_only_gamma_says_it_collapsed(monkeypatch):
+    """And the other way: a stale Gamma low must not sell a recovered position."""
+    placed = []
+    _standing(monkeypatch, positions=[{"ticker": "0xabc", "position_fp": 100.0}],
+              placed=placed)
+    _gamma_lags_the_book(monkeypatch, gamma=30.0, bid=58.0, ask=62.0)
+    _run(tt.standing_tick(allow_trading=True))
+    assert placed == [], "sold a position on Gamma's stale 30c"
+
+
 def test_a_stop_fires_normally_when_the_position_is_intact(monkeypatch):
     placed = []
     entries = _standing(
@@ -783,6 +1070,8 @@ def test_a_stop_fires_normally_when_the_position_is_intact(monkeypatch):
 
 
 def test_a_no_side_stop_reads_the_no_holding(monkeypatch):
+    """A NO position comes back as a NEGATIVE size on the data API. Reading it
+    as a YES holding would make every NO stop think the position was gone."""
     placed = []
     entries = _standing(
         monkeypatch,
@@ -806,8 +1095,13 @@ def test_an_alert_does_not_need_a_position(monkeypatch):
     assert placed == [], "an alert placed an order"
 
 
+
 def _standing_store(monkeypatch, entries):
+    """A real read/modify/write store behind standing_list/_standing_put, so
+    a cancel that lands mid-tick behaves exactly as it does against the KV.
+    On a Live account: the backend's raw default config reads Paper."""
     import copy
+    monkeypatch.setattr(tt, "_paper_mode_on", lambda: False)
     store = {"v": copy.deepcopy(entries)}
     monkeypatch.setattr(tt, "standing_list", lambda: copy.deepcopy(store["v"]))
     monkeypatch.setattr(
@@ -827,6 +1121,10 @@ def _stop_entry(**over):
 
 
 def test_a_stop_cancelled_during_a_tick_is_not_resurrected(monkeypatch):
+    """The worst outcome available here: the user cancels a stop, the tick
+    that was already in flight writes its stale copy back, and the stop is
+    live again — ARMED, against a position the user has decided not to
+    protect. It also fired an order on the way past."""
     store = _standing_store(monkeypatch, [_stop_entry()])
 
     async def _market(cid, include_raw=False):
@@ -852,6 +1150,9 @@ def test_a_stop_cancelled_during_a_tick_is_not_resurrected(monkeypatch):
 
 
 def test_a_stop_disarmed_during_a_tick_stays_disarmed(monkeypatch):
+    """Same lost update, quieter: the trigger never even fires, and the tick's
+    only job is to stamp lastCheckedAt. Writing its copy back re-armed an
+    instruction the user had just switched off."""
     store = _standing_store(monkeypatch, [_stop_entry()])
 
     async def _market(cid, include_raw=False):
@@ -870,6 +1171,8 @@ def test_a_stop_disarmed_during_a_tick_stays_disarmed(monkeypatch):
 
 
 def test_an_instruction_added_during_a_tick_survives_it(monkeypatch):
+    """The other half of the same write: a stop written while the tick was
+    awaiting must not be erased by the older list going back."""
     store = _standing_store(monkeypatch, [_stop_entry()])
 
     async def _market(cid, include_raw=False):
@@ -887,7 +1190,12 @@ def test_an_instruction_added_during_a_tick_survives_it(monkeypatch):
     assert sorted(e["id"] for e in store["v"]) == ["st_1", "st_2"]
 
 
+
 def test_opposite_legs_are_not_treated_as_the_same_question():
+    """Found live: "Fed will INCREASE rates by 25bps" and "Fed will DECREASE
+    rates by 25bps" share 83% of their words. Flagging their 33c gap as a
+    contradiction is a confident wrong claim in the panel that exists to be
+    trusted."""
     a = "Will the Fed increase interest rates by 25 bps in September?"
     b = "Will the Fed decrease interest rates by 25 bps in September?"
     assert t._are_opposites(a, b)
@@ -908,6 +1216,9 @@ def test_a_shared_updown_phrase_is_not_an_opposite():
 
 
 def test_a_negrisk_group_never_reports_a_contradicting_sibling(monkeypatch):
+    """In a neg-risk group exactly one leg wins, so the legs disagreeing IS
+    the design. Group coherence (they sum to ~100c) is the right test, and it
+    is a separate check."""
     async def _event_markets(_slug):
         return [
             {"conditionId": "0xa", "title": "Outcome A", "probability": 70.0},
@@ -934,6 +1245,11 @@ def test_a_standalone_market_still_reports_a_real_contradiction(monkeypatch):
 
 
 def test_negrisk_group_sum_counts_each_leg_exactly_once(monkeypatch):
+    """`_event_markets` already returns OUR market among the event's legs, so
+    adding it again double-counted its price: a Fed group whose five legs
+    really summed to 100.7c was reported as 135.2c — i.e. "35c mispriced",
+    which is a confident, entirely wrong claim. It looked plausible, which is
+    exactly why it survived a screenshot."""
     legs = [
         {"conditionId": "0xme", "title": "Increase 25", "probability": 34.5},
         {"conditionId": "0xa", "title": "Decrease 25", "probability": 1.05},
@@ -959,6 +1275,16 @@ def test_negrisk_group_sum_counts_each_leg_exactly_once(monkeypatch):
 
 
 def test_worthless_redeemable_positions_are_not_called_cash(monkeypatch, fresh_db):
+    """Found against a real wallet: 105 expired losing positions all came back
+    `redeemable: true` with a 0c mark, and the panel told the user they were
+    "ready to redeem — claim them to turn them back into cash". They are worth
+    exactly $0.00. Polymarket flags losing tokens redeemable too, so the
+    wording has to come off the VALUE, not off the flag.
+
+    Wording was not enough: the same flag also lit a per-row REDEEMABLE badge
+    on all 105, which is a claim that there is money to claim. The count and
+    the badge are now gated on the value as well, and worthless resolved dust
+    is reported separately as exactly what it is."""
     import terminal_trade as tt
 
     async def _positions(*a, **kw):
@@ -1010,7 +1336,9 @@ def test_valuable_redeemable_positions_report_what_they_are_worth(monkeypatch, f
     assert "30.00" in r["redeemableNote"]
 
 
+
 def _standing_failing(monkeypatch, ok, placed):
+    monkeypatch.setattr(tt, "_paper_mode_on", lambda: False)
     entries = [{
         "id": "st_1", "conditionId": "0xabc", "title": "T", "side": "yes",
         "kind": "stopLoss", "triggerCents": 40.0, "size": 100,
@@ -1040,6 +1368,9 @@ def _standing_failing(monkeypatch, ok, placed):
 
 
 def test_a_refused_stop_stays_armed_and_retries(monkeypatch):
+    """The order bounced, the position is still open — retiring the stop that
+    protects it is the worst outcome available. It used to do exactly that:
+    `armed = False` ran regardless of whether the sell succeeded."""
     placed = []
     entries = _standing_failing(monkeypatch, ok=False, placed=placed)
     _run(tt.standing_tick(allow_trading=True))
@@ -1050,6 +1381,8 @@ def test_a_refused_stop_stays_armed_and_retries(monkeypatch):
 
 
 def test_a_refused_stop_gives_up_after_a_bounded_number_of_tries(monkeypatch):
+    """Bounded, or a deterministic refusal re-sends an order every tick until
+    the heat death of the universe."""
     placed = []
     entries = _standing_failing(monkeypatch, ok=False, placed=placed)
     for _ in range(tt.MAX_STANDING_FAILURES):
@@ -1072,6 +1405,8 @@ def test_a_successful_stop_retires_normally(monkeypatch):
 
 
 def test_a_refused_stop_is_reported_as_blocked(monkeypatch):
+    """It has to reach the user — desktop notification and phone push both key
+    off `blocked`."""
     placed = []
     _standing_failing(monkeypatch, ok=False, placed=placed)
     r = _run(tt.standing_tick(allow_trading=True))
@@ -1079,6 +1414,9 @@ def test_a_refused_stop_is_reported_as_blocked(monkeypatch):
 
 
 def test_a_sub_minimum_sell_warns_but_is_not_blocked(monkeypatch):
+    """Asymmetric on purpose: a buy can be made bigger, a sell cannot. Blocking
+    it would guarantee the user stays stuck in the position. But they have to
+    be told, because a stop loss on a sub-minimum holding is not a stop."""
     async def _market(cid, include_raw=False):
         m = {"conditionId": cid, "title": "x", "category": "crypto",
              "status": "open", "spread": 1.0, "liquidityUsd": 1e6,
@@ -1110,6 +1448,10 @@ def test_a_sub_minimum_sell_warns_but_is_not_blocked(monkeypatch):
 
 
 def test_a_sell_refreshes_the_conditional_allowance(monkeypatch):
+    """Collateral covers buys. A sell is validated against the CONDITIONAL
+    allowance for the token being sold, and nothing refreshed that — so the
+    exact stale-cache rejection the collateral refresh exists to prevent could
+    still bounce an EXIT."""
     import polymarket_api as api
     calls = []
 
@@ -1167,8 +1509,10 @@ def test_a_buy_does_not_refresh_the_conditional_allowance(monkeypatch):
     assert calls == [], "a buy refreshed the conditional allowance needlessly"
 
 
+
 def _portfolio_with(monkeypatch, fresh_db, *, resolved, side="yes",
                     size=100.0, buy_cents=40.0):
+    """One position with a real cost basis, settled or open."""
     import terminal_trade as tt
     _seed_fills([{"action": "buy", "size": size, "price": buy_cents,
                   "side": side}])
@@ -1194,6 +1538,10 @@ def _portfolio_with(monkeypatch, fresh_db, *, resolved, side="yes",
 
 
 def test_a_settled_loser_is_realised_not_unrealised(monkeypatch, fresh_db):
+    """The bug on a real wallet: 105 resolved losers sat under UNREALISED at
+    -$229 forever — positions that could never move again — while REALISED
+    showed -$17 because the fill ledger only counts SELLS. A resolved market
+    pays a redemption, not a fill, so settlement was invisible to it."""
     r = _portfolio_with(monkeypatch, fresh_db, resolved="no")
     p = r["positions"][0]
     assert p["settled"] is True
@@ -1224,6 +1572,8 @@ def test_an_open_position_is_unrealised_not_realised(monkeypatch, fresh_db):
 
 
 def test_settlement_and_earlier_sells_are_both_counted_once(monkeypatch, fresh_db):
+    """Half sold at 60c, the rest settles at 100c. Both halves must appear in
+    realised, and neither twice."""
     import terminal_trade as tt
     _seed_fills([
         {"action": "buy", "size": 100, "price": 40.0},
@@ -1253,6 +1603,7 @@ def test_settlement_and_earlier_sells_are_both_counted_once(monkeypatch, fresh_d
 
 
 def test_a_settled_position_with_no_basis_reports_no_pnl(monkeypatch, fresh_db):
+    """Knowing the outcome is not knowing the P&L."""
     import terminal_trade as tt
 
     async def _positions(*a, **kw):
@@ -1278,9 +1629,20 @@ def test_a_settled_position_with_no_basis_reports_no_pnl(monkeypatch, fresh_db):
     assert r["settledPnlUsd"] is None
 
 
+
 def _flat(monkeypatch, positions, *, bid=40.0, min_size=None, blockers=(),
           place_ok=True, paper=False, tracked=frozenset(), book_available=True,
           resolved=None, books=None):
+    """Wire flatten_wallet up to stubs and hand back the list of sent orders.
+
+    `resolved` maps conditionId -> 'yes' | 'no' for markets that have SETTLED.
+    Anything absent is still open, which is the default for every test here —
+    a settled position is not sellable and never reaches the book.
+
+    `books` collects every conditionId the book was actually read for, so a
+    test can prove the settled ones were dropped BEFORE the read rather than
+    refused after it.
+    """
     placed: list[dict] = []
     resolved = dict(resolved or {})
 
@@ -1339,6 +1701,9 @@ def _held(cid, size=100.0):
 
 
 def test_flatten_sells_every_position_as_a_marketable_fak_at_the_bid(monkeypatch):
+    """A limit above the bid RESTS, and a resting exit is not an exit. Every
+    order this sends must be a fill-and-kill sell at the price somebody is
+    actually bidding."""
     placed = _flat(monkeypatch, [_held("0xa"), _held("0xb", -50.0)], bid=37.0)
     r = _run(tt.flatten_wallet(allow_trading=True))
 
@@ -1355,6 +1720,8 @@ def test_flatten_sells_every_position_as_a_marketable_fak_at_the_bid(monkeypatch
 
 
 def test_flatten_refuses_once_in_paper_mode_not_once_per_position(monkeypatch):
+    """place() refuses each of these anyway — the point is the MESSAGE. Twenty
+    identical "paper mode is on" lines is a worse answer than one."""
     placed = _flat(monkeypatch, [_held(f"0x{i}") for i in range(5)], paper=True)
     r = _run(tt.flatten_wallet(allow_trading=True))
 
@@ -1366,6 +1733,8 @@ def test_flatten_refuses_once_in_paper_mode_not_once_per_position(monkeypatch):
 
 
 def test_flatten_holds_fire_when_the_wallet_cannot_be_read(monkeypatch):
+    """An unreadable wallet is not an empty one. Selling against a position
+    list we could not fetch is worse than waiting a tick."""
     placed = _flat(monkeypatch, [])
 
     async def _boom(*_a, **_kw):
@@ -1381,6 +1750,8 @@ def test_flatten_holds_fire_when_the_wallet_cannot_be_read(monkeypatch):
 
 
 def test_flatten_reads_positions_strictly(monkeypatch):
+    """`strict=True` is what makes the read RAISE instead of coming back empty.
+    Without it the test above cannot fail."""
     seen = {}
 
     async def _positions(*a, **kw):
@@ -1401,6 +1772,8 @@ def test_flatten_is_held_to_the_live_trading_switch(monkeypatch):
 
 
 def test_flatten_carries_on_past_one_refusal(monkeypatch):
+    """A stuck position is the most likely thing here. Abandoning the other
+    nineteen because of it is the opposite of de-risking."""
     placed = _flat(
         monkeypatch, [_held("0xa"), _held("0xb"), _held("0xc")],
         place_ok=lambda req: req["conditionId"] != "0xb")
@@ -1416,6 +1789,8 @@ def test_flatten_carries_on_past_one_refusal(monkeypatch):
 
 
 def test_flatten_refuses_a_sub_minimum_sell_instead_of_sending_it(monkeypatch):
+    """The venue would bounce it a second later. Refusing here means the
+    reason reaches the user instead of an error row."""
     placed = _flat(monkeypatch, [_held("0xa", 3.0), _held("0xb", 40.0)],
                    min_size=5.0)
     r = _run(tt.flatten_wallet(allow_trading=True))
@@ -1452,6 +1827,9 @@ def test_flatten_surfaces_a_blocker_from_the_preview(monkeypatch):
 
 
 def test_flatten_says_how_many_sold_positions_an_engine_was_tracking(monkeypatch):
+    """Selling one of these from here is fine — the engine's wallet reconcile
+    books an externally-closed position as sold — but the user has to be told
+    that this button reached past their own trades."""
     _flat(monkeypatch, [_held("0xa"), _held("0xb")], tracked={"0xb"})
     r = _run(tt.flatten_wallet(allow_trading=True))
     assert r["engineTrackedSold"] == 1
@@ -1459,6 +1837,7 @@ def test_flatten_says_how_many_sold_positions_an_engine_was_tracking(monkeypatch
 
 
 def test_flatten_reports_an_unreadable_engine_table_as_unknown(monkeypatch):
+    """Never zero. A count we could not read is not a count of none."""
     _flat(monkeypatch, [_held("0xa")], tracked=None)
     r = _run(tt.flatten_wallet(allow_trading=True))
     assert r["engineTrackedSold"] is None
@@ -1483,6 +1862,8 @@ def test_flatten_says_so_when_there_is_nothing_to_sell(monkeypatch):
 
 def test_flatten_leaves_proceeds_unknown_when_a_sell_could_not_be_priced(
         monkeypatch):
+    """A total that silently drops the leg it could not price is a confident
+    lie about how much came back."""
     _flat(monkeypatch, [_held("0xa"), _held("0xb")])
     real_preview = tt.preview
 
@@ -1501,6 +1882,8 @@ def test_flatten_leaves_proceeds_unknown_when_a_sell_could_not_be_priced(
 
 def test_flatten_reports_a_killed_remainder_rather_than_just_order_sent(
         monkeypatch):
+    """An FAK that crosses half the size leaves half the position OPEN, and a
+    result that only says "order sent" hides that."""
     _flat(monkeypatch, [_held("0xa")])
     real_preview = tt.preview
 
@@ -1515,6 +1898,7 @@ def test_flatten_reports_a_killed_remainder_rather_than_just_order_sent(
     r = _run(tt.flatten_wallet(allow_trading=True))
     assert r["sold"] == 1
     assert "killed, not rested" in r["results"][0]["message"]
+
 
 
 def test_flatten_preview_prices_without_sending_anything(monkeypatch):
@@ -1548,6 +1932,7 @@ def test_flatten_preview_names_what_cannot_be_sold(monkeypatch):
     assert len(blocked) == 1 and blocked[0]["conditionId"] == "0xa"
     assert blocked[0]["proceedsUsd"] is None
     assert r["proceedsUsd"] == 24.0
+
 
 
 def test_flatten_preview_drops_settled_positions_before_reading_a_book(monkeypatch):
@@ -1604,6 +1989,9 @@ def test_flatten_of_an_all_settled_wallet_sells_nothing_and_signs_nothing(monkey
 
 
 def test_an_unreadable_resolution_leaves_the_position_open(monkeypatch):
+    """Unknown is not settled. If Gamma will not answer we still try to sell —
+    the book read then refuses it honestly, one row at a time, instead of the
+    position being silently written off as "resolved, nothing to do"."""
     async def _boom(_ids):
         raise RuntimeError("gamma is down")
     reads: list[str] = []
@@ -1616,6 +2004,8 @@ def test_an_unreadable_resolution_leaves_the_position_open(monkeypatch):
 
 
 def test_the_unreadable_book_refusal_has_one_full_stop(monkeypatch):
+    """`terminal.book`'s note is a finished sentence. Appending our own gave
+    "…This is a failed read, not an empty book.. Nothing was sold here…"."""
     _flat(monkeypatch, [_held("0xa")])
 
     async def _book(_cid, _side="yes"):

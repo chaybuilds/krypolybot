@@ -1,6 +1,22 @@
+"""Whale detection off the RTDS activity tape (the ~120s → ~1s accelerator).
+
+`scanner.scan_whales` polls the Data API every `whale_scan_interval` (120s), so
+a whale that hit the wire a second ago could be two minutes old before the app
+saw it. The same trades stream on the `activity` websocket ~1s after execution.
+
+The websocket is a STRICT ACCELERATOR, and these pin exactly that contract:
+  • a socket whale produces the SAME row + the SAME `signal:batch` the REST
+    poll would have produced,
+  • the synthesised `trade_id` matches field-for-field across the two sources,
+    so whichever arrives second inserts nothing (no double rows, no double
+    signals) — REST stays the authority and the backstop,
+  • sub-threshold and malformed frames do nothing and raise nothing,
+  • the socket now runs for whale collection alone, not only for copy trading.
+"""
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -23,6 +39,8 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _raw_trade(*, size=10_000.0, price=0.70, tx="0xdeadbeef", asset="tok-1"):
+    """One raw Polymarket trade record — the shape BOTH the Data-API /trades
+    rows and the RTDS activity frames carry."""
     return {
         "proxyWallet": "0x00000000000000000000000000000000000000aa",
         "side": "BUY",
@@ -42,6 +60,8 @@ def _raw_trade(*, size=10_000.0, price=0.70, tx="0xdeadbeef", asset="tok-1"):
 
 @pytest.fixture
 def wired(monkeypatch, fresh_db):
+    """Service wired the way the loop wires it: cfg collecting whales, the
+    trade hook registered on activity_ws, emit_event captured, no network."""
     events: list[tuple[str, object]] = []
 
     async def _emit(name, data=None):
@@ -67,6 +87,8 @@ def wired(monkeypatch, fresh_db):
 
 
 async def _feed_socket(frame) -> None:
+    """Push one decoded websocket message through and let the detached whale
+    task (a Gamma lookup can't sit on the socket's read loop) finish."""
     activity_ws.handle_message({"topic": "activity", "type": "trades",
                                 "payload": frame})
     for _ in range(3):
@@ -83,6 +105,7 @@ def _whale_rows():
         ).fetchall()]
 
 
+
 def test_socket_and_rest_derive_the_same_trade_id():
     raw = _raw_trade()
     from_socket = api.normalize_activity_trade(raw)
@@ -92,8 +115,12 @@ def test_socket_and_rest_derive_the_same_trade_id():
 
 
 def test_a_frame_without_the_id_bearing_fields_is_dropped():
+    """`trade_id` is synthesised from (tx, asset, price, size). Without both
+    ids the socket would mint an id the REST poll never reproduces — i.e. the
+    same whale twice. Drop it; the 120s poll still has it."""
     assert api.normalize_activity_trade(_raw_trade(tx="")) is None
     assert api.normalize_activity_trade(_raw_trade(asset="")) is None
+
 
 
 def test_a_socket_whale_inserts_one_row_and_emits_one_batch(wired):
@@ -144,12 +171,23 @@ def test_a_garbled_frame_is_ignored_and_never_raises(wired, frame):
     assert [n for (n, _) in events if n == "signal:batch"] == []
 
 
+
+def _as_v2_body(rows):
+    """The REST poll's view of the same trades: Data API v2's envelope and
+    snake_case (asset is `token_id` there), i.e. what /v2/trades serves."""
+    def snake(k):
+        return "token_id" if k == "asset" else re.sub(r"([A-Z])", lambda m: "_" + m.group(1).lower(), k)
+    return {"data": [{snake(k): v for k, v in r.items()} for r in rows],
+            "pagination": {"has_more": False, "next_cursor": None}}
+
+
 def test_socket_then_rest_yields_exactly_one_row(wired, monkeypatch):
     events = wired
     raw = _raw_trade()
 
     async def _get(_url, params=None, **_kw):
-        return [raw]
+        assert "/v2/trades" in _url
+        return _as_v2_body([raw])
     monkeypatch.setattr(api, "_get", _get)
 
     async def _run():
@@ -167,7 +205,8 @@ def test_rest_then_socket_yields_exactly_one_row(wired, monkeypatch):
     raw = _raw_trade()
 
     async def _get(_url, params=None, **_kw):
-        return [raw]
+        assert "/v2/trades" in _url
+        return _as_v2_body([raw])
     monkeypatch.setattr(api, "_get", _get)
 
     async def _run():
@@ -190,6 +229,7 @@ def test_a_repeated_frame_inserts_once(wired):
     assert len(_whale_rows()) == 1
 
 
+
 def test_the_socket_whale_path_respects_the_collection_gate(wired):
     events = wired
     service.STATE.cfg.update({"main_record_signals": False,
@@ -207,7 +247,9 @@ def test_whale_activity_ws_off_disables_the_push_but_not_the_poll(wired):
     assert [n for (n, _) in events if n == "signal:batch"] == []
 
 
+
 class _FakeSocket:
+    """Stands in for the activity_ws module inside the service loop."""
 
     def __init__(self):
         self.started = 0
@@ -241,6 +283,12 @@ class _FakeSocket:
 
 
 def _drive_copy_block(monkeypatch, cfg, *, copy_loop=False) -> _FakeSocket:
+    """Run one loop iteration and report what it did to the trade tape.
+
+    The trade tape's LIFECYCLE (start/stop/watch/hook) is reconciled by the
+    master loop, because two engines share the one socket. The copy ENGINE now
+    ticks on its own task (`_copy_loop`), so a test that needs the drain /
+    run_tick pair has to drive that loop too - pass copy_loop=True."""
     import contextlib
 
     sock = _FakeSocket()
@@ -255,6 +303,7 @@ def _drive_copy_block(monkeypatch, cfg, *, copy_loop=False) -> _FakeSocket:
     monkeypatch.setattr(service, "activity_ws", sock)
     monkeypatch.setattr(service.scanner, "sync_markets", _noop)
     monkeypatch.setattr(service.scanner, "sync_events", _noop)
+    monkeypatch.setattr(service.crypto15m_record, "record_tick", _noop)
 
     async def _no_whales(_cfg):
         return 0, []
@@ -316,7 +365,11 @@ def test_the_socket_stays_down_when_neither_consumer_wants_it(monkeypatch):
     assert sock.started == 0
 
 
+
 def test_the_frame_is_pushed_to_copy_trading_raw(wired, monkeypatch):
+    """copy_trader.on_activity_trade reads the tape's OWN field names
+    (proxyWallet / conditionId / outcomeIndex), so it must get the raw frame,
+    not the scanner-shaped one."""
     seen: list[dict] = []
     monkeypatch.setattr(service.copy_trader, "on_activity_trade", seen.append)
 
@@ -327,6 +380,8 @@ def test_the_frame_is_pushed_to_copy_trading_raw(wired, monkeypatch):
 
 
 def test_a_garbled_frame_still_reaches_copy_without_raising(wired, monkeypatch):
+    """Copy does its own validation; the whale side dropping a frame must not
+    silently starve it (and a raising hook must not kill the socket)."""
     def _boom(_t):
         raise RuntimeError("copy hook exploded")
     monkeypatch.setattr(service.copy_trader, "on_activity_trade", _boom)
@@ -336,6 +391,8 @@ def test_a_garbled_frame_still_reaches_copy_without_raising(wired, monkeypatch):
 
 
 def test_pushed_entries_are_drained_before_the_copy_tick(monkeypatch):
+    """The drain has to run BEFORE run_tick's Data-API read — that ordering is
+    the latency win."""
     order: list[str] = []
 
     async def _drain(_cfg, authed=True):
@@ -360,7 +417,9 @@ def test_pushed_entries_are_drained_before_the_copy_tick(monkeypatch):
     assert order[:2] == ["drain", "run_tick"], order
 
 
+
 def test_watched_wallet_hits_still_land_for_copy(wired):
+    """The whale hook rides along; copy's wakeup queue must be unchanged."""
     raw = _raw_trade()
     activity_ws.set_watch([raw["proxyWallet"]])
     try:

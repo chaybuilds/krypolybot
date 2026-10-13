@@ -1,9 +1,25 @@
+"""Scripts must not depend on the other engines being switched on.
+
+Every case here was a real trap: the Scripts page said a script was ENABLED
+while something owned by a DIFFERENT page silently stopped it from ever
+trading, and nothing in the UI connected the two.
+
+  • crypto15m_assets — the 15m Crypto tab's per-coin checkboxes. Applying the
+    5m preset there pins ['BTC'], which used to narrow every script in the
+    app, live AND in backtest.
+  • main_record_signals / enable_trading — the main engine's collection gate.
+    With both off, scan_whales/scan_momentum never ran, so decide_signal read
+    an empty table forever.
+  • scripts_live_enabled — gated the whole engine, so enabling a shadow
+    script did visibly nothing until the user found a second switch.
+"""
 from __future__ import annotations
 
 import pytest
 
 import script_backtest
 import script_engine
+
 
 
 def test_no_scope_means_every_coin():
@@ -34,6 +50,11 @@ def test_asset_scope_parsing(raw, expect):
 
 
 def test_scope_ignores_the_crypto_engines_asset_setting():
+    """The whole point: a script's universe is its own property.
+
+    crypto15m.asset_enabled(cfg, ...) reads cfg['crypto15m_assets']; the
+    script path must not consult it, so a BTC-only crypto engine still leaves
+    an unscoped script seeing every coin."""
     import crypto15m
     cfg = {"crypto15m_assets": ["BTC"]}
     assert not crypto15m.asset_enabled(cfg, "SOL")
@@ -41,10 +62,14 @@ def test_scope_ignores_the_crypto_engines_asset_setting():
 
 
 def test_neither_engine_module_reads_crypto15m_assets_for_scripts():
+    """A regression guard with teeth: if someone reintroduces the coupling,
+    this fails even though the behavior tests above might not cover the new
+    call site."""
     import inspect
     for mod in (script_engine, script_backtest):
         src = inspect.getsource(mod)
         assert "crypto15m.asset_enabled(" not in src, mod.__name__
+
 
 
 def test_signal_feed_is_not_requested_when_no_script_wants_it(monkeypatch):
@@ -71,6 +96,8 @@ def test_a_decide_only_script_does_not_hold_the_signal_feed_up(monkeypatch):
 
 
 def test_a_stale_hook_census_stops_asserting_itself(monkeypatch):
+    """If the script engine stops ticking, it must stop keeping the collector
+    alive — otherwise a disabled script pins main-engine work forever."""
     import time
     monkeypatch.setattr(script_engine, "_enabled_hooks", {"decide_signal"},
                         raising=False)
@@ -81,23 +108,31 @@ def test_a_stale_hook_census_stops_asserting_itself(monkeypatch):
 
 
 def test_the_service_loop_actually_consults_it():
+    """The gate is only useful if the collector reads it."""
     import inspect
     import service
     src = inspect.getsource(service)
     assert "script_engine.needs_signal_feed()" in src
 
 
+
 def test_the_service_loop_no_longer_gates_the_tick_on_the_master_switch():
+    """Shadow scripts must tick as soon as they're enabled. Gating the whole
+    engine on scripts_live_enabled meant enabling a script did nothing
+    visible until the user found a second switch on the same page."""
     import inspect
     import re
     import service
     src = inspect.getsource(service)
     tick = src[src.index('async with _block("scripts"):'):]
+    tick = tick[:tick.index('async with _block("activityWs"):')]
     guard = tick[tick.index("if ("):tick.index("await script_engine.run_tick")]
     assert "scripts_live_enabled" not in guard, guard
 
 
 def test_run_tick_parks_an_armed_script_when_the_master_switch_is_off():
+    """It must be PARKED, not quietly diverted into the shadow ledger — that
+    would corrupt the very track record the ledger exists to build."""
     import inspect
     src = inspect.getsource(script_engine.run_tick)
     assert 'if not live_ok:' in src

@@ -1,3 +1,16 @@
+"""Indicator candles must exclude the in-progress minute.
+
+Hyperliquid's candleSnapshot runs to `now`, so its last row is the CURRENT
+minute, still forming — its "close" is the price a few seconds in. Including
+it made every momentum field measure the elapsed fraction of a minute rather
+than a whole one.
+
+Observed 2026-07-25: at 23:24:02 UTC velocity1mPct computed +0.0000 while the
+completed minute was -0.0062. Across a day of live ticks |velocity1mPct| was
+~3x smaller than the same statistic on completed candles (median 0.0075 vs
+0.0241), so a 0.1% threshold fired on 0.15% of ticks instead of ~6.9% — and
+LIVE rows were not comparable with backfilled historical ones.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -29,8 +42,9 @@ class _FakeClient:
 
 
 def _candles(closes, *, last_in_progress: bool):
+    """Minute candles ending now; optionally the last one still forming."""
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    minute = (now_ms // 60_000) * 60_000
+    minute = now_ms - 1_000
     rows = []
     n = len(closes)
     for i, c in enumerate(closes):
@@ -60,6 +74,7 @@ def test_completed_candles_are_all_kept():
 
 
 def test_velocity_reflects_a_FULL_minute_not_a_partial_one():
+    """The reported failure, end to end."""
     rows = _candles([64385.0, 64381.0, 64381.0], last_in_progress=True)
     vals = _closes(rows)
     v = indicators.pct_change(vals, 1)
@@ -70,6 +85,8 @@ def test_velocity_reflects_a_FULL_minute_not_a_partial_one():
 
 
 def test_rows_without_a_close_time_are_not_discarded():
+    """Fail OPEN on an unexpected payload shape — a missing `T` must not
+    silently empty the series and blank every indicator."""
     rows = [{"t": 0, "c": "100", "v": "1"}, {"t": 60_000, "c": "101", "v": "1"}]
     assert _closes(rows) == [100.0, 101.0]
 

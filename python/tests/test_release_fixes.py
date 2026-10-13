@@ -1,3 +1,9 @@
+"""Money-path fixes from the 2026-09-01 release audit, pinned.
+
+Each test here is a bug that shipped past 1,040 green tests — in one case
+BECAUSE of a test that stubbed a value production never emits. They are kept
+together so the next audit can see at a glance which regressions are guarded.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +24,11 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
+
 def test_place_refuses_a_real_order_while_paper_mode_is_on(monkeypatch):
+    """The standing tick and the chat bots call place() directly. The paper
+    check used to live only in the RPC handler, so a stop loss armed before
+    switching to paper signed a REAL sell when it triggered."""
     monkeypatch.setattr(tt, "_paper_mode_on", lambda: True)
 
     async def _preview(req):
@@ -47,6 +57,7 @@ def test_paper_mode_is_read_from_the_live_config(monkeypatch):
 
 
 def _standing(monkeypatch, *, positions, prob=30.0, placed=None):
+    """One armed stop at 40c on a market currently at `prob`."""
     entries = [{
         "id": "st_1", "conditionId": "0xabc", "title": "T", "side": "yes",
         "kind": "stopLoss", "triggerCents": 40.0, "size": 100,
@@ -89,6 +100,7 @@ def test_a_standing_stop_does_not_fire_in_paper_mode(monkeypatch):
 
 
 def test_the_standing_tick_reads_the_paper_switch_itself(monkeypatch):
+    """A caller that forgets to pass `paper=` must still be covered."""
     placed = []
     held = [{"ticker": "0xabc", "position_fp": 100.0}]
     _standing(monkeypatch, positions=held, placed=placed)
@@ -98,6 +110,7 @@ def test_the_standing_tick_reads_the_paper_switch_itself(monkeypatch):
 
 
 def test_a_standing_stop_still_fires_live(monkeypatch):
+    """Sanity: the same set-up with paper OFF does sell."""
     placed = []
     held = [{"ticker": "0xabc", "position_fp": 100.0}]
     _standing(monkeypatch, positions=held, placed=placed)
@@ -106,12 +119,56 @@ def test_a_standing_stop_still_fires_live(monkeypatch):
     assert len(placed) == 1 and placed[0]["action"] == "sell"
 
 
-def test_exit_was_sell_matches_what_exit_proceeds_actually_returns():
-    assert trader._exit_was_sell({"kind": "sold"}) is True
-    assert trader._exit_was_sell({"kind": "SELL"}) is True
-    assert trader._exit_was_sell({"kind": "redeemed"}) is False
-    assert trader._exit_was_sell({}) is False
-    assert trader._exit_was_sell(None) is False
+
+def _venue_sell():
+    """A real venue row's figures (btc-updown-15m, 2026-10): SELL 70 @ 0.97.
+    Gross is $67.90; usdcSize is $67.75741 because the venue WITHHELD the
+    taker fee, 0.07 * 0.97 * 0.03 * 70 = $0.14259."""
+    return {"conditionId": "0xabc", "type": "TRADE", "side": "SELL",
+            "outcomeIndex": 0, "size": 70, "price": 0.97, "usdcSize": 67.75741,
+            "timestamp": time.time()}
+
+
+def test_exit_proceeds_are_net_and_report_the_withheld_fee():
+    pos = {"ticker": "0xabc", "direction": "yes", "created_at": "2026-09-01 00:00:00"}
+    info = trader._exit_proceeds(pos, [_venue_sell()])
+    assert info["kind"] == "sold"
+    assert info["proceeds"] == pytest.approx(67.75741)
+    assert info["sell_gross"] == pytest.approx(67.90)
+    assert info["sell_fee"] == pytest.approx(0.14259)
+
+
+def test_a_manual_exit_on_polymarket_is_charged_its_exit_fee_once(tmp_path, monkeypatch):
+    """The 2026-09-01 fix that made "sold" count as a sell switched on a
+    `_sell_fee_usd` charge on top of /activity's usdcSize, which is already
+    net of that fee: every manual exit was booked one taker fee short, and the
+    loss breakers ran on the understated figure."""
+    monkeypatch.setattr(db, "db_path", lambda: tmp_path / "exits.db")
+    db.init_db()
+    monkeypatch.setattr(trader, "get_env", lambda: "mainnet")
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, {
+            "signal_source": "main", "signal_id": 1, "ticker": "0xabc",
+            "direction": "yes", "category": "crypto",
+            "target_contracts": 70, "limit_price_cents": 60,
+            "filled_contracts": 70, "avg_fill_price_cents": 60.0, "cost_usd": 42.0,
+            "client_order_id": "main-1", "status": "filled", "network": "mainnet",
+        })
+
+    async def _positions():
+        return [{"ticker": "0xother", "position_fp": 5.0}]
+
+    async def _activity(limit=1000, **kw):
+        return [_venue_sell()]
+    monkeypatch.setattr(trader, "get_positions", _positions)
+    monkeypatch.setattr(trader, "get_activity", _activity)
+
+    closed = _run(trader.detect_external_exits({}))
+    assert [r["id"] for r in closed] == [pid]
+    entry_fee = 0.07 * 0.6 * 0.4 * 70
+    assert closed[0]["pnl_usd"] == pytest.approx(67.75741 - 42.0 - entry_fee, abs=1e-4)
+    assert closed[0]["fees_usd"] == pytest.approx(entry_fee + 0.14259, abs=1e-6)
+
 
 
 def test_get_positions_strict_raises_when_our_address_cannot_be_read(monkeypatch):
@@ -129,6 +186,9 @@ def test_get_positions_strict_raises_when_our_address_cannot_be_read(monkeypatch
 
 
 def test_the_standing_tick_holds_fire_when_the_wallet_address_is_missing(monkeypatch):
+    """With the old non-strict read, a missing address became an EMPTY
+    holdings map, and every armed stop retired itself with the false note
+    "you no longer hold this position"."""
     placed = []
     entries = _standing(monkeypatch, positions=[], placed=placed)
 
@@ -142,6 +202,7 @@ def test_the_standing_tick_holds_fire_when_the_wallet_address_is_missing(monkeyp
     assert placed == []
     assert entries[0]["armed"] is True, "the stop was retired on an unreadable wallet"
     assert "could not be read" in entries[0]["note"]
+
 
 
 @pytest.fixture
@@ -173,6 +234,10 @@ def _c15_wire(monkeypatch):
 
 
 def test_the_stop_loss_is_exempt_from_the_shared_exit_cooldown(c15_fresh, monkeypatch):
+    """A failed take-profit stamped a per-position cooldown that
+    _place_exit_sell honoured for EVERY reason, so the stop-loss 20 s later
+    submitted nothing — and _manage_position had already consumed the stop's
+    own 90 s throttle. The position sat unguarded for the whole window."""
     calls = _c15_wire(monkeypatch)
     c15._exit_fail_at[1] = time.time()
 
@@ -182,6 +247,7 @@ def test_the_stop_loss_is_exempt_from_the_shared_exit_cooldown(c15_fresh, monkey
     _run(c15._place_exit_sell(_c15_pos(), {}, exit_cents=45, reason="stop_loss"))
     assert len(calls) == 1 and calls[0]["action"] == "sell", \
         "the stop-loss was swallowed by the take-profit's cooldown"
+
 
 
 def test_paired_fee_is_the_fee_v2_curve_on_both_legs():
@@ -198,6 +264,9 @@ def _paired_asset(up_ask: float, down_ask: float) -> dict:
 
 
 def test_a_refused_pair_names_the_taker_fees_it_would_have_paid(monkeypatch):
+    """The cap is on price by design (a tilted bet plus a hedge), but the
+    hedged portion pays both legs' taker fees win or lose. A refusal must say
+    so rather than let the log imply the hedge is free."""
     cfg = {"crypto15m_enabled": True, "crypto15m_paired_mode": True,
            "crypto15m_direction_mode": "paired",
            "crypto15m_paired_max_combined_cents": 100.0,
@@ -207,8 +276,8 @@ def test_a_refused_pair_names_the_taker_fees_it_would_have_paid(monkeypatch):
     assert not ok and "combined" in why and "taker fees" in why
 
 
-import terminal_paper as tp
-from test_terminal_paper import _mock_market, _order, paper_db
+import terminal_paper as tp  # noqa: E402
+from test_terminal_paper import _mock_market, _order, paper_db  # noqa: E402,F401
 
 
 def test_two_resting_sells_cannot_both_be_written_against_one_holding(paper_db, monkeypatch):
@@ -224,6 +293,9 @@ def test_two_resting_sells_cannot_both_be_written_against_one_holding(paper_db, 
 
 
 def test_a_sell_that_outran_the_holding_does_not_credit_phantom_cash(paper_db, monkeypatch):
+    """Legacy rows (or a race) can still leave two filled sells against one
+    holding. The ledger must credit the contracts that existed, not the size
+    on the row — the old code booked $1,014 of cash on a $1,004.50 account."""
     _mock_market(monkeypatch, asks=[(40.0, 100)])
     _run(tp.place(_order(priceCents=40, size=10, orderType="FAK")))
     for _ in range(2):
@@ -263,6 +335,9 @@ def test_the_fill_sweep_cancels_a_resting_sell_once_the_position_is_gone(paper_d
 
 
 def test_per_outcome_redeem_rows_book_a_settled_loss_at_zero():
+    """/activity splits redemptions per outcome since 2026-08-10. Our outcome's
+    REDEEM row paying $0 is a settled loss — not 'no evidence' (which left the
+    position open forever) — and the OTHER outcome's row is never ours."""
     import trader
     pos = {"ticker": "0xabc", "direction": "yes", "created_at": "2026-09-01 00:00:00"}
     later = 1_790_000_000

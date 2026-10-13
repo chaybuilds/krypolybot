@@ -137,7 +137,8 @@ export function TrackPage({ onNav }: { onNav: (p: 'market') => void }) {
           hint="open positions only"
         />
         <StatCard
-          label="Realised"
+          label={pf?.realizedPnlNetUsd == null && pf?.realizedPnlUsd != null
+            ? 'Realised, before fees' : 'Realised'}
           value={<Val
             v={pf?.realizedPnlNetUsd ?? pf?.realizedPnlUsd ?? null}
             fmt={signedUsd}
@@ -147,9 +148,11 @@ export function TrackPage({ onNav }: { onNav: (p: 'market') => void }) {
             pf?.realizedPnlNetUsd != null && pf?.realizedFeesUsd != null
               && pf?.realizedPnlUsd != null
               ? `${signedUsd(pf.realizedPnlUsd)} before ${usdExact(pf.realizedFeesUsd)} in fees`
-              : pf?.settledPnlUsd != null
-                ? `${signedUsd(pf.settledPnlUsd)} of it from settlement`
-                : 'sells and settlements'
+              : pf?.realizedPnlNetUsd == null && pf?.realizedPnlUsd != null
+                ? 'fees not deducted: some fills have an unknown fee'
+                : pf?.settledPnlUsd != null
+                  ? `${signedUsd(pf.settledPnlUsd)} of it from settlement`
+                  : 'sells and settlements'
           }
         />
       </div>
@@ -1063,10 +1066,12 @@ function OrderLog({
               <td className="py-2">
                 <span className={cls('rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider',
                   r.status === 'filled' ? 'border-krypt-win/40 text-krypt-win'
-                    : r.status === 'error' ? 'border-krypt-loss/40 text-krypt-loss'
+                    : r.status === 'error' || r.status === 'rejected' ? 'border-krypt-loss/40 text-krypt-loss'
                       : r.status === 'unmatched' ? 'border-krypt-warn/40 text-krypt-warn'
                         : 'border-krypt-border text-krypt-muted')}
-                  title={r.error ?? undefined}
+                  title={r.status === 'rejected'
+                    ? `Polymarket refused this order — nothing was placed and nothing filled.${r.error ? ` (${r.error})` : ''}`
+                    : r.error ?? undefined}
                 >
                   {r.status}
                 </span>

@@ -1,8 +1,14 @@
+"""Tests for the pure technical-indicator math (indicators.py).
+
+Deterministic, no network/DB — known-value checks for EMA/RSI plus
+structural + cross-detection checks for MACD on constructed series.
+"""
 from __future__ import annotations
 
 import math
 
 import indicators as ind
+
 
 
 def test_ema_seed_and_recursion():
@@ -12,6 +18,7 @@ def test_ema_seed_and_recursion():
 def test_ema_insufficient_history_empty():
     assert ind.ema_series([1, 2], 3) == []
     assert ind.ema_series([], 5) == []
+
 
 
 def test_rsi_all_gains_is_100():
@@ -34,6 +41,7 @@ def test_rsi_midrange_for_balanced_series():
 
 def test_rsi_insufficient_history_none():
     assert ind.rsi([1, 2, 3], period=14) is None
+
 
 
 def test_macd_insufficient_history_none():
@@ -60,6 +68,7 @@ def test_macd_cross_flag_fires_both_directions():
 def test_macd_cross_is_zero_in_steady_trend():
     m = ind.macd([float(x) for x in range(80)])
     assert m is not None and m["cross"] == 0
+
 
 
 _COMPUTE_KEYS = {

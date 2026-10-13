@@ -635,11 +635,15 @@ function AiPanel({
   onRun: () => void;
 }) {
   const provider = status?.provider ?? 'anthropic';
+  const caps = status?.capabilities?.[provider];
+  const label = caps?.label ?? provider;
+  const local = caps?.local ?? (provider === 'ollama' || provider === 'lmstudio');
   const keyed = status?.keys?.[provider]?.present ?? false;
+  const needsKey = status?.keys?.[provider]?.needsKey ?? !local;
   const blocked = !status ? 'Checking…'
-    : status.offline ? 'Offline mode is on, so nothing is sent to any provider.'
+    : status.offline && !local ? 'Offline mode is on, so nothing is sent to a cloud provider.'
       : !status.enabled ? 'AI analysis is off. Turn it on in Settings → AI analysis.'
-        : !keyed ? `No ${provider} API key is stored. Add one in Settings → AI analysis.`
+        : needsKey && !keyed ? `No ${label} API key is stored. Add one in Settings → AI analysis.`
           : null;
 
   return (
@@ -1012,7 +1016,7 @@ function Ticket({
 
           <div className="flex justify-between text-[11px]">
             <span className="text-krypt-dim">
-              {paper ? 'Paper cash' : 'Available (USDC)'}
+              {paper ? 'Paper cash, free' : 'Available (USDC)'}
             </span>
             <span className={cls('font-mono',
               availableUsd === null ? 'text-krypt-dim' : 'text-krypt-muted')}
@@ -1474,6 +1478,7 @@ function PositionRow({
       }
     })();
     return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, sizeNum, slip, position.conditionId, position.side]);
 
   const submit = useCallback(async () => {

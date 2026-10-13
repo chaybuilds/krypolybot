@@ -1,3 +1,53 @@
+"""Cross-venue: the same question, priced on Polymarket and on Kalshi.
+
+This is the one feature in the terminal that asserts something no provider
+told us: that these two markets are the same question. Nothing in either API
+says so — we are inferring it from words, numbers and dates. So the whole
+module is built around one idea:
+
+    A MATCH IS A CLAIM, AND A WRONG MATCH IS WORSE THAN NO PANEL.
+
+A mismatched pair produces a large, confident, entirely fictional "edge", and
+a fictional edge is exactly the kind of number somebody trades on. So:
+
+* every match carries a confidence and the reasons behind it,
+* the matched title is shown verbatim so the user can check it in one glance,
+* below the confidence bar the spread is **withheld** — the pair is shown,
+  labelled as unverified, with no number attached,
+* and even a strong match carries the caveats that survive it: two markets
+  can ask the same question and still settle on different sources or dates.
+
+WHERE THE RECALL WENT (measured 2026-09-02, 60 real markets, see
+tests/test_cross_venue_eval.py). The reported complaint was that the panel
+found nothing for most markets, and it was true: 3 of 31 real counterparts,
+a recall of 0.10 at perfect precision. The scoring was not the problem. The
+RETRIEVAL was — the right Kalshi market was usually never a candidate at all:
+
+* a Kalshi SERIES is titled "Professional Baseball Game" and a Polymarket
+  question is titled "New York Mets vs. Tampa Bay Rays"; they share no word,
+  so no amount of text similarity connects them,
+* "BTC" and "Bitcoin" likewise,
+* and the market sweep the matcher ran took the first 200 rows of a series,
+  which on a daily strike ladder is one date's worth of strikes — so the
+  right threshold on the right day was structurally unreachable.
+
+So this module now retrieves three ways (see _candidate_series) and compares
+STRUCTURALLY where both sides parse to (subject, date, threshold, direction),
+falling back to the original text scorer for everything else. Two things about
+the structured path are worth knowing before reading it:
+
+* the settlement DAY is read in US Eastern from the venues' own stamps — never
+  from the close time, which BOTH venues pad by days so a postponed fixture
+  can still settle,
+* and the comparable side is not always YES. Kalshi lists levels from either
+  direction, so "below $75,999.99" is the NO leg of "above $76,000". That
+  inversion is allowed, is applied to the quote and the chart alike, and is
+  stated on the response — an inverted spread nobody was told about is the
+  same fictional edge as a wrong pairing.
+
+Read-only. Nothing here can place an order on either venue.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -38,6 +88,7 @@ _UNIT_AFTER = re.compile(
 
 
 def _is_year(text: str, start: int, end: int, raw: str, v: float) -> bool:
+    """Whether the run of digits at [start:end] reads as a calendar year."""
     if len(raw) != 4 or not raw.isdigit():
         return False
     if not (_YEAR_MIN <= v <= _YEAR_MAX):
@@ -50,6 +101,13 @@ def _is_year(text: str, start: int, end: int, raw: str, v: float) -> bool:
 
 
 def _numbers(text: str) -> set[str]:
+    """Significant numbers, normalised.
+
+    This is the single most important discriminator for threshold markets:
+    "Bitcoin above $110,000" and "Bitcoin above $120,000" differ by nothing
+    else a token comparison can see. Commas are stripped and a trailing ".0"
+    normalised so 110,000 / 110000 / 110000.0 are one number.
+    """
     s = text or ""
     out: set[str] = set()
     for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", s):
@@ -75,19 +133,23 @@ def _close_ts(iso: Optional[str]) -> Optional[float]:
         return None
 
 
+
 def _nth_weekday_utc(year: int, month: int, nth: int) -> datetime:
+    """The nth Sunday of a month, at 00:00 UTC."""
     d = datetime(year, month, 1, tzinfo=timezone.utc)
     first_sunday = 1 + ((6 - d.weekday()) % 7)
     return datetime(year, month, first_sunday + 7 * (nth - 1), tzinfo=timezone.utc)
 
 
 def _et_offset_hours(dt: datetime) -> int:
+    """-4 during Eastern Daylight Time, -5 otherwise."""
     start = _nth_weekday_utc(dt.year, 3, 2).replace(hour=7)
     end = _nth_weekday_utc(dt.year, 11, 1).replace(hour=6)
     return -4 if start <= dt < end else -5
 
 
 def et_date(iso: Optional[str]) -> Optional[str]:
+    """An ISO instant → the calendar date it falls on in US Eastern."""
     ts = _close_ts(iso)
     if ts is None:
         return None
@@ -109,6 +171,12 @@ _TEXT_DATE = re.compile(
 
 
 def kalshi_ticker_date(ticker: str) -> Optional[str]:
+    """The ET date Kalshi stamped into an event ticker, or None.
+
+    Preferred over every timestamp on the row: `close_time` is padded by days
+    on both venues so a postponed fixture can still settle, and comparing two
+    padded dates is what made same-day pairs look a week apart.
+    """
     m = _KX_TICKER_DATE.search(str(ticker or "").upper())
     if not m:
         return None
@@ -122,6 +190,13 @@ def kalshi_ticker_date(ticker: str) -> Optional[str]:
 
 
 def kalshi_ticker_month(ticker: str) -> Optional[str]:
+    """The month Kalshi stamped into a monthly event ticker → "YYYY-MM".
+
+    Preferred over the close time for the same reason the day is: the close
+    time is padded, and on a Fed market it is the only date the Polymarket
+    side has. Reading Kalshi's own stamp means a monthly pairing does not
+    depend on either venue's deadline at all.
+    """
     up = str(ticker or "").upper()
     m = _KX_TICKER_MONTH.search(up)
     if not m:
@@ -133,6 +208,7 @@ def kalshi_ticker_month(ticker: str) -> Optional[str]:
 
 
 def text_date(text: str, *, year_hint: Optional[str] = None) -> Optional[str]:
+    """A date written out in a question title → "YYYY-MM-DD", or None."""
     m = _TEXT_DATE.search(text or "")
     if not m:
         return None
@@ -230,6 +306,7 @@ _SLUG_LINE = re.compile(r"(\d+)pt(\d+)")
 
 
 def expand_tokens(tokens: set[str]) -> set[str]:
+    """Question tokens plus every alias they translate to."""
     out = set(tokens)
     for t in tokens:
         out |= _ALIASES.get(t, set())
@@ -275,6 +352,12 @@ def _scaled(digits: str, suffix: Optional[str]) -> Optional[float]:
 
 
 def parse_threshold(text: str) -> Optional[tuple]:
+    """A written question → ("above"|"below"|"between", value[, value]).
+
+    Returns None when the text states no threshold, which is the honest answer
+    for "Will X win the election?" and means the structural path simply does
+    not apply.
+    """
     s = text or ""
     m = _RE_BETWEEN.search(s) or _RE_BAND.search(s)
     if m:
@@ -294,11 +377,26 @@ def parse_threshold(text: str) -> Optional[tuple]:
 
 
 def _same_value(a: float, b: float) -> bool:
+    """Two thresholds naming the same level.
+
+    Kalshi writes a "greater than" strike one tick below the number it prints
+    (floor_strike 75999.99 under the label "$76,000 or above"), so a whole-cent
+    gap is the same level written two ways. Anything wider is a DIFFERENT
+    threshold — the single most important discriminator in this module — and
+    the tolerance stays far below the smallest real strike spacing on either
+    venue.
+    """
     return abs(a - b) <= 0.011 or abs(a - b) <= abs(a) * 1e-9
 
 
 def compare_thresholds(pm_t: Optional[tuple],
                        kx_t: Optional[tuple]) -> Optional[str]:
+    """→ "same" | "complement" | None (contradicts, or not comparable).
+
+    "complement" is the case that matters: a Kalshi "below X" is the NO leg of
+    a Polymarket "above X". It is a real match, but only if the module says so
+    out loud and inverts the price it compares — see structural_match.
+    """
     if not pm_t or not kx_t:
         return None
     if pm_t[0] == "between" or kx_t[0] == "between":
@@ -315,6 +413,7 @@ _FED_LEGS = ("H0", "H25", "H26", "C25", "C26")
 
 
 def fed_leg(text: str) -> Optional[str]:
+    """A Fed-decision question → the leg it names, or None."""
     s = (text or "").lower()
     if not re.search(r"\bfed\b|federal reserve|fomc|interest rate", s):
         return None
@@ -333,6 +432,7 @@ def fed_leg(text: str) -> Optional[str]:
 
 
 def kalshi_fed_leg(kx: dict) -> Optional[str]:
+    """The leg of a KXFEDDECISION market, straight off its ticker."""
     tick = str(kx.get("conditionId") or "").upper()
     if "FEDDECISION" not in tick:
         return None
@@ -341,6 +441,13 @@ def kalshi_fed_leg(kx: dict) -> Optional[str]:
 
 
 def parse_fixture(pm: dict) -> Optional[dict]:
+    """A Polymarket sports slug → {league, date, family, line, tail}.
+
+    The slug is the only honest source for two facts a game market never puts
+    in its title: which competition it is, and which day it is played. Both
+    venues pad the close time by days so a postponed fixture can still settle,
+    so the close time cannot supply the second one.
+    """
     for key in ("slug", "eventSlug"):
         s = str(pm.get(key) or "").strip().lower()
         m = _SLUG_FIXTURE.match(s)
@@ -384,6 +491,12 @@ _KALSHI_UPDOWN_MINUTES = 15
 
 
 def parse_updown(pm: dict) -> Optional[dict]:
+    """A Polymarket timed up/down market → {asset, minutes, startTs, endTs}.
+
+    Read from the slug, which carries the window as a unix start plus a
+    length. The title says the same thing in words ("September 3,
+    12:00AM-12:15AM ET") but the slug needs no timezone reasoning at all.
+    """
     m = _SLUG_UPDOWN.match(str(pm.get("slug") or "").strip().lower())
     if not m:
         return None
@@ -398,6 +511,7 @@ def parse_updown(pm: dict) -> Optional[dict]:
 
 
 def et_clock(iso_or_ts) -> Optional[str]:
+    """An instant → "12:15AM ET", the way both venues write these windows."""
     ts = (float(iso_or_ts) if isinstance(iso_or_ts, (int, float))
           else _close_ts(iso_or_ts))
     if ts is None:
@@ -409,6 +523,7 @@ def et_clock(iso_or_ts) -> Optional[str]:
 
 
 def updown_match(up: dict, kx: dict) -> Optional[dict]:
+    """Pair a timed up/down market with the Kalshi window that ends with it."""
     if str(kx.get("seriesTicker") or "").upper() != up["series"]:
         return None
     kx_end = _close_ts(kx.get("resolvesAt") or kx.get("closeTime"))
@@ -439,12 +554,21 @@ def updown_match(up: dict, kx: dict) -> Optional[dict]:
 
 
 async def explain_no_match(pm: dict) -> Optional[str]:
+    """Why THIS question has no counterpart, when we can say something better
+    than "no market looks like this".
+
+    The generic note is true but useless on a family where the user knows
+    perfectly well that both venues list something: what they need to hear is
+    that the windows do not line up, and which one Kalshi is actually quoting.
+    Uses only what the lookup already fetched — every call rides the same TTL
+    cache — so this costs nothing extra.
+    """
     up = parse_updown(pm)
     if not up:
         return None
     try:
         rows = await kalshi.events_in_series(up["series"])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     open_ends = sorted(
         {_close_ts(r.get("resolvesAt") or r.get("closeTime")) for r in rows
@@ -477,6 +601,11 @@ async def explain_no_match(pm: dict) -> Optional[str]:
 
 
 def pm_settlement_date(pm: dict) -> tuple[Optional[str], bool]:
+    """→ (YYYY-MM-DD in US Eastern, exact?).
+
+    `exact` is False when the date came from the padded close time, which is
+    the venue's deadline rather than the question's day.
+    """
     fx = parse_fixture(pm)
     if fx:
         return fx["date"], True
@@ -488,6 +617,7 @@ def pm_settlement_date(pm: dict) -> tuple[Optional[str], bool]:
 
 
 def kx_settlement_date(kx: dict) -> tuple[Optional[str], bool]:
+    """Same, for a Kalshi row. The event ticker's own stamp wins."""
     d = kalshi_ticker_date(str(kx.get("eventTicker")
                                or kx.get("conditionId") or ""))
     if d:
@@ -499,6 +629,14 @@ def kx_settlement_date(kx: dict) -> tuple[Optional[str], bool]:
 
 
 def _subject_tokens(text: str) -> set[str]:
+    """Tokens minus the words every threshold question contains, so what is
+    left is the SUBJECT: the asset, the city, the teams.
+
+    Alias-expanded, because the two venues genuinely disagree on the name:
+    Kalshi's event reads "BTC price on Sep 3" where Polymarket's reads "the
+    price of Bitcoin", and without the translation those two share no subject
+    word at all and the structural path never fires.
+    """
     drop = {"price", "above", "below", "over", "under", "between", "highest",
             "lowest", "maximum", "minimum", "temperature", "will", "get",
             "high", "low", "range", "rate", "rates", "value", "level"}
@@ -507,6 +645,14 @@ def _subject_tokens(text: str) -> set[str]:
 
 
 def structural_match(pm: dict, kx: dict) -> Optional[dict]:
+    """Compare two markets as (subject, date, threshold, direction).
+
+    Returns None when either side does not parse — that is not a rejection,
+    it just means the text path is the only one that applies. When it does
+    return, it says WHICH side of the Kalshi book it compared, because a
+    Kalshi "below X" is the NO leg of a Polymarket "above X" and quietly
+    comparing YES to YES there would print an inverted, fictional spread.
+    """
     pm_text = str(pm.get("title") or "")
     kx_text = str(kx.get("matchText") or kx.get("title") or "")
 
@@ -614,6 +760,7 @@ def _threshold_phrase(pm_t: tuple, kx_t: tuple) -> str:
 
 
 def _kx_strike_threshold(kx: dict) -> Optional[tuple]:
+    """The threshold Kalshi states in its own structured fields."""
     st = str(kx.get("strikeType") or "").lower()
     floor, cap = kx.get("floorStrike"), kx.get("capStrike")
     if st in ("greater", "greater_or_equal") and floor is not None:
@@ -626,6 +773,11 @@ def _kx_strike_threshold(kx: dict) -> Optional[tuple]:
 
 
 def score_pair(pm: dict, kx: dict) -> tuple[float, list[str], list[str]]:
+    """→ (score 0..1, reasons for, reasons against).
+
+    Pure and side-effect free, so the whole matching rule is unit testable
+    without touching either venue.
+    """
     pm_text = f"{pm.get('title') or ''}"
     kx_text = kx.get("matchText") or kx.get("title") or ""
 
@@ -688,6 +840,8 @@ def score_pair(pm: dict, kx: dict) -> tuple[float, list[str], list[str]]:
 
 
 def _confidence(score: float) -> str:
+    """Only two tiers are ever shown. Anything below POSSIBLE is reported as
+    no match at all — see find_match."""
     return "strong" if score >= STRONG else "possible"
 
 
@@ -717,6 +871,7 @@ async def _get_index() -> tuple[list[dict], dict[str, set[int]], bool]:
 
 def _series_candidates(pm_tokens: set[str], rows: list[dict],
                        inv: dict[str, set[int]]) -> list[dict]:
+    """Series whose TITLE overlaps the question, best first."""
     counts: dict[int, int] = {}
     for tok in pm_tokens:
         for i in inv.get(tok, ()):
@@ -736,6 +891,24 @@ def _series_candidates(pm_tokens: set[str], rows: list[dict],
 
 def _candidate_series(pm: dict, rows: list[dict],
                       inv: dict[str, set[int]]) -> list[dict]:
+    """Which Kalshi series could possibly hold this question, best first.
+
+    Three routes, in order of how much they actually know:
+
+    1. **The fixture route.** A Polymarket sports slug states the league and
+       the date outright, and Kalshi's tickers are KX + league + family. That
+       is a lookup, not a guess, and it is the route that took sports from
+       unmatchable to exact.
+    2. **The named-topic route.** A handful of question families where the
+       Kalshi series title shares no words with the question at all — "LA
+       LIGA" for a question about Levante, "How low will Bitcoin fall this
+       year?" for "Will Bitcoin dip to $45,000".
+    3. **The token route**, as before, but over alias-expanded tokens so BTC
+       reaches Bitcoin and "dip" reaches "fall".
+
+    Every ticker either route proposes is checked against the live series
+    index first, so a stale table entry costs nothing and fetches nothing.
+    """
     by_ticker = {r["ticker"]: r for r in rows}
     picked: list[dict] = []
     seen: set[str] = set()
@@ -779,6 +952,13 @@ _RE_VS = re.compile(r"^(.*?)\s+vs\.?\s+(.*)$", re.IGNORECASE)
 
 
 def pm_yes_claim(pm: dict, fx: dict) -> Optional[str]:
+    """What a Polymarket fixture market's YES actually claims, in words.
+
+    Polymarket's YES is never labelled: the title is "New York Mets vs. Tampa
+    Bay Rays" and the reader is expected to know YES means the first-named
+    side. Making that explicit here is the whole reason the leg can be picked
+    safely — and why an inverted pairing is an error rather than a coin flip.
+    """
     title = str(pm.get("title") or "").strip()
     tail = fx.get("tail") or ""
     line = fx.get("line")
@@ -807,6 +987,13 @@ def pm_yes_claim(pm: dict, fx: dict) -> Optional[str]:
 
 
 def _leg_score(claim: str, kx: dict) -> float:
+    """How well one Kalshi leg answers the Polymarket YES claim.
+
+    Names carry a point each and the figure carries three, because within one
+    event the figure is the whole question: every leg of "Total Runs" says
+    "Over N runs scored" and only N tells them apart. A figure that
+    CONTRADICTS is scored below zero, never merely unrewarded.
+    """
     kt = _tokens(str(kx.get("subtitle") or kx.get("title") or ""))
     ct = _tokens(claim)
     if not ct or not kt:
@@ -820,6 +1007,7 @@ def _leg_score(claim: str, kx: dict) -> float:
 
 
 def pick_leg(claim: str, legs: list[dict]) -> Optional[tuple[dict, float, float]]:
+    """The one leg this claim names, or None when it is not clear-cut."""
     scored = sorted(((_leg_score(claim, k), k) for k in legs),
                     key=lambda x: -x[0])
     if not scored or scored[0][0] <= 0:
@@ -834,6 +1022,13 @@ _STRIP_DIGITS = re.compile(r"^\d+")
 
 
 def event_code(ticker: str) -> str:
+    """The side codes Kalshi packs into an event ticker after the date.
+
+    "KXMLBGAME-26SEP021840NYMTB" → "NYMTB"; "KXCHLLDPGAME-26SEP02DEPNUB" →
+    "DEPNUB". Polymarket writes the same two sides into its slug, and for most
+    leagues the two venues use the same abbreviations — which turns "which of
+    tonight's fifteen games is this" from a guess into a lookup.
+    """
     up = str(ticker or "").upper()
     m = _KX_TICKER_DATE.search(up)
     if not m:
@@ -842,6 +1037,7 @@ def event_code(ticker: str) -> str:
 
 
 def _event_score(pm_title: str, sides: tuple, legs: list[dict]) -> float:
+    """How strongly one Kalshi event answers "which fixture is this?"."""
     code = event_code(str(legs[0].get("eventTicker") or ""))
     hits = 0
     for s in sides:
@@ -854,6 +1050,17 @@ def _event_score(pm_title: str, sides: tuple, legs: list[dict]) -> float:
 
 
 def _fixture_verdict(pm: dict, fx: dict, markets: list[dict]) -> Optional[dict]:
+    """Match a Polymarket game market to one Kalshi leg of the same fixture.
+
+    Two decisions, each required to be decisive on its own:
+
+    * **Which fixture** — the slug's league and date, then the side codes.
+    * **Which leg** — the Polymarket YES claim against each leg's subtitle.
+
+    A tie at either step is answered with None. Half of a fixture pairing is
+    not half right: comparing "Mets win" to "Rays win" produces two real
+    prices, a large spread and a completely inverted claim.
+    """
     claim = pm_yes_claim(pm, fx)
     if not claim:
         return None
@@ -914,6 +1121,7 @@ def _fixture_verdict(pm: dict, fx: dict, markets: list[dict]) -> Optional[dict]:
 
 
 async def find_match(pm: dict) -> Optional[dict]:
+    """Best Kalshi candidate for a Polymarket market, or None."""
     rows, inv, _ = await _get_index()
     if not rows:
         return None
@@ -928,7 +1136,7 @@ async def find_match(pm: dict) -> Optional[dict]:
     for sx in series:
         try:
             markets = await kalshi.events_in_series(sx["ticker"])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug("cross-venue: series %s failed: %s", sx["ticker"], e)
             continue
         for kx in markets:
@@ -978,6 +1186,18 @@ _SIBLING_MARGIN = 0.08
 
 
 def _beats_its_siblings(cand: dict, cands: list[dict]) -> bool:
+    """Whether this leg is clearly the one the question names.
+
+    The legs of one Kalshi event differ ONLY by the entity — twenty rows that
+    all read "Will <club> win La Liga?" — so a text scorer that likes one
+    likes them all. Caught on this fixture: a question about Getafe scored
+    Barcelona, Real Madrid and Atletico identically at 0.40, the correct leg
+    happened to be unquoted, and the panel would have shown Barcelona's price
+    under a question about Getafe.
+
+    So a leg only counts when it beats its own siblings. If the question does
+    not distinguish them, the honest answer is that we cannot either.
+    """
     ev = str(cand["market"].get("eventTicker") or "")
     if not ev:
         return True
@@ -998,6 +1218,9 @@ _BUCKETS = {
 
 
 def _bucket(points: list[dict], size: int) -> dict[int, float]:
+    """Snap a series onto a shared grid. Both venues already bucket their own
+    history; snapping to a common bucket START acknowledges that rather than
+    inventing anything. The LAST observation in a bucket wins."""
     out: dict[int, float] = {}
     for p in points:
         t, v = p.get("t"), p.get("p")
@@ -1008,6 +1231,7 @@ def _bucket(points: list[dict], size: int) -> dict[int, float]:
 
 
 async def compare(condition_id: str, interval: str = "1d") -> dict:
+    """Both venues' prices and history for one Polymarket market."""
     iv = interval if interval in _BUCKETS else "1d"
     bucket_s, lookback_s, kx_period = _BUCKETS[iv]
 

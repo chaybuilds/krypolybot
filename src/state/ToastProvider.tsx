@@ -3,6 +3,7 @@ import {
 } from 'react';
 import { CheckCircle, XCircle, Info, AlertTriangle, X } from 'lucide-react';
 import { cls } from '../utils/format';
+import { GlassPanel } from '../components/glass/GlassPanel';
 
 export type ToastKind = 'success' | 'error' | 'info' | 'warn';
 
@@ -86,13 +87,13 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
     Info;
 
   return (
-    <div
+    <GlassPanel
+      preset="modal"
+      display="flex"
+      tint="linear-gradient(165deg, rgba(24,30,52,0.66), rgba(10,12,22,0.76))"
+      style={{ boxShadow: TOAST_GLOW[toast.kind] }}
       className={cls(
-        'pointer-events-auto flex items-start gap-3 rounded-xl border bg-krypt-surface/90 p-3 backdrop-blur-md shadow-krypt-soft animate-fade-in',
-        toast.kind === 'success' && 'border-krypt-win/30',
-        toast.kind === 'error' && 'border-krypt-loss/40',
-        toast.kind === 'warn' && 'border-krypt-warn/40',
-        toast.kind === 'info' && 'border-krypt-border',
+        'glass-pop pointer-events-auto items-start gap-3 rounded-2xl p-3',
         exit && 'opacity-0 transition-opacity duration-200',
       )}
     >
@@ -105,14 +106,21 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
           toast.kind === 'info' && 'text-krypt-purple',
         )}
       />
-      <div className="flex-1 text-sm">{toast.message}</div>
+      <div className="flex-1 text-sm text-white/95">{toast.message}</div>
       <button
         onClick={onClose}
-        className="text-krypt-muted hover:text-white"
+        className="text-krypt-muted transition-colors hover:text-white"
         aria-label="Dismiss"
       >
         <X className="h-4 w-4" />
       </button>
-    </div>
+    </GlassPanel>
   );
 }
+
+const TOAST_GLOW: Record<ToastKind, string> = {
+  success: 'inset 0 0 0 1px rgba(34,197,94,0.35), 0 12px 32px -14px rgba(34,197,94,0.55)',
+  error: 'inset 0 0 0 1px rgba(239,68,68,0.45), 0 12px 32px -14px rgba(239,68,68,0.6)',
+  warn: 'inset 0 0 0 1px rgba(245,158,11,0.4), 0 12px 32px -14px rgba(245,158,11,0.5)',
+  info: 'inset 0 0 0 1px rgba(255,255,255,0.08), 0 12px 32px -14px rgba(59,130,246,0.55)',
+};

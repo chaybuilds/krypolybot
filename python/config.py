@@ -1,9 +1,22 @@
+"""Default Krypt PolyBot configuration.
+
+This dict is the source of truth for what the Python backend understands.
+The Electron renderer's `TraderConfig` mirrors these keys (camelCase on
+the JS side, snake_case here). Conversion is handled by `_camel_keys` in
+the IPC layer.
+
+Every knob the user sees in the UI is here. Add a new one? Add it here
+first, mirror it in `shared/types.ts`, then surface it in
+`src/pages/SettingsPage.tsx`.
+"""
 from __future__ import annotations
 from typing import Any
 
 import re as _re
 
 import rules as rules_engine
+
+# pylint: disable=invalid-name
 
 CRYPTO15M_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB", "ZEC"]
 
@@ -225,23 +238,37 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "terminal_notifications": True,
     "ai_enabled": False,
     "ai_provider": "anthropic",
-    "ai_anthropic_model": "claude-opus-5",
-    "ai_openai_model": "",
+    "ai_model": "claude-opus-5",
     "ai_web_search": False,
+    "autopilot_enabled": False,
+    "autopilot_interval_min": 60,
+    "autopilot_max_runs_per_day": 12,
+    "autopilot_daily_token_budget": 1_500_000,
+    "autopilot_max_steps": 15,
+    "autopilot_mission": "",
+    "autopilot_agent_id": "default",
     "remote_enabled": False,
     "remote_discord_enabled": False,
     "remote_telegram_enabled": False,
     "remote_trading_enabled": False,
     "remote_max_order_usd": 100.0,
-    "terminal_paper_mode": False,
+    "account_mode": "paper",
+    "terminal_paper_mode": True,
     "terminal_paper_bankroll_usd": 1000.0,
     "mcp_enabled": False,
     "mcp_port": 47615,
-    "mcp_live_trading_enabled": False,
+    "mcp_trade_mode": "paper",
     "mcp_max_order_usd": 25.0,
-    "mcp_daily_limit_usd": 100.0,
+    "mcp_daily_spend_usd": 100.0,
+    "mcp_max_positions": 10,
+    "mcp_min_edge_cents": 3.0,
+    "mcp_daily_loss_usd": 50.0,
+    "mcp_live_approval": True,
+    "mcp_agents": None,
+    "mcp_allow_live_switches": False,
     "mcp_scripts_enabled": False,
     "mcp_paper_bankroll_usd": 1000.0,
+    "mcp_http_enabled": False,
     "script_market_limit": 150,
     "script_market_min_volume": 5000.0,
     "script_market_max_spread_cents": 2.0,
@@ -353,9 +380,9 @@ CRYPTO15M_PRESETS: list[dict[str, Any]] = [
             "Buy the favorite only when it is already >=95c. The June "
             "replay of 531 markets showed +2.8c/contract on 16 wins; the "
             "full corpus (2026-09-01, n=10,373) measures favorite-follow "
-            "at -2.06c/contract and the 95-100c band at +0.10c (t=0.3) — "
-            "statistically zero, and negative once the half-spread is "
-            "added. One loss at 97c wipes out ~35 wins. Example "
+            "at -2.06c/contract and the 95-100c band at +0.10c (t=0.3, "
+            "unclustered) — statistically zero, and negative once the "
+            "half-spread is added. One loss at 97c wipes out ~35 wins. Example "
             "configuration, not an edge. Paper-trade first."
         ),
         "config": {
@@ -374,8 +401,8 @@ CRYPTO15M_PRESETS: list[dict[str, Any]] = [
             "When a side is an extreme favorite (>=90c), buy the CHEAP "
             "opposite side, betting the 15-minute move reverts before "
             "close. Low win rate, high payoff (longshot); holds to "
-            "settlement, no stop. An early sample read break-even (+1.0c/"
-            "contract, n=64); the full corpus (2026-09-01, n=10,373) "
+            "settlement, no stop. An early, small sample read break-even "
+            "(+1.0c/contract, n=64); the full corpus (2026-09-01, n=10,373) "
             "measures -3.80c/contract (t=-9.7), the worst number in the "
             "corpus. Not recommended. Paper-trade hard."
         ),
@@ -409,6 +436,7 @@ def _camel_to_snake(name: str) -> str:
 
 
 def _as_float(v: Any, default: float) -> float:
+    """Best-effort float, falling back to `default` on junk/NaN."""
     try:
         f = float(v)
     except (TypeError, ValueError):
@@ -447,6 +475,9 @@ _UNIT_KEYS = [
 
 
 def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Clamp money-critical knobs to sane ranges BEFORE they can drive an
+    order. The renderer is trusted-ish, but a malformed value (e.g. a
+    size fraction of 5.0) must never reach the sizing path uncorrected."""
     d = DEFAULT_CONFIG
 
     if "dry_run" in cfg:
@@ -593,11 +624,25 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["main_record_signals"] = bool(cfg.get("main_record_signals", d["main_record_signals"]))
     cfg["ai_enabled"] = bool(cfg.get("ai_enabled", d["ai_enabled"]))
     cfg["ai_web_search"] = bool(cfg.get("ai_web_search", d["ai_web_search"]))
-    if cfg.get("ai_provider") not in ("anthropic", "openai"):
-        cfg["ai_provider"] = d["ai_provider"]
-    for _k in ("ai_anthropic_model", "ai_openai_model"):
-        _v = cfg.get(_k)
-        cfg[_k] = _v.strip()[:120] if isinstance(_v, str) else d[_k]
+    import ai_providers as _aip
+    _p = str(cfg.get("ai_provider") or "").strip().lower()
+    cfg["ai_provider"] = _p if _p in _aip.PROVIDERS else d["ai_provider"]
+    cfg["ai_model"] = _aip.clean_model(cfg["ai_provider"], cfg.get("ai_model"))
+    cfg["autopilot_enabled"] = cfg.get("autopilot_enabled", False) is True
+    cfg["autopilot_interval_min"] = _clampi(
+        cfg.get("autopilot_interval_min"), 15, 1440, d["autopilot_interval_min"])
+    cfg["autopilot_max_runs_per_day"] = _clampi(
+        cfg.get("autopilot_max_runs_per_day"), 1, 96, d["autopilot_max_runs_per_day"])
+    cfg["autopilot_daily_token_budget"] = _clampi(
+        cfg.get("autopilot_daily_token_budget"), 50_000, 50_000_000,
+        d["autopilot_daily_token_budget"])
+    cfg["autopilot_max_steps"] = _clampi(
+        cfg.get("autopilot_max_steps"), 3, 40, d["autopilot_max_steps"])
+    cfg["autopilot_mission"] = str(cfg.get("autopilot_mission") or "")[:2000]
+    import mcp_agents as _mag
+    _aid = str(cfg.get("autopilot_agent_id") or "").strip().lower()
+    cfg["autopilot_agent_id"] = (_aid if (_aid == _mag.DEFAULT_ID or _mag.valid_id(_aid))
+                                 else _mag.DEFAULT_ID)
     if cfg.get("crypto15m_entry_style") not in ("maker", "taker"):
         cfg["crypto15m_entry_style"] = d["crypto15m_entry_style"]
     cfg["crypto15m_taker_fak"] = bool(cfg.get("crypto15m_taker_fak", True))
@@ -758,15 +803,29 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg.get("remote_max_order_usd"), 0.0, 10_000.0, d["remote_max_order_usd"])
     cfg["mcp_enabled"] = bool(cfg.get("mcp_enabled", False))
     cfg["mcp_port"] = _clampi(cfg.get("mcp_port"), 1024, 65535, d["mcp_port"])
-    cfg["mcp_live_trading_enabled"] = bool(cfg.get("mcp_live_trading_enabled", False))
+    tm = str(cfg.get("mcp_trade_mode") or "").lower()
+    cfg["mcp_trade_mode"] = tm if tm in ("off", "paper", "live") else d["mcp_trade_mode"]
     cfg["mcp_max_order_usd"] = _clampf(
         cfg.get("mcp_max_order_usd"), 0.0, 100_000.0, d["mcp_max_order_usd"])
-    cfg["mcp_daily_limit_usd"] = _clampf(
-        cfg.get("mcp_daily_limit_usd"), 0.0, 1_000_000.0, d["mcp_daily_limit_usd"])
+    cfg["mcp_daily_spend_usd"] = _clampf(
+        cfg.get("mcp_daily_spend_usd"), 0.0, 1_000_000.0, d["mcp_daily_spend_usd"])
+    cfg["mcp_max_positions"] = _clampi(
+        cfg.get("mcp_max_positions"), 0, 500, d["mcp_max_positions"])
+    cfg["mcp_min_edge_cents"] = _clampf(
+        cfg.get("mcp_min_edge_cents"), 0.0, 50.0, d["mcp_min_edge_cents"])
+    cfg["mcp_daily_loss_usd"] = _clampf(
+        cfg.get("mcp_daily_loss_usd"), 0.0, 1_000_000.0, d["mcp_daily_loss_usd"])
+    cfg["mcp_live_approval"] = cfg.get("mcp_live_approval") is not False
+    import mcp_agents
+    cfg["mcp_agents"] = mcp_agents.validate_agents(
+        cfg.get("mcp_agents"), cfg["mcp_trade_mode"])
+    cfg["mcp_allow_live_switches"] = cfg.get("mcp_allow_live_switches") is True
     cfg["mcp_scripts_enabled"] = bool(cfg.get("mcp_scripts_enabled", False))
     cfg["mcp_paper_bankroll_usd"] = _clampf(
         cfg.get("mcp_paper_bankroll_usd"), 1.0, 1e7, d["mcp_paper_bankroll_usd"])
-    cfg["terminal_paper_mode"] = bool(cfg.get("terminal_paper_mode", False))
+    cfg["mcp_http_enabled"] = cfg.get("mcp_http_enabled") is True
+    cfg["account_mode"] = "live" if str(cfg.get("account_mode") or "").lower() == "live" else "paper"
+    cfg["terminal_paper_mode"] = cfg["account_mode"] == "paper"
     cfg["terminal_paper_bankroll_usd"] = _clampf(
         cfg.get("terminal_paper_bankroll_usd"), 1.0, 1e7,
         d["terminal_paper_bankroll_usd"])
@@ -782,14 +841,104 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def merge_with_defaults(user: dict[str, Any]) -> dict[str, Any]:
+    """Apply user overrides on top of DEFAULT_CONFIG.
+
+    Accepts either snake_case or camelCase keys (the Electron renderer
+    sends camelCase; the Python codebase reads snake_case). Always
+    returns a fully populated config dict — missing keys back-fill from
+    defaults. Unknown keys are preserved (forward-compat) but ignored by
+    the running code.
+    """
     out = dict(DEFAULT_CONFIG)
+    given: set[str] = set()
     for k, v in (user or {}).items():
         if k in out:
             out[k] = v
+            given.add(k)
             continue
         sk = _camel_to_snake(k)
         out[sk] = v
+        given.add(sk)
+    _migrate_mcp(out, given)
+    _migrate_account(out, given)
+    _migrate_ai(out, given)
     return _validate_config(out)
+
+
+def _migrate_ai(out: dict[str, Any], given: set[str]) -> None:
+    """Configs from before the six providers had one model key per SDK
+    provider (`ai_anthropic_model`, `ai_openai_model`). Carried into the one
+    `ai_model` for the provider the user has selected — only when `ai_model`
+    was not given, so a config that already says what it wants is never
+    rewritten — and the legacy keys are dropped."""
+    if "ai_model" not in given:
+        prov = str(out.get("ai_provider") or "anthropic").strip().lower()
+        legacy = out.get(f"ai_{prov}_model") if prov in ("anthropic", "openai") else None
+        if isinstance(legacy, str) and legacy.strip():
+            out["ai_model"] = legacy.strip()
+        elif prov != "anthropic":
+            out["ai_model"] = ""
+    out.pop("ai_anthropic_model", None)
+    out.pop("ai_openai_model", None)
+
+
+def _migrate_account(out: dict[str, Any], given: set[str]) -> None:
+    """A config from before account_mode existed. Paper if it had paper mode
+    on; otherwise an EXISTING config (one that carries any setting at all)
+    is live — its engines sent real orders yesterday and must not silently
+    stop today — and a fresh one (nothing given) is paper.
+
+    The renderer's settings store owns the stricter half of this rule (it
+    knows whether the disclaimer was accepted) and always sends accountMode
+    once it knows the key; this is what a config WITHOUT it means here.
+    Never applied when account_mode was given."""
+    if "account_mode" in given:
+        return
+    if not given:
+        out["account_mode"] = "paper"
+    elif "terminal_paper_mode" in given:
+        out["account_mode"] = "paper" if out.get("terminal_paper_mode") is True else "live"
+    else:
+        out["account_mode"] = "live"
+
+
+def account_live(cfg: dict[str, Any]) -> bool:
+    """True when the ACCOUNT is live: real orders may leave this app at all.
+
+    Narrowing only: a validated config says it twice (account_mode, and the
+    derived terminal_paper_mode), and either one saying paper is paper. A raw
+    dict that never went through merge_with_defaults and names neither key
+    (tests, CLI tools) keeps the pre-account-mode meaning: live."""
+    m = cfg.get("account_mode")
+    if m is not None and str(m).lower() != "live":
+        return False
+    return not cfg.get("terminal_paper_mode")
+
+
+def engine_on(cfg: dict[str, Any], switch: str) -> bool:
+    """The EFFECTIVE engine switch: the user's own switch AND a live account.
+    In Paper the engines send nothing, and the user's switch is left exactly
+    as they set it — going live again restores what they had."""
+    return bool(cfg.get(switch)) and account_live(cfg)
+
+
+def _migrate_mcp(out: dict[str, Any], given: set[str]) -> None:
+    """Configs from before named agents had one live switch
+    (`mcp_live_trading_enabled`) and let the agent pick paper or live per
+    call. Carried forward, never widened: a user who had live trading on keeps
+    agents able to trade live (now behind approvals by default) and keeps the
+    whole-account powers that switch used to grant; everyone else is paper.
+    Only applied when the new key was not given — a config that already says
+    what it wants is never rewritten."""
+    legacy_live = out.get("mcp_live_trading_enabled") is True
+    if "mcp_trade_mode" not in given:
+        out["mcp_trade_mode"] = "live" if legacy_live else DEFAULT_CONFIG["mcp_trade_mode"]
+    if "mcp_allow_live_switches" not in given and legacy_live:
+        out["mcp_allow_live_switches"] = True
+    if "mcp_daily_spend_usd" not in given and "mcp_daily_limit_usd" in given:
+        out["mcp_daily_spend_usd"] = out.get("mcp_daily_limit_usd")
+    out.pop("mcp_live_trading_enabled", None)
+    out.pop("mcp_daily_limit_usd", None)
 
 
 def strategy_full_config(strategy_id: str) -> dict[str, Any] | None:

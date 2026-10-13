@@ -1,3 +1,15 @@
+"""Live provider check for the manual terminal.
+
+Deliberately NOT part of `npm run py:test`: it is slow and it depends on
+somebody else's uptime, so a red run here should never block CI. Run it BY
+HAND after touching anything in terminal.py / terminal_trade.py, because this
+is the layer that catches what unit tests structurally cannot — a route that
+vanished, a response shape that changed, a rate limit nobody documented.
+
+    npm run py:live
+
+Read-only. It never authenticates and never places an order.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -17,12 +29,13 @@ def note(name: str, status: str, detail: str = "") -> None:
 
 
 async def check_discover() -> str | None:
+    """Every column must return rows AND be honest about what it filtered."""
     first_cid = None
     for column in ("volume", "closing", "new", "volatility"):
         started = time.monotonic()
         try:
             r = await t.discover(column, limit=10)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             note(f"discover:{column}", FAIL, f"{type(e).__name__}: {e}")
             continue
         ms = (time.monotonic() - started) * 1000
@@ -141,13 +154,16 @@ async def check_resolution(cid: str) -> None:
 
 
 async def check_kalshi(cid: str | None) -> None:
+    """The second venue. Its discovery path is fragile in a specific way — see
+    kalshi.series_index() — so this checks the index is usable, not just that
+    the host answered."""
     import cross_venue
     import kalshi
 
     started = time.monotonic()
     try:
         series, ok = await kalshi.series_index()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         note("kalshi:series", FAIL, f"{type(e).__name__}: {e}")
         return
     secs = time.monotonic() - started
@@ -236,6 +252,19 @@ _SAMPLE = 12
 
 
 async def check_kalshi_match_rate() -> None:
+    """How often a live Polymarket market finds a Kalshi counterpart.
+
+    The owner's report was "it doesn't find matches for most markets", and the
+    unit tests structurally cannot catch that: they pin the RULES, and the
+    failure was in RETRIEVAL. So this samples the real Discover columns and
+    prints the rate, with each pairing's two titles side by side — because the
+    only real check on a match is a human reading both.
+
+    There is no FAIL threshold on the rate itself. Most Polymarket questions
+    genuinely have no Kalshi counterpart, so a low rate can be perfectly
+    honest; what is being watched is a rate that COLLAPSES (retrieval broke)
+    and any pairing a reader would not accept.
+    """
     import cross_venue
 
     rows: list[dict] = []
@@ -243,7 +272,7 @@ async def check_kalshi_match_rate() -> None:
     for column in ("volume", "closing", "volatility"):
         try:
             r = await t.discover(column, limit=12)
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         for m in r.get("rows") or []:
             if m.get("conditionId") and m["conditionId"] not in seen:
@@ -259,7 +288,7 @@ async def check_kalshi_match_rate() -> None:
     for m in rows:
         try:
             hit = await cross_venue.find_match(m)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             failed += 1
             note("kalshi:match-rate", FAIL, f"{type(e).__name__}: {e}")
             continue
@@ -298,13 +327,25 @@ async def check_kalshi_match_rate() -> None:
 
 
 async def check_kalshi_timed_crypto() -> None:
+    """The timed crypto up/down family, end to end through `compare()`.
+
+    This is the family the owner trades, and the one where a near miss is
+    hardest to see: Polymarket lists 5- and 15-minute windows, Kalshi lists
+    15-minute windows only and opens one at a time, and on a quiet quarter
+    hour every one of those prices looks like every other. Two invariants,
+    both checkable whatever is open at the time:
+
+      * a reported match must be the SAME window to the second, and
+      * a no-match must say which window Kalshi is actually quoting, instead
+        of the generic "no market looks like this question".
+    """
     import cross_venue
 
     live: dict[str, dict] = {}
     for column in ("new", "closing", "volatility"):
         try:
             r = await t.discover(column, limit=100)
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         for m in r.get("rows") or []:
             up = cross_venue.parse_updown(m)
@@ -365,6 +406,12 @@ async def check_search() -> None:
 
 
 async def check_backoff() -> None:
+    """Prove a parked host fails FAST instead of holding the queue.
+
+    This is the failure that blanked the chart on the crypto build: a
+    discovery burst 429'd the provider, and the doomed retries starved a
+    high-value request while a plain curl to the same endpoint returned 200.
+    """
     gate = t._gates["gamma"]
     gate.park(2.0)
     started = time.monotonic()
@@ -394,6 +441,14 @@ async def check_cache() -> None:
 
 
 async def check_concurrency() -> None:
+    """Prove the gate overlaps round trips against the REAL provider.
+
+    The gate's lock covers only the spacing decision — next allowed start,
+    sleep the gap, stamp it — and is released before the HTTP call, with a
+    semaphore bounding how many are in flight. Held across the round trip (as
+    it once was) a Discover load needing ~20 Gamma calls cost 20 × (RTT +
+    0.12s). Unit tests pin this with a stub; only this check sees a real RTT.
+    """
     gate = t._gates["gamma"]
     n = 6
     before = gate.calls

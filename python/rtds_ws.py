@@ -1,3 +1,49 @@
+"""Chainlink oracle prices for the crypto up/down markets — the series they
+actually SETTLE on — over Polymarket's PolyBolt socket, with the legacy RTDS
+socket as a fallback.
+
+SETTLEMENT (since 2026-08-07; 5m windows moved to 60s on 2026-08-14). The
+up/down markets resolve on Chainlink's 60-second TWAP stream
+(`data.chain.link/streams/<asset>-usd-twap-60s-streams`): Up wins when the
+TWAP at the window's close is ≥ the TWAP at its open. So this module keeps
+two series per asset:
+  * spot  — Chainlink spot prints, ~1/s (`price.crypto`), and
+  * twap  — Chainlink 60s TWAP points, ~1/s (`price.crypto.twap`); the point
+            stamped at a window's open second IS that window's official strike.
+
+LATENCY (measured 2026-10-05, 3-second-return cross-correlation against the
+Coinbase ticker, ETH, 5 minutes): legacy RTDS Chainlink spot ~1s behind;
+PolyBolt `price.crypto` Chainlink spot ~20s behind (correlation 0.4 — a
+delayed redistribution); PolyBolt `price.crypto` pinned to Pyth ~0s
+(correlation 0.81); the 60s TWAP (identical values on both transports) tracks
+the trailing 60s Coinbase mean to ~1-2s. So on PolyBolt the LIVE spot is the
+Pyth pin, and a Chainlink spot point there is recorded but never served as
+live — a 20s-stale "live" price is exactly what the final-minute sniper must
+not see. HYPE has no Pyth feed: on PolyBolt it gets TWAP only, and its live
+spot falls back to the next layer.
+
+TRANSPORTS
+  PolyBolt (primary): wss://ws-live-v2.polymarket.com/ws
+    auth       {"op":"auth","rid":..,"auth":{apiKey,secret,passphrase}} → {"op":"authed"}
+               (the CLOB API credentials the bot already derives)
+    subscribe  {"op":"subscribe","rid":..,"subscriptions":[
+                  {"channel":"price.crypto","filter":{"symbol":"btcusd"}},
+                  {"channel":"price.crypto.twap","filter":{"symbol":"btcusd","window_seconds":60}}]}
+    data       {"v":1,"channel","seq","ts","snapshot"?,"payload":{symbol,value,timestamp,source,..}}
+               Each subscription opens with a snapshot of the previous ~2 minutes
+               (payload.data: [points]) — so a strike is recoverable after a
+               late start. Verified live 2026-10-05.
+  RTDS (legacy fallback): wss://ws-live-data.polymarket.com, topics
+    `crypto_prices_chainlink` and `crypto_prices_twap_sixty`. Deprecated by
+    Polymarket on 2026-09-23 with removal planned about a month later; used
+    only when there are no CLOB credentials or PolyBolt is unreachable.
+
+STRICT ACCELERATOR like spot_ws/clob_ws: consumers fall back per asset to the
+Coinbase WS overlay and then the REST chain whenever this feed is down, cold
+or stale. Never MORE fragile than what it upgrades.
+
+Opt out with KRYPT_RTDS_WS=0 (env) or the `crypto15m_rtds_ws` config key.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,10 +58,10 @@ from typing import Optional
 logger = logging.getLogger("rtds_ws")
 
 try:
-    import websockets
+    import websockets  # type: ignore
     _WS_IMPORT_OK = True
-except Exception:
-    websockets = None
+except Exception:  # pragma: no cover - websockets missing
+    websockets = None  # type: ignore
     _WS_IMPORT_OK = False
 
 _POLYBOLT_URL = os.environ.get("KRYPT_POLYBOLT_URL") or "wss://ws-live-v2.polymarket.com/ws"
@@ -46,9 +92,17 @@ _RECONNECT_MAX_SEC = 60.0
 _SAMPLES_MAX = 300
 _SETTLE_WINDOW_SEC = TWAP_WINDOW_SEC
 _PB_FAILS_BEFORE_FALLBACK = 2
+_ROUTINE_CLOSE_CODES = (1000, 4003)
+_ROUTINE_RECONNECT_SEC = 1.0
+
+
+def _close_code(e: BaseException) -> Optional[int]:
+    """The close code the server sent, if `e` is a websocket close."""
+    return getattr(getattr(e, "rcvd", None), "code", None)
 
 
 def _creds() -> Optional[dict]:
+    """CLOB API credentials for PolyBolt, or None (→ legacy RTDS)."""
     try:
         import polymarket_auth
         c = polymarket_auth.get_api_creds()
@@ -124,13 +178,21 @@ class _Client:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                if use_pb:
+                routine = self.connected and _close_code(e) in _ROUTINE_CLOSE_CODES
+                if use_pb and not routine:
                     self._pb_fails += 1
+                elif not use_pb:
+                    self._pb_fails = 0
                 self.last_error = f"{type(e).__name__}: {e}"
-                attempt = min(attempt + 1, 16)
-                backoff = min(2.0 ** attempt, _RECONNECT_MAX_SEC)
-                backoff *= random.uniform(0.75, 1.25)
-                logger.warning(
+                if routine:
+                    attempt = 0
+                    backoff = _ROUTINE_RECONNECT_SEC
+                else:
+                    attempt = min(attempt + 1, 16)
+                    backoff = min(2.0 ** attempt, _RECONNECT_MAX_SEC)
+                    backoff *= random.uniform(0.75, 1.25)
+                logger.log(
+                    logging.INFO if routine else logging.WARNING,
                     f"rtds_ws: {'polybolt' if use_pb else 'rtds'} disconnected "
                     f"({self.last_error}); reconnect in {backoff:.0f}s"
                 )
@@ -169,6 +231,7 @@ class _Client:
                 subs.append({"channel": "price.crypto.twap",
                              "filter": {"symbol": sym, "window_seconds": TWAP_WINDOW_SEC}})
             await ws.send(json.dumps({"op": "subscribe", "rid": "subs", "subscriptions": subs}))
+            self._pb_fails = 0
             self.connected = True
             self.transport = "polybolt"
             logger.info(f"rtds_ws: connected → {_POLYBOLT_URL} (polybolt)")
@@ -266,11 +329,15 @@ class _Client:
         self.basis[asset] = b if cur is None else cur + _BASIS_ALPHA * (b - cur)
 
     def _adj(self, asset: str, px: float) -> float:
+        """A Pyth price in Chainlink terms (unchanged for Chainlink spots)."""
         if self.spot_sources.get(asset) == "pyth":
             return px / (1.0 + self.basis.get(asset, 0.0))
         return px
 
     def handle_polybolt(self, m) -> None:
+        """PolyBolt envelopes: snapshots seed the rings (they carry the
+        previous ~2 minutes, i.e. a window open the app started after), live
+        points update the latest price too."""
         if not isinstance(m, dict):
             return
         ch = m.get("channel")
@@ -302,6 +369,8 @@ class _Client:
                          live=(not m.get("snapshot")) or last)
 
     def handle_message(self, m) -> None:
+        """Legacy RTDS `update` envelopes (spot or 60s TWAP). History bundles
+        (payload.data lists), acks, and unknown symbols are ignored."""
         if not isinstance(m, dict) or m.get("topic") not in (_TOPIC, _TWAP_TOPIC):
             return
         p = m.get("payload")
@@ -329,6 +398,7 @@ class _Client:
         return self._adj(a, px)
 
     def twap(self, asset: str) -> Optional[float]:
+        """Latest live 60s TWAP point, or None when cold/stale."""
         rec = self.twaps.get((asset or "").upper())
         if not rec or not self.connected:
             return None
@@ -338,6 +408,8 @@ class _Client:
         return px
 
     def fresh_spots(self) -> dict[str, float]:
+        """Live oracle prices fresh enough to trust, keyed by asset. Empty
+        when the socket is down/cold — callers then use the next layer."""
         if not self.connected:
             return {}
         now = time.time()
@@ -363,6 +435,8 @@ class _Client:
     def sample_at(
         self, asset: str, epoch_sec: float, tolerance_sec: float = 3.0,
     ) -> Optional[float]:
+        """The ring's ORACLE spot print nearest `epoch_sec` (within
+        tolerance), in Chainlink terms, or None."""
         a = (asset or "").upper()
         px = self._nearest(self.samples.get(a), epoch_sec, tolerance_sec)
         return None if px is None else self._adj(a, px)
@@ -370,11 +444,17 @@ class _Client:
     def twap_at(
         self, asset: str, epoch_sec: float, tolerance_sec: float = 1.0,
     ) -> Optional[float]:
+        """The official 60s TWAP point stamped at `epoch_sec` — a window's
+        strike when `epoch_sec` is its open. Tight tolerance: a TWAP a few
+        seconds off is a different number from the one that settles."""
         return self._nearest(self.twap_samples.get((asset or "").upper()), epoch_sec, tolerance_sec)
 
     def window_partial(
         self, asset: str, close_epoch: float, now: Optional[float] = None,
     ) -> tuple[float, int]:
+        """(sum, count) of one-per-second ORACLE spot prints observed so far
+        inside a window's settlement average (close−60s, close]. (0, 0) when
+        nothing observed."""
         a = (asset or "").upper()
         ring = self.samples.get(a)
         if not ring:

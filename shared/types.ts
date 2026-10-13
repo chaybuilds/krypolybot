@@ -1,5 +1,8 @@
 import type {
-  AiAnalysis, AiProvider, AiStatus,
+  AccountMode, AgentPaper, AiAnalysis, AiProvider, AiProviderCheck, AiStatus,
+  AutopilotStatus, ForecastScoreboard, HealthReport,
+  McpActivity, McpAgentStatus, McpLossToday, McpOrderEvent, McpOrderRow, McpRails, McpSeen,
+  McpToolCallEvent, McpTradeMode, PaperStatus,
   BookSnapshot, DiscoverColumn, DiscoverFilters, DiscoverResult,
   FlattenPreview, FlattenResult,
   ManualOrderPreview, ManualOrderRequest, ManualOrderResult, MarketSummary,
@@ -11,6 +14,7 @@ import type {
   TerminalFill, TerminalHealth, TerminalInterval, TerminalPortfolio,
   WatchEntry,
 } from './market';
+import type { McpAgent } from './agents';
 
 export type Network = 'mainnet';
 
@@ -67,6 +71,8 @@ export interface RemoteAuditRow {
   command: string;
   outcome: string;
   detail: string;
+  count?: number;
+  firstAt?: string;
 }
 
 export interface RemotePlatformStatus {
@@ -113,9 +119,19 @@ export interface McpStatus {
   lastError: string | null;
   hasToken: boolean;
   tokenMasked: string | null;
+  tradeMode?: McpTradeMode;
+  rails?: McpRails;
+  approvals?: boolean;
+  agents?: McpAgentStatus[];
+  pendingApprovals?: McpOrderRow[];
   sessions: McpSession[];
   toolCount: number;
   spentTodayUsd: number | null;
+  lossTodayUsd?: number | null;
+  lossToday?: McpLossToday | null;
+  httpEnabled?: boolean;
+  httpUrl?: string;
+  accountMode?: AccountMode;
   audit: McpAuditRow[];
   fetchedAt: string;
 }
@@ -126,12 +142,23 @@ export type McpClientId =
 export interface McpClientSetup {
   id: McpClientId;
   label: string;
+  agentId: string;
+  serverName: string;
   configPath: string | null;
+  configPaths?: string[];
   detected: boolean;
   installed: boolean;
+  canInstall: boolean;
   snippet: string;
   snippetKind: 'json' | 'toml' | 'shell';
   note?: string;
+}
+
+export interface McpInstallResult {
+  ok: boolean;
+  message: string;
+  files?: string[];
+  backups?: string[];
 }
 
 export interface StandingEvent {
@@ -354,9 +381,8 @@ export interface TraderConfig {
   terminalOfflineMode?: boolean;
   terminalNotifications?: boolean;
   aiEnabled?: boolean;
-  aiProvider?: 'anthropic' | 'openai';
-  aiAnthropicModel?: string;
-  aiOpenaiModel?: string;
+  aiProvider?: AiProvider;
+  aiModel?: string;
   aiWebSearch?: boolean;
   remoteEnabled?: boolean;
   remoteDiscordEnabled?: boolean;
@@ -365,13 +391,28 @@ export interface TraderConfig {
   remoteMaxOrderUsd?: number;
   terminalPaperMode?: boolean;
   terminalPaperBankrollUsd?: number;
+  accountMode?: AccountMode;
   mcpEnabled?: boolean;
   mcpPort?: number;
-  mcpLiveTradingEnabled?: boolean;
+  mcpTradeMode?: McpTradeMode;
   mcpMaxOrderUsd?: number;
-  mcpDailyLimitUsd?: number;
+  mcpDailySpendUsd?: number;
+  mcpMaxPositions?: number;
+  mcpMinEdgeCents?: number;
+  mcpDailyLossUsd?: number;
+  mcpLiveApproval?: boolean;
+  mcpAgents?: McpAgent[];
+  mcpAllowLiveSwitches?: boolean;
   mcpScriptsEnabled?: boolean;
   mcpPaperBankrollUsd?: number;
+  mcpHttpEnabled?: boolean;
+  autopilotEnabled?: boolean;
+  autopilotIntervalMin?: number;
+  autopilotMaxRunsPerDay?: number;
+  autopilotDailyTokenBudget?: number;
+  autopilotMaxSteps?: number;
+  autopilotMission?: string;
+  autopilotAgentId?: string;
   whaleActivityWs?: boolean;
   dbCleanupInterval?: number;
   crypto15mRulesNo?: RuleCondition[];
@@ -389,6 +430,7 @@ export interface CopyWalletInfo {
   short: string;
   positions: number;
   valueUsd: number;
+  error?: string | null;
 }
 
 export interface CopyStatus {
@@ -457,6 +499,7 @@ export interface AppState {
   acceptedDisclaimer: boolean;
   uiMode: 'simple' | 'advanced';
   windowBounds: { x: number; y: number; width: number; height: number } | null;
+  onboardingSeen?: number;
 }
 
 export type BackendStatus =
@@ -475,6 +518,18 @@ export interface BackendInfo {
   authOk: boolean;
 }
 
+export type RegionStatusKind = 'allowed' | 'close_only' | 'blocked' | 'unknown';
+
+export interface RegionStatus {
+  status: RegionStatusKind;
+  country: string;
+  region: string;
+  checkedAt?: number;
+  ageSec?: number;
+  message: string;
+  refusedOrder?: boolean;
+}
+
 export interface AccountSnapshot {
   cashUsd: number;
   portfolioUsd: number;
@@ -482,6 +537,7 @@ export interface AccountSnapshot {
   backendDown?: boolean;
   balanceSyncing?: boolean;
   tradingGeoblocked?: boolean;
+  tradingRegion?: RegionStatus | null;
   tradingRestriction?: { kind: 'restarting' | 'post_only'; untilEpoch: number; message: string } | null;
   userFeed?: { running: boolean; connected: boolean; events: number; lastEventAgoSec: number | null; lastError: string };
   startBankrollUsd: number;
@@ -829,7 +885,20 @@ export interface Crypto15mBacktest {
   byDay: { day: string; n: number; wins: number; pnlUsd: number }[];
   trades: { ticker: string; asset: string; side: string; costCents: number; minsLeft: number | null; won: boolean; pnlUsd: number; at: string }[];
   caveats: string[];
-  interval?: '5m' | '15m' | 'hourly';
+  tStat?: number | null;
+  tStatNaive?: number | null;
+  nClusters?: number;
+  interval?: '5m' | '15m' | 'hourly' | '4h';
+  noData?: ReplayNoData;
+}
+
+export interface ReplayNoData {
+  reason: 'interval' | 'assets' | 'collection-off' | 'none-yet';
+  interval: string;
+  recordingInterval: string | null;
+  recordingOn: boolean | null;
+  recorded: Record<string, number>;
+  message: string;
 }
 
 export interface UserScriptStats {
@@ -945,6 +1014,8 @@ export interface CollectionStats {
     windows: number; resolved: number; ticks: number;
     firstAt: string | null; lastAt: string | null;
     recent: { ticker: string; asset: string; favorite: string | null; favorite_price: number | null; up_won: number | null; resolved: number; close_time: string }[];
+    byInterval?: Record<string, { windows: number; resolved: number }>;
+    recordingInterval?: string;
   };
   main: {
     whales: number; whalesResolved: number; alerts: number; alertsResolved: number;
@@ -966,10 +1037,14 @@ export interface KryptApi {
     version: () => Promise<string>;
     openExternal: (url: string) => Promise<void>;
     showItemInFolder: (filePath: string) => Promise<void>;
+    saveVideo: (bytes: Uint8Array, ext: 'webm' | 'mp4', name?: string) => Promise<{ ok: boolean; data?: string; message?: string }>;
     getUserDataPath: () => Promise<string>;
     factoryReset: () => Promise<ActionResult<{ deleted: Record<string, number> }>>;
     clearHistory: () => Promise<ActionResult<{ deleted: Record<string, number> }>>;
     onDataReset: (cb: (payload: unknown) => void) => () => void;
+    markOnboardingSeen: () => Promise<ActionResult>;
+    isVisible: () => Promise<boolean>;
+    onVisibility: (cb: (visible: boolean) => void) => () => void;
   };
   accounts: {
     current: () => Promise<string>;
@@ -986,6 +1061,7 @@ export interface KryptApi {
     acceptDisclaimer: () => Promise<ActionResult>;
     setUiMode: (v: 'simple' | 'advanced') => Promise<ActionResult>;
     resetOnboarding: () => Promise<ActionResult>;
+    markOnboardingSeen: () => Promise<ActionResult>;
   };
   config: {
     get: () => Promise<TraderConfig>;
@@ -1015,6 +1091,8 @@ export interface KryptApi {
       ready?: boolean;
       approvalsOk?: boolean | null;
       issues?: string[];
+      fatalIssues?: string[];
+      region?: RegionStatus | null;
       address?: string;
     }>>;
     clear: (env?: Network) => Promise<ActionResult>;
@@ -1164,6 +1242,19 @@ export interface KryptApi {
       => Promise<{ ok: boolean; message: string; models?: string[]; masked?: string }>;
     listModels: (provider: AiProvider)
       => Promise<{ ok: boolean; models: string[]; message?: string }>;
+    checkProvider: (provider: AiProvider) => Promise<AiProviderCheck>;
+    scoreboard: (recent?: number) => Promise<ForecastScoreboard>;
+  };
+  autopilot: {
+    status: () => Promise<AutopilotStatus | null>;
+    runNow: () => Promise<{ ok: boolean; message: string }>;
+  };
+  paper: {
+    status: () => Promise<PaperStatus | null>;
+    reset: () => Promise<ActionResult<unknown>>;
+  };
+  health: {
+    check: (deep?: boolean) => Promise<HealthReport | null>;
   };
   remote: {
     status: () => Promise<RemoteStatus>;
@@ -1181,12 +1272,23 @@ export interface KryptApi {
   mcp: {
     status: () => Promise<McpStatus>;
     sync: () => Promise<McpStatus>;
-    rotateToken: () => Promise<McpStatus>;
-    revealToken: () => Promise<{ token: string }>;
-    paper: (reset?: boolean) => Promise<{ portfolio: unknown; orders: unknown }>;
-    clients: () => Promise<McpClientSetup[]>;
-    install: (id: McpClientId) => Promise<{ ok: boolean; message: string }>;
-    uninstall: (id: McpClientId) => Promise<{ ok: boolean; message: string }>;
+    rotateToken: (agentId: string) => Promise<McpStatus>;
+    paper: (agentId: string, reset?: boolean) => Promise<AgentPaper>;
+    decide: (id: number, approve: boolean) => Promise<{ ok: boolean; message: string }>;
+    settleUnknown: (id: number) => Promise<{ ok: boolean; status?: string; message: string }>;
+    activity: (limit?: number) => Promise<McpActivity>;
+    seen: () => Promise<McpSeen>;
+    copyHttpSnippet: (agentId: string) => Promise<{ ok: boolean; message?: string }>;
+    clients: (agentId?: string) => Promise<McpClientSetup[]>;
+    install: (clientId: McpClientId, agentId: string) => Promise<McpInstallResult>;
+    uninstall: (clientId: McpClientId, agentId: string) => Promise<McpInstallResult>;
+    copyConfig: (clientId: McpClientId, agentId: string) => Promise<{ ok: boolean; message?: string }>;
+    openConfigFolder: (clientId: McpClientId) => Promise<{ ok: boolean; message?: string }>;
+    closeAgentPaper: (agentId: string) => Promise<{
+      ok: boolean; message: string; closed?: unknown[]; open?: unknown[];
+    }>;
+    onOrder: (cb: (d: McpOrderEvent) => void) => () => void;
+    onToolCall: (cb: (d: McpToolCallEvent) => void) => () => void;
   };
   logs: {
     tail: (limit?: number) => Promise<LogEntry[]>;
@@ -1200,6 +1302,8 @@ export interface KryptApi {
     close: () => void;
     isMaximized: () => Promise<boolean>;
     onMaximizeChange: (cb: (max: boolean) => void) => () => void;
+    isVisible: () => Promise<boolean>;
+    onVisibility: (cb: (visible: boolean) => void) => () => void;
   };
 }
 
@@ -1396,6 +1500,7 @@ export interface PerpsStatus {
   link: {
     linked: boolean; expired: boolean; expiresAt: number | null;
     proxy: string | null; owner: string | null; walletPresent: boolean;
+    renewError?: string;
   };
   trading: boolean;
   haltReason: string;
@@ -1474,4 +1579,4 @@ export interface BiggestWinner {
   eventTitle: string;
   eventSlug: string;
   resolvedAt: number | null;
-}
+}

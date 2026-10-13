@@ -1,7 +1,7 @@
 httpx>=0.28.0
 cryptography>=42.0.0
 eth-account>=0.13.0
-py_clob_client_v2>=1.1.0
+py_clob_client_v2>=1.1.0,<1.2
 websockets>=12,<14
 keyring>=24
 anthropic>=1.0.0

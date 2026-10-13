@@ -495,7 +495,7 @@ const MIN_CONTRACTS = 5;
 const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<TraderConfig> }[] = [
   {
     id: 'sniper', name: 'Settlement Sniper',
-    hint: 'The validated config: only strike in the FINAL 2 MINUTES when the live-spot model is ≥99.85% sure (≈3σ) and the lagging book still leaves ≥2¢ of fee-net edge. Real-book replay: +3.2¢/contract, 91% win rate (n=151, Jul 3–5). Raising "Model certainty" back down (e.g. 0.5) turns this into early-window model-following, which measured NEGATIVE (−1.4¢/ct) — don\'t. Out-of-sample check 2026-09-01: on the 5-minute corpus (Jul 22–Aug 31, n=7,167, none of it in the fit window) every price band measured negative, −3.26¢/contract overall, and the 15-minute 95–100¢ band is +0.10¢ (t=0.3), statistically zero. Treat the numbers above as in-sample.',
+    hint: 'The tuned config: only strike in the FINAL 2 MINUTES when the live-spot model is ≥99.85% sure (≈3σ) and the lagging book still leaves ≥2¢ of fee-net edge. Its one measurement is in-sample and pre-TWAP: +3.2¢/contract, 91% win rate (n=151) on a real-book replay of 15m windows from Jul 3–5, the same panel it was tuned on, before the Aug 7 switch to Chainlink 60s-TWAP settlement and on data since pruned, so it cannot be re-run. It has no out-of-sample or post-TWAP measurement. Raising "Model certainty" back down (e.g. 0.5) turns this into early-window model-following, which measured negative on that same Jul 3–5 replay — don\'t.',
     patch: {
       ...C15_PRESET_CORE.sniper,
       crypto15mModelMinProb: 0.9985, crypto15mTimeDelayMin: 2, crypto15mEntryMax: 0.99,
@@ -506,7 +506,7 @@ const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<Trad
   },
   {
     id: 'sniper-5m', name: '5m Sniper (BTC)',
-    hint: 'Switches the engine to the 5-MINUTE BTC series (recording follows). Modeled on a verified profitable public bot (PRR "BTC5MScour", +$26.5k over 27 days, 95.8% win): in the final 2 minutes, when spot has moved ≥0.05% off the open, buy the 90–99¢ favorite and hold to settlement — never touch the 40–90¢ band (it measured −5.5% ROI even for that bot). NOT validated in this app: the identical trade measured ZERO edge on the 15m series, and that bot wins on sub-second execution. Let the recorder collect several days of 5m data and backtest it here BEFORE arming.',
+    hint: 'Switches the engine to the 5-MINUTE BTC series (recording follows). Modeled on a publicly documented bot (PRR "BTC5MScour"; its own published record, not measured here: +$26.5k over 27 days, 95.8% win, and −5.5% ROI on the 40–90¢ band it avoids): in the final 2 minutes, when spot has moved ≥0.05% off the open, buy the 90–99¢ favorite and hold to settlement. NOT validated in this app, and that bot wins on sub-second execution. The nearest measurement here is broader and negative: plain favorite-buying at each recorded 5m window\'s decision point, Jul 22–Aug 31 (n=7,167 windows, checked 2026-09-01, partly before the 5m series\' Aug 14 switch to TWAP settlement), measured −3.26¢/contract. Let the recorder collect several days of 5m data and backtest this preset here BEFORE arming.',
     patch: {
       ...C15_PRESET_CORE['sniper-5m'],
       crypto15mExitThreshold: 0, crypto15mStopLossPct: 0, crypto15mTakeProfit: 0,
@@ -526,12 +526,12 @@ const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<Trad
   },
   {
     id: 'favorite', name: 'Deep Favorite',
-    hint: 'Buy 95–98¢ favorites, hold to settle. Real-book replay: about −0.7¢/contract after fees (96% win rate doesn\'t clear the fee at these prices). Kept as a baseline to experiment against, not a recommendation.',
+    hint: 'Buy 95–98¢ favorites, hold to settle. Real-book replay of 15m windows from Jul 3–5 (~800 windows, in-sample, before the Aug 7 switch to TWAP settlement): about −0.7¢/contract after fees (a 96% win rate doesn\'t clear the fee at these prices). Kept as a baseline to experiment against, not a recommendation.',
     patch: { ...C15_PRESET_CORE.favorite, crypto15mPairedMode: false, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'taker' },
   },
   {
     id: 'fav-90-95', name: 'Favorite 90–95¢',
-    hint: 'Was the strongest pocket on Gamma-mid pricing (~99% win in-sample), but on REAL-book fills it measured −0.5¢/contract — the mid was phantom. Kept for comparison; validate before arming.',
+    hint: 'Was the strongest pocket on Gamma-mid pricing, but on REAL-book fills it measured −0.5¢/contract — the mid was phantom. Both figures: 15m windows from Jul 3–5 (~800 windows, in-sample, before the Aug 7 switch to TWAP settlement). Kept for comparison; validate before arming.',
     patch: { crypto15mInterval: '15m', crypto15mPairedMode: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.90, crypto15mEntryMax: 0.95, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'taker', crypto15mUseRules: false },
   },
 ];
@@ -554,7 +554,7 @@ function StrategySettings({
   const [saveProfileOpen, setSaveProfileOpen] = useState(false);
   const toast = useToast();
   const update = async (patch: Partial<TraderConfig>) => {
-    try { await window.krypt.config.update(patch); } catch {}
+    try { await window.krypt.config.update(patch); } catch { }
   };
   const saveProfile = async (name: string): Promise<void> => {
     setSaveProfileOpen(false);
@@ -1392,6 +1392,7 @@ const C15_SKIP_LABELS: Record<string, { label: string; tip: string }> = {
   no_liquidity: { label: 'no fill', tip: 'Taker crossed but found no resting liquidity at/under your price — 0 fill. Enter earlier (wider window) or use maker.' },
   favorite_flipped: { label: 'flipped', tip: 'Favorite fell below your Favorite≥ floor before the order landed — skipped.' },
   unfilled_expired: { label: 'expired', tip: "Order didn't fill before the window closed." },
+  paper_pulled: { label: 'pulled (Paper)', tip: 'The account went to Paper while this entry was still waiting to fill, so it was canceled. Paper completes no real buy.' },
   stop_loss: { label: 'stopped', tip: 'Stop-loss sold to flatten the position.' },
   take_profit: { label: 'took profit', tip: 'Take-profit cashed out — sold the position into the book at your target price.' },
   settlement_reconciled: { label: 'settled', tip: 'Booked from on-chain settlement after a missed/mis-marked fill.' },

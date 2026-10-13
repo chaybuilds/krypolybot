@@ -3,7 +3,9 @@ import { FlaskConical, Play } from 'lucide-react';
 import {
   Area, AreaChart, Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { C15_PRESET_CORE } from '@shared/c15Presets';
+import {
+  C15_PRESET_CORE, intervalDataWarning, noDataHeadline, replayInterval,
+} from '@shared/c15Presets';
 import type { CollectionStats, Crypto15mBacktest, TraderConfig } from '@shared/types';
 import { Card, Page, Switch } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
@@ -56,7 +58,7 @@ export function BacktestPage() {
   const loadCollection = async () => {
     try {
       setColl(await window.krypt.trading.collection());
-    } catch {}
+    } catch { }
   };
   useEffect(() => { void loadCollection(); }, []);
 
@@ -117,16 +119,32 @@ export function BacktestPage() {
       setErr(e?.message || String(e));
     } finally {
       setBusy(false);
+      void loadCollection();
     }
   };
 
   const isCryptoProfile = (scope?: string) => (scope ?? 'main') === 'crypto';
   const isMainProfile = (scope?: string) => (scope ?? 'main') === 'main';
 
+  const liveInterval = config?.crypto15mInterval ?? coll?.c15.recordingInterval;
+  const byInterval = coll?.c15.byInterval;
+  const c15OptionLabel = (name: string, patch: Partial<TraderConfig>) => {
+    const iv = replayInterval(patch, liveInterval);
+    const empty = byInterval ? (byInterval[iv]?.resolved ?? 0) === 0 : false;
+    return `${name} · ${iv}${empty ? ' (no data recorded)' : ''}`;
+  };
+  const c15DataWarning = engine === 'crypto15m'
+    ? intervalDataWarning(
+      replayInterval(resolvePatch(), liveInterval),
+      coll?.c15,
+      config?.crypto15mRecordSignals ?? true,
+    )
+    : null;
+
   return (
     <Page
       title="Backtest"
-      subtitle="While the bot runs it records every crypto up/down window (whichever interval you watch — 5m, 15m, or hourly) and every whale/momentum signal it sees, with outcomes. Test any strategy against that collected history — same entry gates as live, real Polymarket fees — and see WHEN the profit happens, not just how much."
+      subtitle="While the bot runs it records every crypto up/down window for the interval selected on the Crypto tab (5m, 15m, hourly or 4h — only that one) and every whale/momentum signal it sees, with outcomes. Test any strategy against that collected history — same entry gates as live, real Polymarket fees — and see WHEN the profit happens, not just how much."
     >
       <Card header={<div className="text-xs uppercase tracking-wider text-krypt-muted">Setup</div>}>
         <div className="flex flex-wrap items-end gap-4">
@@ -144,16 +162,18 @@ export function BacktestPage() {
                 onChange={(e) => setStratSel(e.target.value)}
                 className="rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
               >
-                <option value="current">Current settings</option>
+                <option value="current">{c15OptionLabel('Current settings', {})}</option>
                 <optgroup label="Presets">
                   {C15_STRATS.filter((st) => st.id !== 'current').map((st) => (
-                    <option key={st.id} value={`preset:${st.id}`}>{st.name}</option>
+                    <option key={st.id} value={`preset:${st.id}`}>{c15OptionLabel(st.name, st.patch)}</option>
                   ))}
                 </optgroup>
                 {profiles.some((pr) => isCryptoProfile(pr.scope)) && (
                   <optgroup label="My profiles">
                     {profiles.filter((pr) => isCryptoProfile(pr.scope)).map((pr) => (
-                      <option key={pr.id} value={`profile:${pr.id}`}>{pr.name}</option>
+                      <option key={pr.id} value={`profile:${pr.id}`}>
+                        {c15OptionLabel(pr.name, sliceProfile(pr.config, 'crypto15m'))}
+                      </option>
                     ))}
                   </optgroup>
                 )}
@@ -194,6 +214,9 @@ export function BacktestPage() {
             {busy ? 'Replaying…' : 'Run backtest'}
           </button>
         </div>
+        {c15DataWarning && (
+          <p className="mt-2 text-xs leading-relaxed text-krypt-warn">{c15DataWarning}</p>
+        )}
         {err && <p className="mt-2 text-xs text-krypt-loss">{err}</p>}
       </Card>
 
@@ -308,7 +331,17 @@ export function BacktestPage() {
       {res && res.windowsScanned === 0 && (
         <Card className="mt-4">
           <div className="py-4 text-center">
-            <div className="text-sm font-semibold text-white">No collected data yet</div>
+            <div className="text-sm font-semibold text-white">{noDataHeadline(res.noData)}</div>
+            {res.noData?.recordingInterval && res.noData.reason !== 'assets' && (
+              <div className="mt-1.5 flex flex-wrap justify-center gap-1.5">
+                <span className="rounded bg-krypt-surface2 px-1.5 py-0.5 font-mono text-[10px] text-krypt-dim">
+                  strategy needs {res.noData.interval}
+                </span>
+                <span className="rounded bg-krypt-surface2 px-1.5 py-0.5 font-mono text-[10px] text-krypt-dim">
+                  {res.noData.recordingOn === false ? 'collection off' : `recording ${res.noData.recordingInterval}`}
+                </span>
+              </div>
+            )}
             {res.caveats?.length ? (
               <p className="mx-auto mt-1 max-w-md text-xs leading-relaxed text-krypt-dim">{res.caveats[0]}</p>
             ) : (
@@ -342,8 +375,8 @@ export function BacktestPage() {
           <div className="mt-4 grid grid-cols-2 gap-2 text-xs sm:grid-cols-6">
             <Stat label="Trades" value={`${res.n}`} sub={`${res.windowsScanned} ${engine === 'crypto15m' ? 'windows' : 'signals'} scanned`} />
             <Stat label="Win rate" value={res.n ? `${(res.winRate * 100).toFixed(1)}%` : '—'} />
-            <Stat label="Edge / contract" value={`${res.netEvCentsPerContract.toFixed(2)}¢`} tone={res.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
-            <Stat label="Total P&L" value={fmtUsd(res.totalPnlUsd, { sign: true })} tone={res.totalPnlUsd >= 0 ? 'good' : 'bad'} />
+            <Stat label="Edge / contract" value={res.n ? `${res.netEvCentsPerContract.toFixed(2)}¢` : '—'} tone={!res.n ? undefined : res.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
+            <Stat label="Total P&L" value={res.n ? fmtUsd(res.totalPnlUsd, { sign: true }) : '—'} tone={!res.n ? undefined : res.totalPnlUsd >= 0 ? 'good' : 'bad'} />
             <Stat label="Max drawdown" value={fmtUsd(res.maxDrawdownUsd)} tone="bad" />
             <Stat label="Days traded" value={`${res.byDay.length}`} />
           </div>

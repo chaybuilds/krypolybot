@@ -1,3 +1,9 @@
+"""Tests for the 15-minute crypto research logger + backtest.
+
+Covers the pure strategy evaluation (favorite vs contrarian, price/delta
+filters), the settled-outcome reader, the whole-window tick logger, and
+the DB round-trip that feeds the CLI 15m backtest.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +34,7 @@ def _sig(fav, fav_price, fav_won, *, entry_cost=None, delta_pct=0.1):
         "delta_pct": delta_pct,
         "mins_left": 7.0,
     }
+
 
 
 def test_favorite_mode_wins_count_as_correct():
@@ -73,6 +80,20 @@ def test_report_structure_and_collecting_verdict():
     assert len(rep["favoriteSweep"]) == len(backtest._FAV_THRESHOLDS)
     assert "macdBreakdown" in rep
     assert "COLLECTING DATA" in rep["verdict"]
+
+
+def test_report_header_names_the_recorded_interval():
+    """`backtest.py --c15 --interval 5m` used to print "15-minute crypto
+    backtest" and "settled 15m signals" over a 5m corpus."""
+    sigs = [_sig("up", 0.8, True) for _ in range(5)]
+    text = backtest.format_crypto15m_report(
+        backtest.crypto15m_report(sigs, interval="5m"), "test.db")
+    head = "\n".join(text.splitlines()[:5])
+    assert "recording interval: 5m" in head
+    assert "settled 5m signals: 5" in head
+    assert "15m" not in head and "15-minute" not in head
+    assert "5m" in backtest.crypto15m_report(sigs, interval="5m")["verdict"]
+
 
 
 def _macd_sig(fav, fav_won, macd_hist):
@@ -124,6 +145,7 @@ def test_macd_fields_survive_db_roundtrip(fresh_db):
     assert s["rsi"] == pytest.approx(64.5)
 
 
+
 def test_settled_up_won_reads_result_and_value():
     assert crypto15m_record._settled_up_won({"result": "yes"}) is True
     assert crypto15m_record._settled_up_won({"result": "no"}) is False
@@ -132,6 +154,7 @@ def test_settled_up_won_reads_result_and_value():
     assert crypto15m_record._settled_up_won(
         {"status": "finalized", "settlement_value": 0}) is False
     assert crypto15m_record._settled_up_won({"status": "active", "result": ""}) is None
+
 
 
 def test_signal_db_roundtrip(fresh_db):
@@ -153,6 +176,7 @@ def test_signal_db_roundtrip(fresh_db):
     s = loaded[0]
     assert s["favorite"] == "down" and s["fav_won"] is True
     assert s["entry_cost"] == pytest.approx(0.66)
+
 
 
 def test_record_tick_logs_ticks_and_decision_points(fresh_db, monkeypatch):
@@ -220,6 +244,7 @@ def test_record_tick_captures_indicator_fields(fresh_db, monkeypatch):
     assert sig["macd_cross"] == 1 and sig["macd_hist"] == pytest.approx(0.3)
 
 
+
 def test_ws_up_price_and_fav_ask():
     yes = {"bid_cents": 94, "ask_cents": 96}
     no = {"bid_cents": 4, "ask_cents": 6}
@@ -235,14 +260,16 @@ def test_ws_up_price_rejects_unusable_book():
     assert round(crypto15m._ws_up_price({"bid_cents": 94, "ask_cents": 96}, None), 4) == 0.95
 
 
-def _one_market_cfg(monkeypatch, *, ws_quotes):
+def _one_market_cfg(monkeypatch, *, ws_quotes, market=None):
+    """Stub fetch_crypto_updown to one market + the WS feed quotes; gate off the
+    extra detectors. Returns (cfg, now_epoch)."""
     now = 1_790_000_000.0
 
     async def _mkts(asset, interval, *, fast=False):
         return [{"ticker": "WS-T", "yes_token": "Y", "no_token": "N",
                  "yes_bid": 0.30, "yes_bid_dollars": 0.30,
                  "window_close_epoch": now + 300, "window_start_epoch": now - 300,
-                 "close_time": ""}]
+                 "close_time": "", **(market or {})}]
     monkeypatch.setattr(crypto15m.polymarket_api, "fetch_crypto_updown", _mkts)
     monkeypatch.setattr(crypto15m.clob_ws.feed, "start", lambda: None)
     monkeypatch.setattr(crypto15m.clob_ws.feed, "observe", lambda *a: None)
@@ -278,6 +305,21 @@ def test_snapshot_falls_back_to_gamma_when_feed_cold(monkeypatch):
     assert out["favorite"] == "down"
     assert round(out["favoritePrice"], 2) == 0.70
     assert out["wsAsk"] is None
+
+
+def test_gamma_fallback_prices_up_off_the_mid_not_the_bid(monkeypatch):
+    """The market dict now carries Gamma's real bid/ask. The up probability is
+    the mid; reading the bid would sit half a spread low and tilt every
+    near-even window toward "down"."""
+    cfg, now = _one_market_cfg(monkeypatch, ws_quotes={}, market={
+        "yes_bid_dollars": 0.47, "yes_ask_dollars": 0.55,
+        "last_price_dollars": 0.51,
+    })
+    out = asyncio.run(crypto15m._asset_snapshot(
+        {"asset": "ETH", "series": "X"}, 100.0, cfg, now))
+    assert out["priceSource"] == "gamma"
+    assert out["upProb"] == 0.51 and out["favorite"] == "up"
+
 
 
 def test_asset_indicators_computes_and_caches(monkeypatch):
@@ -326,7 +368,9 @@ def test_cleanup_prunes_old_ticks(fresh_db):
     assert rows == ["T-NEW"]
 
 
+
 def _seed_window(conn, ticker, asset, interval, up_won, *, ask=0.92):
+    """One resolved window with a real-book tick, ready for replay."""
     db.insert_crypto15m_signal(conn, {
         "ticker": ticker, "asset": asset, "series": f"{asset}-UPDOWN",
         "close_time": "2026-07-09T00:15:00Z", "mins_left": 1.5,
@@ -358,6 +402,8 @@ def _replay_cfg(interval):
 
 
 def test_replay_separates_interval_datasets(fresh_db):
+    """A 5m backtest must never fill against 15m rows (and vice versa) —
+    a user who switches the Crypto-tab interval accumulates both."""
     import replay
     with db.get_db() as conn:
         _seed_window(conn, "0xfive", "BTC", "5m", up_won=1)
@@ -372,6 +418,7 @@ def test_replay_separates_interval_datasets(fresh_db):
 
 
 def test_replay_treats_legacy_null_interval_as_15m(fresh_db):
+    """Rows recorded before the interval column shipped are all 15m."""
     import replay
     with db.get_db() as conn:
         _seed_window(conn, "0xlegacy", "BTC", "15m", up_won=1)
@@ -383,6 +430,8 @@ def test_replay_treats_legacy_null_interval_as_15m(fresh_db):
 
 
 def _seed_tp_window(conn, ticker, asset, interval, up_won, *, entry_ask, exit_bid):
+    """A resolved window with an ENTRY tick then a later tick whose bid pumped up,
+    so a percent take-profit would sell before settlement."""
     db.insert_crypto15m_signal(conn, {
         "ticker": ticker, "asset": asset, "series": f"{asset}-UPDOWN",
         "close_time": "2026-07-09T00:15:00Z", "mins_left": 2.5,
@@ -425,6 +474,9 @@ def _tp_cfg():
 
 
 def test_replay_simulates_percent_take_profit(fresh_db):
+    """A percent take-profit sells into the pumped bid instead of holding a
+    favorite that LOST to settlement — turning a settlement loss into a realized
+    win in replay (the whole point of the feature)."""
     import replay
     with db.get_db() as conn:
         _seed_tp_window(conn, "0xtp", "BTC", "15m", up_won=0, entry_ask=0.60, exit_bid=0.80)
@@ -443,6 +495,9 @@ def test_replay_simulates_percent_take_profit(fresh_db):
 
 
 def test_recorder_stamps_interval_and_scales_lookback(fresh_db):
+    """The recorder follows crypto15m_interval: rows are stamped with it and
+    the decision-point lookback sits at the same relative spot per window
+    (2.5 min for 5m — an 8-min lookback would capture 5m windows at birth)."""
     snap = {"assets": [{
         "hasMarket": True, "ticker": "0xa", "asset": "BTC",
         "series": "BTC-UPDOWN", "closeTime": "2026-07-09T00:05:00Z",
@@ -458,6 +513,7 @@ def test_recorder_stamps_interval_and_scales_lookback(fresh_db):
         tick = conn.execute("SELECT interval FROM crypto15m_ticks").fetchone()
     assert sig["interval"] == "5m"
     assert tick["interval"] == "5m"
+
 
 
 def test_live_velocity_needs_history(monkeypatch):

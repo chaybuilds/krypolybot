@@ -1,3 +1,11 @@
+"""Money rails and lifecycle for the user-script engine.
+
+The Scripts page advertises these caps as HARD, and they apply to EVERY
+script. Removing the language sandbox did not touch them: a script is
+ordinary Python that returns an intent, and the intent is what the rails
+gate. This file pins each rail to that promise, plus the return-value
+sanitizers and the hook lifecycle.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +36,7 @@ def fresh_db(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clean_engine_globals(monkeypatch):
+    """The engine keeps process-level registries; isolate them per test."""
     monkeypatch.setattr(script_engine, "_compiled", {}, raising=False)
     monkeypatch.setattr(script_engine, "_notified_fill", set(), raising=False)
     monkeypatch.setattr(script_engine, "_notified_settle", set(), raising=False)
@@ -44,6 +53,7 @@ def _clean_engine_globals(monkeypatch):
 
 @pytest.fixture
 def placed(monkeypatch):
+    """Capture every order the engine tries to place; never touch the network."""
     calls: list[dict] = []
 
     async def _place(**kw):
@@ -85,8 +95,10 @@ def _script(sid="s1abc", **over) -> dict:
     return s
 
 
+
 @pytest.fixture
 def emitted(monkeypatch):
+    """Capture every event the engine pushes to the UI."""
     events: list[tuple[str, dict]] = []
 
     async def _emit(name, data):
@@ -102,6 +114,8 @@ def _mod(code: str = "def decide(ctx):\n    return None\n"):
 
 
 def test_heartbeat_lists_only_the_hooks_the_script_defines():
+    """A decide()-only script should not have to read past three '×0'
+    entries for hooks it never wrote."""
     line = script_engine._heartbeat_line(
         {"ticks": 12, "decide": 84, "decide_intents": 0, "decide_market_hooked": 0},
         shadow=True, open_count=0, day_pnl=0.0)
@@ -122,6 +136,8 @@ def test_heartbeat_reports_orders_refusals_and_errors():
 
 
 def test_heartbeat_says_one_intent_not_one_intents():
+    """This line is read by a human every minute; it should not read like a
+    debug dump."""
     line = script_engine._heartbeat_line(
         {"ticks": 1, "decide": 1, "decide_intents": 1, "placed": 1,
          "errors": 1},
@@ -139,6 +155,8 @@ def test_heartbeat_says_shadow_orders_when_the_script_is_in_shadow():
 
 
 def test_heartbeat_fires_on_the_first_tick_so_the_panel_is_never_empty(emitted):
+    """Waiting a full interval before the first line is exactly the silence
+    this feature exists to remove."""
     script_engine._hb_note("s1abc", "ticks")
     script_engine._hb_note("s1abc", "decide", 7)
     asyncio.run(script_engine._maybe_heartbeat(
@@ -167,6 +185,7 @@ def test_heartbeat_resets_its_counters_after_emitting(emitted):
 
 
 def test_heartbeat_never_breaks_a_trading_pass(monkeypatch, emitted):
+    """Observability must not be able to take down the engine loop."""
     async def _boom(name, data):
         raise RuntimeError("event bus down")
 
@@ -175,8 +194,12 @@ def test_heartbeat_never_breaks_a_trading_pass(monkeypatch, emitted):
         _script(), _mod(), shadow=True, open_count=0, day_pnl=0.0))
 
 
+
 def test_a_rails_refused_market_is_not_reoffered_immediately(fresh_db, placed,
                                                              monkeypatch):
+    """A 99c favourite against a 97c cap used to be re-quoted and re-refused
+    on every 5s tick, forever — one market alone wrote ~12 log lines a
+    minute and burned a CLOB quote for each."""
     quotes: list[str] = []
 
     async def _quote(ticker, side):
@@ -195,6 +218,8 @@ def test_a_rails_refused_market_is_not_reoffered_immediately(fresh_db, placed,
 
 
 def test_the_cooldown_expires_so_a_moved_price_is_reconsidered(monkeypatch):
+    """Unlike a 15-minute crypto window a market lives for days; one refusal
+    must not retire it for good."""
     script_engine._cool_off("s1abc", "0xmkt", "too expensive")
     assert script_engine._in_cooldown("s1abc", "0xmkt") is True
     script_engine._market_cooldown[("s1abc", "0xmkt")] = time.time() - 1
@@ -221,6 +246,7 @@ def test_forget_drops_heartbeat_state():
     script_engine.forget("s1abc")
     assert "s1abc" not in script_engine._hb
     assert "s1abc" not in script_engine._hb_last
+
 
 
 @pytest.mark.parametrize("raw,expect", [
@@ -304,6 +330,7 @@ def test_sanitize_signal_action_rejects_malformed_returns(raw):
     assert out is None and err
 
 
+
 def test_entry_above_the_price_cap_is_refused(fresh_db, placed):
     cfg = _cfg(script_max_entry_cents=60)
     intent = {"side": "up", "price": 75}
@@ -335,6 +362,7 @@ def test_crossing_the_ask_without_a_real_book_places_nothing(fresh_db, placed):
         assert conn.execute("SELECT COUNT(*) FROM crypto15m_positions").fetchone()[0] == 0
 
 
+
 def test_size_above_the_contract_cap_is_clamped(fresh_db, placed):
     cfg = _cfg(script_max_contracts=7)
     intent = {"side": "up", "price": 50, "size": 999}
@@ -344,6 +372,13 @@ def test_size_above_the_contract_cap_is_clamped(fresh_db, placed):
 
 
 def test_contract_cap_below_the_exchange_minimum_is_never_exceeded(fresh_db, placed):
+    """A cap the engine cannot honor must REFUSE, not silently overshoot.
+
+    The exchange floor is 5 contracts. With a user cap below that, the old
+    code raised the order to 5 — 5x the rail the UI advertises as hard —
+    while the adjacent min-notional branch was scrupulous about refusing in
+    exactly this situation.
+    """
     cfg = _cfg(script_max_contracts=2)
     intent = {"side": "up", "price": 90, "size": 1}
     out = asyncio.run(script_engine._place_intent(_script(), _asset(), intent, cfg, ENV))
@@ -366,6 +401,10 @@ def test_min_notional_shortfall_refuses_when_it_would_break_the_cap(fresh_db, pl
 
 
 def test_backtest_contract_floor_matches_the_live_engine():
+    """script_backtest duplicates the exchange floor as a literal to stay
+    'structurally order-free' (importing crypto15m_trader would pull in
+    polymarket_api). Pin the two so a change to one can't silently make the
+    backtest model a size live would never place."""
     import script_backtest
     assert script_backtest.MIN_CONTRACTS == crypto15m_trader._C15_MIN_CONTRACTS
 
@@ -376,6 +415,7 @@ def test_min_notional_is_met_when_the_cap_has_room(fresh_db, placed):
     asyncio.run(script_engine._place_intent(_script(), _asset(), intent, cfg, ENV))
     assert len(placed) == 1
     assert placed[0]["count"] * 5 / 100.0 >= crypto15m_trader._MIN_ORDER_NOTIONAL_USD
+
 
 
 def _shadow_rows(sid="s1abc"):
@@ -402,6 +442,8 @@ def test_shadow_entry_records_the_order_and_places_nothing(fresh_db, placed):
 
 
 def test_shadow_runs_the_same_rails_as_live(fresh_db, placed):
+    """A rail refusal in shadow must look exactly like a rail refusal live —
+    otherwise the shadow track record overstates what live would have done."""
     s = _script(dry_run=1)
     cfg = _cfg(script_max_entry_cents=50)
     out = asyncio.run(script_engine._place_intent(
@@ -480,6 +522,10 @@ def test_shadow_settlement_charges_fees_on_a_loss(fresh_db):
 
 
 def test_market_shadow_orders_settle_from_the_recorded_market_result(fresh_db):
+    """decide_market() rows carry no signal id, so they settle against the
+    market's own outcome. They used to match nothing and stay open FOREVER:
+    no track record (the arm modal read a clean 0W/0L) and a permanently
+    consumed open-position slot, which gates every hook the script has."""
     with db.get_db() as conn:
         db.insert_script_shadow(conn, {
             "script_id": "s1abc", "source": "signal",
@@ -503,6 +549,7 @@ def test_market_shadow_orders_settle_from_the_recorded_market_result(fresh_db):
 
 
 def test_market_shadow_loss_settles_from_settlement_value(fresh_db):
+    """Settled on-chain but the text result lagged — snap to settlement_value."""
     with db.get_db() as conn:
         db.insert_script_shadow(conn, {
             "script_id": "s1abc", "source": "signal",
@@ -523,6 +570,9 @@ def test_market_shadow_loss_settles_from_settlement_value(fresh_db):
 
 
 def test_stale_shadow_orders_stop_consuming_the_open_cap(fresh_db):
+    """Belt and braces for the same failure: a row whose outcome was never
+    recorded (source aged out, recording switched off) must not hold a cap slot
+    for the rest of time."""
     with db.get_db() as conn:
         db.insert_script_shadow(conn, {
             "script_id": "s1abc", "source": "signal",
@@ -540,6 +590,8 @@ def test_stale_shadow_orders_stop_consuming_the_open_cap(fresh_db):
 
 
 def test_unresolved_windows_leave_shadow_orders_open(fresh_db):
+    """A window that closed recently but has no recorded outcome yet is still
+    legitimately pending — the recorder may simply not have caught up."""
     import datetime
     recent = (datetime.datetime.now(datetime.timezone.utc)
               - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -551,6 +603,11 @@ def test_unresolved_windows_leave_shadow_orders_open(fresh_db):
 
 
 def test_a_long_stale_shadow_order_is_retired_rather_than_left_open(fresh_db):
+    """...but one still unresolved a WEEK after close is abandoned, not held.
+
+    Open shadow rows count against script_max_open, which gates every hook, so
+    rows that can never resolve would otherwise retire the whole script. It is
+    booked as UNKNOWN (no win/loss, no P&L) rather than guessed at."""
     s = _script(dry_run=1)
     asyncio.run(script_engine._place_intent(
         s, _asset(closeTime="2026-07-01T00:00:00Z"),
@@ -601,6 +658,7 @@ def test_arming_a_script_persists(fresh_db):
     with db.get_db() as conn:
         db.update_user_script(conn, "sArm", dry_run=0)
         assert db.get_user_script(conn, "sArm")["dry_run"] == 0
+
 
 
 def _market(**over) -> dict:
@@ -658,6 +716,8 @@ def test_sanitize_market_intent_rejects_malformed_intents(raw):
 
 
 def test_market_universe_excludes_crypto_updown_windows(fresh_db):
+    """decide() already owns those windows; letting decide_market see them
+    too would let one script enter the same window twice."""
     with db.get_db() as conn:
         db.upsert_market(conn, {
             "ticker": "0xbig", "title": "Will X happen?", "slug": "will-x",
@@ -682,6 +742,9 @@ def _hours_from_now(h: float) -> str:
 
 
 def test_market_universe_drops_markets_that_already_closed(fresh_db):
+    """scanner.py refuses to refresh a market past its close_time, so an
+    expired row keeps its last-seen price and volume forever and squats the
+    volume ranking. Those rows are not tradeable and must never be offered."""
     with db.get_db() as conn:
         db.upsert_market(conn, {
             "ticker": "0xdead", "title": "Yesterday's game", "slug": "dead",
@@ -699,6 +762,8 @@ def test_market_universe_drops_markets_that_already_closed(fresh_db):
 
 
 def test_market_universe_keeps_rows_with_no_close_time(fresh_db):
+    """"Unknown" is not "expired" — a row Gamma gave no end date for is still
+    a live market, and the old universe offered it."""
     with db.get_db() as conn:
         db.upsert_market(conn, {
             "ticker": "0xundated", "title": "T", "slug": "undated",
@@ -710,6 +775,9 @@ def test_market_universe_keeps_rows_with_no_close_time(fresh_db):
 
 
 def test_market_universe_reserves_half_the_budget_for_imminent_markets(fresh_db):
+    """Volume rank alone selects long-dated futures, which no event-driven
+    strategy can trade. Half the budget goes to markets closing soon, and it
+    comes first so an entry that cannot wait is considered before the cap."""
     with db.get_db() as conn:
         for i in range(10):
             db.upsert_market(conn, {
@@ -731,6 +799,8 @@ def test_market_universe_reserves_half_the_budget_for_imminent_markets(fresh_db)
 
 
 def test_market_universe_spends_the_whole_budget_when_nothing_closes_soon(fresh_db):
+    """A quiet board must not shrink the universe to half — the unspent
+    closing-soon half falls back to the general slice."""
     with db.get_db() as conn:
         for i in range(6):
             db.upsert_market(conn, {
@@ -744,6 +814,9 @@ def test_market_universe_spends_the_whole_budget_when_nothing_closes_soon(fresh_
 
 
 def test_market_universe_never_repeats_a_market_across_the_two_slices(fresh_db):
+    """A market that is both busiest and closing soon appears in both
+    queries; a script must still be asked about it exactly once, or the
+    one-entry-per-market rule is the only thing left stopping a double buy."""
     with db.get_db() as conn:
         db.upsert_market(conn, {
             "ticker": "0xboth", "title": "Big game tonight", "slug": "both",
@@ -788,6 +861,10 @@ def test_market_entry_places_through_the_rails(fresh_db, placed):
 
 
 def test_failed_market_entry_is_recorded_and_not_resubmitted(fresh_db, monkeypatch):
+    """An exchange failure must leave a terminal row + a cooldown. Returning
+    bare left NO trace, so the identical intent went back to the exchange every
+    poll (~5s) forever — and if the order actually landed and only the response
+    was lost, the retry opened a SECOND real position."""
     calls: list[dict] = []
 
     async def _boom(**kw):
@@ -897,6 +974,8 @@ def test_one_entry_per_market_per_script(fresh_db, placed):
 
 
 def test_two_scripts_can_follow_the_same_market(fresh_db, placed):
+    """bot_positions is UNIQUE(signal_source, signal_id, network) — the key
+    must be scoped per script or the second script's insert collides."""
     for sid in ("scriptA", "scriptB"):
         out = asyncio.run(script_engine._place_market_intent(
             _script(sid, dry_run=0), _market(),
@@ -904,6 +983,7 @@ def test_two_scripts_can_follow_the_same_market(fresh_db, placed):
         assert out is not None, f"{sid} failed to record its position"
     with db.get_db() as conn:
         assert conn.execute("SELECT COUNT(*) FROM bot_positions").fetchone()[0] == 2
+
 
 
 def test_supervise_rejects_keys_outside_the_whitelist():
@@ -914,6 +994,8 @@ def test_supervise_rejects_keys_outside_the_whitelist():
 
 
 def test_supervise_may_disable_engines_but_never_enable_them():
+    """Turning an engine OFF is risk-off; turning one ON would deploy the
+    account through an engine that has none of the per-script rails."""
     patch, notes = script_engine._sanitize_supervise({"set": {"enable_trading": True}})
     assert patch == {}
     assert any("not on" in n for n in notes)
@@ -946,6 +1028,9 @@ def test_supervise_rejects_a_malformed_return(raw):
 
 
 def test_supervise_does_not_run_in_shadow_mode(emitted):
+    """supervise() is the one hook that reaches OUTSIDE the script — it rewrites
+    the live engine's config. A script the UI badges "shadow" must not be able
+    to retune the real crypto engine; the user green-lit a simulation."""
     mod = _mod(
         "def decide(ctx):\n    return None\n"
         "def supervise(app):\n"
@@ -970,6 +1055,7 @@ def test_heartbeat_says_supervise_was_skipped_in_shadow():
         {"ticks": 4, "supervise_skipped_shadow": 4},
         shadow=True, open_count=0, day_pnl=0.0)
     assert "supervise skipped (shadow)" in line
+
 
 
 def _add_crypto_pos(sid, *, pnl=None, resolved=0, filled=0, status="filled"):
@@ -1018,6 +1104,7 @@ def test_a_refusal_row_consumes_the_window(fresh_db):
         assert script_engine._already_attempted(conn, "sC", "0xtick") is True
 
 
+
 def _install_script(sid, code, **over):
     with db.get_db() as conn:
         row = {"id": sid, "name": "n", "description": "", "code": code,
@@ -1040,6 +1127,10 @@ def test_state_round_trips_through_the_database(fresh_db):
 
 
 def test_oversized_state_never_overwrites_good_state_with_broken_json(fresh_db):
+    """Truncating json.dumps() mid-string yields INVALID json, which silently
+    resets the strategy's memory to {} on the next load — and destroys the
+    last good snapshot on the way. An oversized state must be dropped, not
+    truncated."""
     _install_script("sE", "def decide(ctx):\n    return None\n")
     with db.get_db() as conn:
         row = db.get_user_script(conn, "sE")
@@ -1067,6 +1158,7 @@ def test_non_serializable_state_is_dropped_not_fatal(fresh_db):
         assert json.loads(db.get_user_script(conn, "sF")["state_json"]) == {}
 
 
+
 def test_compile_failure_disables_the_script_and_records_why(fresh_db):
     _install_script("sG", "def decide(ctx)\n    return None\n", enabled=1)
     with db.get_db() as conn:
@@ -1079,6 +1171,7 @@ def test_compile_failure_disables_the_script_and_records_why(fresh_db):
 
 
 def test_a_script_that_imports_the_stdlib_compiles_fine(fresh_db):
+    """The sandbox is gone: an import must no longer disable a script."""
     _install_script(
         "sG2", "import json\ndef decide(ctx):\n    return None\n", enabled=1)
     with db.get_db() as conn:
@@ -1089,9 +1182,13 @@ def test_a_script_that_imports_the_stdlib_compiles_fine(fresh_db):
 
 
 def test_a_hook_that_hangs_is_abandoned_not_awaited_forever(fresh_db):
+    """Scripts run untraced, so this thread timeout is the ONLY containment
+    between a runaway hook and a frozen master loop. It must return control
+    to the engine no matter what the hook is doing."""
     with pytest.raises(script_engine.script_sandbox.ScriptBudgetExceeded):
         script_engine._run_bounded(lambda: __import__("time").sleep(5),
                                    0.2, "hang-test")
+
 
 
 def test_on_fill_and_on_settle_fire_for_crypto_positions(fresh_db):
@@ -1118,6 +1215,8 @@ def test_on_fill_and_on_settle_fire_for_crypto_positions(fresh_db):
 
 
 def test_fill_notifications_are_not_confused_across_the_two_tables(fresh_db):
+    """The tables have independent id sequences, so the seen-key must be
+    namespaced — otherwise crypto row 1 silently suppresses signal row 1."""
     code = (
         "def decide(ctx):\n    return None\n"
         "def on_fill(position, state):\n"
@@ -1154,6 +1253,9 @@ def test_forget_releases_a_deleted_scripts_module(fresh_db):
 
 
 def test_on_fill_fires_for_signal_follow_positions_too(fresh_db):
+    """decide_signal() follows land in bot_positions. The hooks are
+    documented without qualification, and both tables carry script_id, so a
+    script that follows signals must still see its own fills."""
     code = (
         "def decide_signal(signal):\n    return None\n"
         "def on_fill(position, state):\n"
@@ -1177,7 +1279,10 @@ def test_on_fill_fires_for_signal_follow_positions_too(fresh_db):
     assert mod.state.get("filled") == 1
 
 
+
 def _all_engines_off() -> dict:
+    """A config with every OTHER engine switched off, and every collection
+    toggle a script used to depend on turned off too."""
     return {
         "enable_trading": False,
         "crypto15m_enabled": False,
@@ -1208,6 +1313,8 @@ def _snapshot_of(*assets: str) -> dict:
 
 @pytest.fixture
 def engine_stubs(monkeypatch):
+    """Isolate run_tick from the network: a fixed snapshot, a fixed env, no
+    balance call. Everything else is the real engine."""
     import crypto15m
     import polymarket_api
     import polymarket_auth
@@ -1232,6 +1339,12 @@ def engine_stubs(monkeypatch):
 
 
 def test_a_shadow_script_trades_with_every_other_engine_off(fresh_db, engine_stubs):
+    """The headline claim: no other engine has to be switched on.
+
+    Main engine off, crypto engine off, copy off, signal collection off,
+    the 15m tab pinned to BTC only, and the scripts master switch off. A
+    shadow script must still tick, still see every coin, and still record
+    the orders it would have placed."""
     _install_script("indep", (
         "def decide(ctx):\n"
         "    log('saw ' + ctx['asset'])\n"
@@ -1250,6 +1363,7 @@ def test_a_shadow_script_trades_with_every_other_engine_off(fresh_db, engine_stu
 
 
 def test_a_scoped_script_sees_only_its_own_coins(fresh_db, engine_stubs):
+    """And the scope that DOES apply is the script's own."""
     _install_script("scoped", (
         "def decide(ctx):\n"
         "    return {'side': 'up', 'price': 'ask'}\n"
@@ -1266,6 +1380,8 @@ def test_a_scoped_script_sees_only_its_own_coins(fresh_db, engine_stubs):
 
 def test_an_armed_script_is_parked_when_the_master_switch_is_off(
         fresh_db, engine_stubs, monkeypatch):
+    """It must place nothing AND record nothing — diverting an armed script's
+    orders into the shadow ledger would corrupt that ledger's track record."""
     import polymarket_api
 
     async def _boom(**kw):
@@ -1290,6 +1406,7 @@ def test_an_armed_script_is_parked_when_the_master_switch_is_off(
 
 def test_the_master_switch_lets_the_same_script_trade(fresh_db, engine_stubs,
                                                       placed):
+    """...and flipping it on is the only thing that changes."""
     _install_script("armed2", (
         "def decide(ctx):\n"
         "    return {'side': 'up', 'price': 'ask'}\n"
@@ -1309,6 +1426,9 @@ def test_the_master_switch_lets_the_same_script_trade(fresh_db, engine_stubs,
 
 def test_a_signal_script_keeps_the_collector_alive_with_the_main_engine_off(
         fresh_db, engine_stubs):
+    """decide_signal reads rows the main engine's scanners write. With
+    main_record_signals and enable_trading both off nothing wrote them, so the
+    script starved. After one tick the engine must be asking for the feed."""
     _install_script("sig", (
         "def decide_signal(signal):\n"
         "    return None\n"
@@ -1332,6 +1452,8 @@ def test_a_crypto_only_script_does_not_ask_for_the_signal_feed(
 
 def test_no_crypto_hook_means_no_crypto_snapshot_fanout(fresh_db, engine_stubs,
                                                         monkeypatch):
+    """A signal-only script must not drive the ~7-calls-per-series crypto
+    fan-out just by being enabled."""
     import crypto15m
     calls = []
 
@@ -1348,6 +1470,7 @@ def test_no_crypto_hook_means_no_crypto_snapshot_fanout(fresh_db, engine_stubs,
     assert calls == []
 
 
+
 def test_notional_cap_keeps_a_fill_inside_the_size_rail():
     cap = script_engine._notional_capped
     n = cap(20, 21, 20, 20)
@@ -1356,6 +1479,8 @@ def test_notional_cap_keeps_a_fill_inside_the_size_rail():
 
 
 def test_notional_cap_is_a_no_op_on_a_tight_cross():
+    """It must not shrink ordinary orders — a 1c markup over a fresh ask is
+    the normal case and has essentially no overshoot."""
     cap = script_engine._notional_capped
     for req, lim, ask in ((5, 21, 20), (5, 32, 31), (10, 51, 50)):
         assert cap(req, lim, ask, 20) == req, (req, lim, ask)
@@ -1367,7 +1492,10 @@ def test_notional_cap_survives_a_missing_quote():
     assert cap(5, 99, 1, 20) is None
 
 
+
 def test_notional_cap_refuses_when_it_would_break_the_contract_floor():
+    """script_max_contracts=5, ask 60c -> limit 61c: 5*60//61 = 4 contracts,
+    under the 5-contract market minimum. Old code returned 4 and sent it."""
     cap = script_engine._notional_capped
     floor = crypto15m_trader._C15_MIN_CONTRACTS
     assert (5 * 60) // 61 == 4 < floor
@@ -1375,6 +1503,8 @@ def test_notional_cap_refuses_when_it_would_break_the_contract_floor():
 
 
 def test_notional_cap_refuses_when_it_would_break_the_min_notional():
+    """script_max_contracts=6, ask 17c -> limit 18c: 6*17//18 = 5 contracts
+    = $0.90, under the venue's $1.00 marketable-order minimum."""
     cap = script_engine._notional_capped
     assert (6 * 17) // 18 == 5 and 5 * 18 / 100.0 < 1.0
     assert cap(6, 18, 17, 6, floor=5) is None
@@ -1389,6 +1519,11 @@ def test_notional_cap_refusal_reason_names_the_rail():
 
 def test_the_live_entry_path_requotes_before_crossing(fresh_db, engine_stubs,
                                                       placed, monkeypatch):
+    """The snapshot ask is stale; the order must be priced off a FRESH quote.
+
+    Snapshot says 90c, the real book says 30c. The submitted limit must follow
+    the real book (31c), not the snapshot (91c) — that gap is exactly what
+    bought 40% extra size on the live account."""
     import polymarket_api
 
     async def _quote(_ticker, _side):
@@ -1410,6 +1545,9 @@ def test_the_live_entry_path_requotes_before_crossing(fresh_db, engine_stubs,
 
 def test_a_live_entry_is_refused_when_the_balance_cannot_fund_it(
         fresh_db, engine_stubs, placed, monkeypatch):
+    """The built-in crypto engine skips an unaffordable order; this path used
+    to SEND it and let the exchange bounce it, leaving a terminal `error` row
+    that reads like a malfunction. It must refuse before the exchange call."""
     import trader
 
     async def _broke(_cfg, force=False):
@@ -1436,6 +1574,7 @@ def test_a_live_entry_is_refused_when_the_balance_cannot_fund_it(
 
 def test_an_affordable_entry_still_goes_through(fresh_db, engine_stubs, placed,
                                                 monkeypatch):
+    """The affordability guard must not block a funded order."""
     import trader
 
     async def _ok(_cfg, force=False):
@@ -1454,6 +1593,8 @@ def test_an_affordable_entry_still_goes_through(fresh_db, engine_stubs, placed,
 
 
 def test_shadow_ignores_the_balance(fresh_db, engine_stubs, monkeypatch):
+    """Shadow spends nothing, so a flat balance must not stop it building a
+    track record — that record is the whole point of an unfunded account."""
     import trader
 
     async def _broke(_cfg, force=False):
@@ -1472,6 +1613,7 @@ def test_shadow_ignores_the_balance(fresh_db, engine_stubs, monkeypatch):
     assert [r for r in rows if not r["refused"]], "shadow was blocked by balance"
 
 
+
 def _mk_shadow(sid, ticker, side, *, cents=90, contracts=10, close_time):
     with db.get_db() as conn:
         return db.insert_script_shadow(conn, {
@@ -1487,6 +1629,7 @@ def _fee(_cost, _category):
 
 
 def test_market_shadow_settles_from_the_live_api_not_the_local_table(fresh_db):
+    """The ticker is absent from `markets` entirely — exactly the live case."""
     _mk_shadow("mk", "0xgone", "yes", close_time="2026-07-27T03:00:00Z")
     with db.get_db() as conn:
         assert conn.execute(
@@ -1512,6 +1655,8 @@ def test_a_losing_market_shadow_books_the_loss(fresh_db):
 
 
 def test_an_unresolvable_row_is_retired_so_it_stops_eating_the_cap(fresh_db):
+    """The backstop. Without it, a market whose outcome never arrives blocks
+    the script forever — the open cap gates every hook, not just this one."""
     _mk_shadow("mk", "0xstuck", "yes", close_time="2026-07-01T00:00:00Z")
     with db.get_db() as conn:
         n = db.resolve_script_shadow(conn, _fee, market_results={}, stale_days=7)
@@ -1527,6 +1672,8 @@ def test_an_unresolvable_row_is_retired_so_it_stops_eating_the_cap(fresh_db):
 
 
 def test_a_recent_unresolved_row_is_left_alone(fresh_db):
+    """Only LONG-stale rows are retired — a game that closed an hour ago is
+    still legitimately pending."""
     import datetime
     soon = (datetime.datetime.now(datetime.timezone.utc)
             - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1538,6 +1685,8 @@ def test_a_recent_unresolved_row_is_left_alone(fresh_db):
 
 
 def test_stuck_rows_no_longer_retire_a_script(fresh_db):
+    """The end-to-end consequence: five stuck rows against a cap of 2 blocked
+    every hook. After settlement the script can trade again."""
     for i in range(5):
         _mk_shadow("blocked", f"0xold{i}", "yes",
                    close_time="2026-07-01T00:00:00Z")
@@ -1548,6 +1697,8 @@ def test_stuck_rows_no_longer_retire_a_script(fresh_db):
 
 
 def test_crypto_shadow_settlement_is_unaffected(fresh_db):
+    """The crypto branch reads recorded window outcomes and must keep working
+    without any API lookup at all."""
     with db.get_db() as conn:
         db.insert_script_shadow(conn, {
             "script_id": "cy", "source": "crypto", "asset": "BTC",
@@ -1565,6 +1716,7 @@ def test_crypto_shadow_settlement_is_unaffected(fresh_db):
         r = dict(conn.execute(
             "SELECT * FROM script_shadow_orders WHERE ticker='0xwin'").fetchone())
     assert r["outcome_correct"] == 1 and r["pnl_usd"] > 0
+
 
 
 def test_a_resting_script_limit_is_booked_as_a_maker(fresh_db, monkeypatch):
@@ -1588,6 +1740,7 @@ def test_a_resting_script_limit_is_booked_as_a_maker(fresh_db, monkeypatch):
 
 def test_a_crossing_script_entry_is_still_booked_as_a_taker(fresh_db, placed,
                                                             monkeypatch):
+    """price:"ask" crosses at the ask — the fee is real and must be charged."""
     import trader
 
     async def _book(_t, _s):
@@ -1607,6 +1760,7 @@ def test_a_crossing_script_entry_is_still_booked_as_a_taker(fresh_db, placed,
 
 
 def test_a_matched_order_is_a_taker_whatever_the_price_said():
+    """The exchange's own answer wins: a limit that crossed pays the fee."""
     was = script_engine._entry_was_maker
     assert was(30, None, "live") == 1
     assert was(30, None, "matched") == 0
@@ -1614,9 +1768,16 @@ def test_a_matched_order_is_a_taker_whatever_the_price_said():
     assert was(47, 47, "live") == 0
     assert was(30, 47, "") == 1
     assert was(30, None, "") == 0
+    assert was(30, None, "delayed") == 0
+    assert was(30, 47, "delayed") == 0
+
 
 
 def test_an_abandoned_hook_thread_cannot_persist_its_late_write(fresh_db):
+    """A hook that blows its timeout keeps running in its daemon thread and
+    keeps writing into `state`. _disable only wrote enabled=0, so _save_states
+    kept persisting that dict — checkpointing a half-finished mutation over
+    the last good snapshot — and re-enabling handed back the SAME module."""
     code = (
         "import time\n"
         "def decide(ctx):\n"
@@ -1672,6 +1833,9 @@ def test_a_retired_module_refuses_further_hook_calls(fresh_db):
 
 def test_save_states_reports_a_concurrent_writer_instead_of_going_quiet(
         fresh_db, monkeypatch, caplog):
+    """json.dumps walks the live dict, so a background thread mutating it
+    raised RuntimeError into the catch-all `except Exception: logger.debug`
+    and the save was skipped with nothing said. Snapshot first, and say so."""
     _install_script("sAD", "def decide(ctx):\n    return None\n")
     with db.get_db() as conn:
         row = db.get_user_script(conn, "sAD")
@@ -1692,3 +1856,23 @@ def test_save_states_reports_a_concurrent_writer_instead_of_going_quiet(
     with db.get_db() as conn:
         assert json.loads(
             db.get_user_script(conn, "sAD")["state_json"]) == {"good": 1}
+
+
+def test_a_paper_account_parks_an_armed_script_with_its_switch_on(fresh_db, engine_stubs,
+                                                                   placed):
+    """Account mode gate: scripts_live_enabled ON and an armed script, but the
+    account is Paper — nothing reaches the exchange, nothing is diverted
+    into the shadow ledger, and the switch is left as the user set it."""
+    _install_script("armed3", (
+        "def decide(ctx):\n"
+        "    return {'side': 'up', 'price': 'ask'}\n"
+    ), enabled=1, dry_run=0)
+    cfg = _all_engines_off()
+    cfg["scripts_live_enabled"] = True
+    cfg["account_mode"] = "paper"
+    asyncio.run(script_engine.run_tick(cfg, authed=True))
+    assert placed == []
+    with db.get_db() as conn:
+        assert db.list_script_shadow(conn, "armed3", 50) == []
+    assert script_engine.status_for("armed3")["gate"] == "master_off"
+    assert cfg["scripts_live_enabled"] is True

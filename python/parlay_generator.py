@@ -1,3 +1,34 @@
+"""Parlay schedule generator — per-UTC-hour brute force of the deep-favorite
+config over the recorded tick corpus.
+
+The port of the Kalshi bot's "Individual-24" pattern: volatility (and thus the
+last-second flip rate that is this strategy's entire downside) is not uniform
+across the day, so instead of one all-day compromise config, every UTC hour is
+searched SEPARATELY over a (favorite floor x entry window x MACD gate) grid
+and the winners are stitched into one 24-hour schedule. An hour with no
+qualifying config is left unseated — the live engine simply doesn't open
+positions during it.
+
+Honesty rules baked in (all measured on THIS app's Polymarket data, 2026-07):
+  * Scored via replay._simulate — the exact live should_enter gate, recorded
+    real-book asks, fee-v2 taker fees. No parallel reimplementation to drift.
+  * Train/holdout split by recorded DATE (last N distinct dates are holdout).
+    Configs are qualified and ranked on TRAIN only; the holdout is scored
+    afterwards and reported untouched. It used to be a qualifying bar too,
+    which made it part of the selection: among ~30 candidates per hour, the
+    ones that happened to clear the holdout were kept, so the stored holdout
+    figures were no longer out-of-sample (2026-10-11 audit).
+  * Hours are searched POOLED across coins. Per-coin-per-hour granularity
+    needs ~60 days of data before it stops being noise — revisit then.
+  * Every candidate is hold-to-settlement (all exits pinned to 0), so a
+    trade's outcome is deterministic: win iff the favorite settles correct.
+
+Run standalone against the installed app's data:
+    set KRYPT_POLYBOT_USERDATA=%APPDATA%\\Krypt PolyBot
+    python parlay_generator.py --save            # generate + store (unarmed)
+    python parlay_generator.py --save --arm on   # ... and arm it
+or through the service RPCs (c15ParlayGenerate / c15ParlayArm).
+"""
 from __future__ import annotations
 
 import argparse
@@ -6,6 +37,7 @@ import logging
 from datetime import datetime, timezone
 
 import config as cfgmod
+import crypto15m
 import db
 import replay
 
@@ -49,12 +81,14 @@ def _stats(trades: list[dict]) -> dict:
     }
 
 
-def _qualifies(train: dict, hold: dict, mwr: float, min_trades: int) -> bool:
+def _qualifies(train: dict, mwr: float, min_trades: int) -> bool:
+    """Perfect (>= mwr) on TRAIN, enough trades to mean anything, and positive
+    train edge. The holdout takes no part: a bar it must clear is a selection
+    on it, and its numbers stop being an out-of-sample check. Its stats are
+    stored next to each seated hour so the arming decision can read them."""
     if train["n"] < min_trades:
         return False
     if train["winRate"] < mwr or train["pnlUsd"] <= 0:
-        return False
-    if hold["n"] > 0 and (hold["winRate"] < mwr or hold["pnlUsd"] < 0):
         return False
     return True
 
@@ -71,6 +105,8 @@ def generate(
     min_win_rate: float = DEFAULT_MIN_WIN_RATE,
     min_trades: int = DEFAULT_MIN_TRADES,
 ) -> dict:
+    """Search every UTC hour and return the stitched schedule payload
+    (NOT saved — see save_schedule / set_armed)."""
     by_window = replay.load_windows(env=env, interval=interval, since_days=since_days)
     if not by_window:
         raise RuntimeError(
@@ -113,7 +149,7 @@ def generate(
                     trades, _nw, _lm = replay._simulate(by_hour[h], cand)
                     tr, ho = _split(trades, hold_dates)
                     st, sh = _stats(tr), _stats(ho)
-                    if not _qualifies(st, sh, min_win_rate, min_trades):
+                    if not _qualifies(st, min_win_rate, min_trades):
                         continue
                     n_cands += 1
                     key = (st["pnlUsd"], st["n"])
@@ -143,6 +179,23 @@ def generate(
     v_trades, n_windows, _ = replay._simulate(by_window, stitched)
     v_tr, v_ho = _split(v_trades, hold_dates)
 
+    notes = [
+        "Hours searched pooled across coins (per-coin-hour needs ~60 days to beat noise).",
+        "Configs are qualified and ranked on train dates only; the holdout is scored afterwards and reported untouched.",
+        "Fills at recorded real-book asks, taker fee-v2; depth not recorded — optimistic at scale.",
+        "Hold-to-settlement by construction; the live engine exempts parlay rows from stop/TP.",
+        "P&L figures are per single contract per trade.",
+    ]
+    since = crypto15m.twap_settlement_since(interval)
+    pre_twap = [d for d in all_dates if since and d < since]
+    if pre_twap:
+        notes.insert(0, (
+            f"{len(pre_twap)} of {len(all_dates)} recorded dates precede {since}, "
+            f"when {interval} windows settled on a single print instead of the "
+            "60s TWAP: the schedule is partly fit to a settlement rule that no "
+            "longer applies."
+        ))
+
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "env": env, "interval": interval,
@@ -157,13 +210,10 @@ def generate(
             "windows": n_windows,
             "train": _stats(v_tr), "holdout": _stats(v_ho), "all": _stats(v_trades),
         },
-        "notes": [
-            "Hours searched pooled across coins (per-coin-hour needs ~60 days to beat noise).",
-            "Fills at recorded real-book asks, taker fee-v2; depth not recorded — optimistic at scale.",
-            "Hold-to-settlement by construction; the live engine exempts parlay rows from stop/TP.",
-            "P&L figures are per single contract per trade.",
-        ],
+        "holdout_untouched": True,
+        "notes": notes,
     }
+
 
 
 def save_schedule(schedule: dict) -> None:
@@ -174,6 +224,9 @@ def save_schedule(schedule: dict) -> None:
 
 
 def set_armed(armed: bool) -> None:
+    """Arm/disarm the stored schedule. Arming a schedule that seats ZERO hours
+    is refused: it would trade nothing (best case) and the engine still stamps
+    its rows as parlay, which exempts them from every exit path."""
     import crypto15m_trader
     if armed:
         with db.get_db() as conn:
@@ -198,8 +251,11 @@ def _print_summary(s: dict) -> None:
           f"{s['data_dates']['count']} recorded dates "
           f"({s['data_dates']['first']} → {s['data_dates']['last']}), "
           f"holdout = last {s['holdout_days']} dates")
-    print(f"bar: win-rate ≥ {s['min_win_rate']:.0%} on train AND holdout, "
-          f"≥ {s['min_trades']} train trades, train P&L > 0\n")
+    print(f"bar: win-rate ≥ {s['min_win_rate']:.0%} on train, "
+          f"≥ {s['min_trades']} train trades, train P&L > 0 "
+          "(the holdout is scored after selection, never used to pick)\n")
+    for note in s.get("notes") or []:
+        print(f"note: {note}")
     for h in range(24):
         hs = s["hours"].get(str(h))
         if not hs:
@@ -243,6 +299,10 @@ def main() -> None:
         set_armed(args.arm_only == "on")
         print(f"parlay {'ARMED' if args.arm_only == 'on' else 'disarmed'} "
               "(stored schedule unchanged)")
+        import crypto15m_trader
+        stale = crypto15m_trader.parlay_stale_reason(crypto15m_trader.parlay_state(force=True)[1])
+        if stale:
+            print(f"STALE: {stale}")
         return
 
     sched = generate(

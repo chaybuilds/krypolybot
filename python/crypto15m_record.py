@@ -1,3 +1,28 @@
+"""Passive research logger for the recurring crypto up/down strategy.
+
+Follows `crypto15m_interval` — whichever window series the Crypto tab
+watches (5m / 15m / hourly) is the one recorded, and every row is stamped
+with that interval so per-interval backtests never mix datasets.
+
+Builds the dataset that makes the strategy backtestable: once per
+window per asset it captures a *decision-point* snapshot (which side is
+the favorite, its price, and the underlying delta a few minutes before
+close), then fills in the settled outcome afterward. It NEVER places an
+order or touches money — it only reads public market data, exactly like
+the monitor. Runs in the background regardless of whether the executor is
+enabled, so anyone accumulates data to test their own strategies against.
+
+The captured features are raw (favorite price, delta %), so the backtest
+can sweep ANY entry threshold / delta filter / favorite-vs-contrarian
+choice after the fact without re-collecting data.
+
+It also appends a `crypto15m_ticks` row for every active market on every
+pass (~25s cadence, the whole window — bid/ask, mid, spot, delta), the
+raw series needed to study entry timing, quote staleness vs spot, and
+maker-fill behaviour. After 60 days db maintenance moves ticks (and resolved
+signals) out of the live DB into data/research-archive.db, which is never
+pruned; backtest.py and any replay window longer than 60 days read them there.
+"""
 from __future__ import annotations
 
 import logging
@@ -23,6 +48,10 @@ _GIVE_UP_AFTER_SEC = 3 * 24 * 3600.0
 
 
 def _settled_up_won(m: dict) -> Optional[bool]:
+    """Did the up/yes side win? None if the market isn't settled yet.
+
+    Mirrors trader._market_yes_payout but local (no import cycle): reads
+    `result`, else the settlement value (dollar or legacy cents)."""
     if not isinstance(m, dict):
         return None
     result = (m.get("result") or "").lower()
@@ -48,7 +77,34 @@ def _settled_up_won(m: dict) -> Optional[bool]:
     return None
 
 
+_STRIKE_CHECK_BPS = 2.0
+
+
+def _check_strike(sig: dict, m: dict) -> Optional[float]:
+    """Gap in bps between a resolved window's captured strike and the official
+    one, logged when beyond `_STRIKE_CHECK_BPS`. None when either is missing."""
+    try:
+        ours, official = float(sig.get("strike")), float(m.get("price_to_beat"))
+    except (TypeError, ValueError):
+        return None
+    if ours <= 0 or official <= 0:
+        return None
+    gap = (ours / official - 1.0) * 1e4
+    if abs(gap) > _STRIKE_CHECK_BPS:
+        logger.warning(
+            f"crypto15m strike check {sig.get('asset')} {str(sig.get('ticker'))[:16]}…: "
+            f"captured {ours:.8g} ({sig.get('strike_source') or 'unknown source'}) vs "
+            f"official {official:.8g} ({gap:+.1f} bps)"
+        )
+    return gap
+
+
 def _capture_ticks(snap: dict, env: str, interval: str) -> int:
+    """Append a whole-window observation row for every active market —
+    every recorder pass, not just the decision point. This is the raw
+    series that lets entry TIMING, spot-vs-quote staleness, and maker
+    fill behaviour be studied later (the per-market outcome joins in
+    from crypto15m_signals on ticker)."""
     captured = 0
     max_mins = {"5m": 5, "15m": 15, "hourly": 60, "4h": 240}.get(interval, 15) + 2
     with db.get_db() as conn:
@@ -180,6 +236,7 @@ async def _resolve(now_epoch: float) -> int:
                     "(no settled outcome 3 days after close) — parked without outcome"
                 )
             continue
+        _check_strike(s, m or {})
         with db.get_db() as conn:
             db.resolve_crypto15m_signal(conn, s["ticker"], 1 if up_won else 0)
         resolved += 1
@@ -187,6 +244,8 @@ async def _resolve(now_epoch: float) -> int:
 
 
 async def record_tick(cfg: dict) -> dict:
+    """One pass: log a tick for every active market, capture new decision
+    points, resolve settled ones. Resilient — never raises into the loop."""
     env = polymarket_auth.get_env()
     interval = crypto15m._interval(cfg)
     now_epoch = datetime.now(timezone.utc).timestamp()

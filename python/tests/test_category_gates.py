@@ -1,3 +1,19 @@
+"""Category filtering: the UI's keys must reach the trader's gates.
+
+Reported 2026-07-25: toggling Categories in Settings appeared to have no
+effect, with the backend logging `whale: category 'sports' not in whale set`.
+
+The report concluded the UI wrote a key the trader ignored. That was wrong —
+the trader DOES read `allowed_categories`. The real fault was that the
+PER-SOURCE lists (`allowed_whale_categories` / `allowed_momentum_categories`)
+were written only by strategy presets, enforced by the trader, and had no UI
+control at all — so a preset could narrow an engine invisibly and the visible
+control looked broken.
+
+These tests pin the whole chain: the camelCase keys the renderer writes must
+survive merge_with_defaults into the snake_case keys should_trade() reads,
+and each gate must behave as documented.
+"""
 from __future__ import annotations
 
 import pytest
@@ -18,6 +34,7 @@ def _cfg(**camel) -> dict:
     return cfgmod.merge_with_defaults(dict(camel))
 
 
+
 def test_camel_keys_from_the_ui_map_to_the_snake_keys_the_trader_reads():
     merged = _cfg(
         allowedCategories=["sports", "crypto"],
@@ -27,6 +44,7 @@ def test_camel_keys_from_the_ui_map_to_the_snake_keys_the_trader_reads():
     assert merged["allowed_categories"] == ["sports", "crypto"]
     assert merged["allowed_whale_categories"] == ["crypto"]
     assert merged["allowed_momentum_categories"] == ["sports"]
+
 
 
 def test_global_filter_is_enforced():
@@ -49,13 +67,17 @@ def test_global_none_means_no_filter():
 
 
 def test_global_empty_list_means_trade_nothing():
+    """The trap the UI now warns about explicitly."""
     cfg = _cfg(allowedCategories=[])
     ok, why = trader.should_trade(_signal("crypto"), "whale", cfg)
     assert ok is False
     assert "no categories enabled" in why
 
 
+
 def test_per_source_list_narrows_within_the_global_one():
+    """The reported symptom: 'sports' allowed globally, still blocked for
+    whales because a preset had set the whale list to crypto only."""
     cfg = _cfg(
         allowedCategories=["sports", "crypto"],
         allowedWhaleCategories=["crypto"],
@@ -68,6 +90,7 @@ def test_per_source_list_narrows_within_the_global_one():
 
 
 def test_per_source_none_adds_no_restriction():
+    """What the new 'Any' button writes — it must unblock the case above."""
     cfg = _cfg(
         allowedCategories=["sports", "crypto"],
         allowedWhaleCategories=None,
@@ -91,6 +114,7 @@ def test_convergence_shares_the_whale_list():
 
 
 def test_momentum_uses_its_own_list_not_the_whale_one():
+    """A whale-only restriction must not silently gag momentum."""
     cfg = _cfg(
         allowedCategories=["sports"],
         allowedWhaleCategories=["crypto"],
@@ -102,6 +126,7 @@ def test_momentum_uses_its_own_list_not_the_whale_one():
 
 @pytest.mark.parametrize("source", ["whale", "momentum"])
 def test_global_and_per_source_compose_with_AND(source):
+    """Passing one but not the other must still block."""
     key = ("allowedWhaleCategories" if source == "whale"
            else "allowedMomentumCategories")
     cfg = _cfg(**{"allowedCategories": ["crypto"], key: ["sports"]})

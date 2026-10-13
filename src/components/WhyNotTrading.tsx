@@ -11,7 +11,7 @@ export function WhyNotTrading() {
       try {
         const s = await window.krypt.trading.status();
         if (alive) setSt(s);
-      } catch {}
+      } catch { }
     };
     void pull();
     const t = setInterval(pull, 5000);

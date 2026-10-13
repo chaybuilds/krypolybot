@@ -1,3 +1,35 @@
+"""Realised P&L comes from the FILL LEDGER, not from what the wallet still holds.
+
+Shaped from the same real wallet as `test_track_real_cases.py`, and written
+against the complaint that followed the last repair: **"it shows 105 losses,
+which is not true — it thinks we lost every bet, so my realised profit shows
+-$681.13."**
+
+That was not an arithmetic bug. It was the unit of account.
+
+The Positions tab is the WALLET, and on a prediction market a wallet is a
+survivorship filter with the sign flipped:
+
+  * a resolved WINNER leaves the wallet the moment it is redeemed, and a
+    redemption is an on-chain claim rather than a CLOB trade — so it leaves no
+    "sell" row in the fill ledger either;
+  * a resolved LOSER stays in the wallet forever as $0 dust, because there is
+    nothing to claim and no reason to spend the gas.
+
+So summing realised P&L over "positions we still hold, plus explicit sells"
+drops every single win by construction and totals the losses. On the author's
+real wallet that read: 584 markets traded, 453 of them redeemed for a payout,
+and a Track screen reporting 105 positions, 105 losses, realised -$681.13.
+
+The fix these tests pin: settle EVERY market the ledger has fills for at $1 per
+contract on the winning outcome and $0 on the loser, whether or not the tokens
+are still in the wallet — a redeemed winner has already been PAID. An
+unresolved market realises from its sells only, and a market whose outcome we
+cannot read stays UNKNOWN and is counted as such. Never as a loss.
+
+Public market ids only. No wallet address, no key: a condition id names a
+market, not a person.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +57,7 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _fills(rows):
+    """Seed the fill ledger. `rows`: dicts of cid/side/action/size/price/fee."""
     with db.get_db() as conn:
         conn.execute("DELETE FROM terminal_fills")
         for i, r in enumerate(rows):
@@ -42,6 +75,13 @@ def _fills(rows):
 
 
 def _portfolio(monkeypatch, *, wallet=(), resolved=None, calls=None):
+    """Run `portfolio()` against a stubbed wallet and stubbed Gamma.
+
+    `wallet` is what /positions still returns — deliberately allowed to be
+    EMPTY while the ledger is full, which is the redeemed-winner case.
+    `resolved` maps conditionId -> 'yes' | 'no' | None; a market absent from
+    the map is one Gamma would not answer for at all.
+    """
     resolved = dict(resolved or {})
 
     async def _positions(*a, **kw):
@@ -79,7 +119,12 @@ def _portfolio(monkeypatch, *, wallet=(), resolved=None, calls=None):
     return _run(tt.portfolio())
 
 
+
 def test_a_redeemed_winner_absent_from_the_wallet_still_counts(fresh_db, monkeypatch):
+    """THE regression. 5 contracts bought at 40c on a market that resolved our
+    way, redeemed, and therefore gone from /positions. There is no sell row —
+    a redemption is an on-chain claim — so the old code saw nothing at all and
+    realised $0.00 on a bet that paid $5.00 for $2.00."""
     _fills([{"cid": BTC_UP, "side": "yes", "action": "buy",
              "size": 5.0, "price": 40.0}])
     r = _portfolio(monkeypatch, wallet=[], resolved={BTC_UP: "yes"})
@@ -93,6 +138,9 @@ def test_a_redeemed_winner_absent_from_the_wallet_still_counts(fresh_db, monkeyp
 
 
 def test_a_losing_dust_position_counts_as_a_loss(fresh_db, monkeypatch):
+    """The other half: the loser is still in the wallet, worth exactly $0, and
+    it is a real loss. Nothing here is meant to hide it — the complaint was
+    never that the losses were wrong."""
     _fills([{"cid": DOGE_DOWN, "side": "no", "action": "buy",
              "size": 5.0, "price": 40.0}])
     r = _portfolio(
@@ -109,6 +157,10 @@ def test_a_losing_dust_position_counts_as_a_loss(fresh_db, monkeypatch):
 
 
 def test_the_wallet_alone_reports_every_bet_as_a_loss(fresh_db, monkeypatch):
+    """The shape of the real complaint, in miniature: three winners redeemed
+    and gone, one loser left sitting in the wallet. Counted over the wallet
+    this is "1 position, 1 loss, realised -$2.00" — which is what the user
+    saw. Counted over the ledger it is 3 won, 1 lost, and a profit."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy", "size": 5.0, "price": 40.0},
         {"cid": ETH_UP, "side": "yes", "action": "buy", "size": 5.0, "price": 45.0},
@@ -128,7 +180,11 @@ def test_the_wallet_alone_reports_every_bet_as_a_loss(fresh_db, monkeypatch):
     assert r["walletPnlUsd"] == pytest.approx(-2.0)
 
 
+
 def test_a_sold_out_unresolved_market_realises_its_sells_only(fresh_db, monkeypatch):
+    """Bought 10 at 50c, sold all 10 at 60c, market still open. There is
+    nothing left to settle, so the outcome decides nothing: realised is the
+    $1.00 the sells banked, and the market scores neither a win nor a loss."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy", "size": 10.0, "price": 50.0},
         {"cid": BTC_UP, "side": "yes", "action": "sell", "size": 10.0, "price": 60.0},
@@ -144,6 +200,11 @@ def test_a_sold_out_unresolved_market_realises_its_sells_only(fresh_db, monkeypa
 
 
 def test_a_sub_contract_remainder_does_not_score(fresh_db, monkeypatch):
+    """Straight from the real ledger: selling 5 contracts back left 0.0794
+    behind, because the venue nets in shares rather than lots. Those hundredths
+    were never redeemed — they are not worth the gas — and calling that market
+    "won" inflated the record past the venue's own redemption count. The P&L on
+    them still counts; it is real money."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy",
          "size": 5.0794, "price": 64.64},
@@ -159,6 +220,9 @@ def test_a_sub_contract_remainder_does_not_score(fresh_db, monkeypatch):
 
 
 def test_both_sides_held_to_settlement_land_in_both_columns(fresh_db, monkeypatch):
+    """A paired crypto entry buys Up AND Down and holds both to settlement, so
+    one market is genuinely a win and a loss at once. The counts say so instead
+    of quietly picking one, and the note tells the user they do not add up."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy", "size": 5.0, "price": 55.0},
         {"cid": BTC_UP, "side": "no", "action": "buy", "size": 5.0, "price": 48.0},
@@ -173,7 +237,11 @@ def test_both_sides_held_to_settlement_land_in_both_columns(fresh_db, monkeypatc
     assert "BOTH columns" in (r["recordNote"] or "")
 
 
+
 def test_an_unreadable_outcome_is_counted_never_assumed_lost(fresh_db, monkeypatch):
+    """Gamma has nothing for this market. The contracts are outstanding, so we
+    cannot say what they are worth — and the one thing we must not do is settle
+    them at zero, which would turn every lookup failure into a loss."""
     _fills([{"cid": GIANTS, "side": "yes", "action": "buy",
              "size": 5.0, "price": 40.0}])
     r = _portfolio(monkeypatch, wallet=[], resolved={})
@@ -187,6 +255,8 @@ def test_an_unreadable_outcome_is_counted_never_assumed_lost(fresh_db, monkeypat
 
 
 def test_one_unknown_market_does_not_void_the_rest(fresh_db, monkeypatch):
+    """The unknown is carved out, not contagious: the markets we CAN read are
+    still settled, and the page is told how many were left out."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy", "size": 5.0, "price": 40.0},
         {"cid": GIANTS, "side": "yes", "action": "buy", "size": 5.0, "price": 40.0},
@@ -199,7 +269,12 @@ def test_one_unknown_market_does_not_void_the_rest(fresh_db, monkeypatch):
     assert r["ledgerMarkets"] == 2
 
 
+
 def test_fees_are_reported_and_netted_rather_than_buried(fresh_db, monkeypatch):
+    """On the real ledger the gross figure was +$11.87 and $76.14 of fees had
+    been paid to earn it — the account was DOWN $64.27. Gross stays available
+    because it is the convention the venue's own P&L uses; the net is the one
+    the screen leads with."""
     _fills([
         {"cid": BTC_UP, "side": "yes", "action": "buy",
          "size": 5.0, "price": 40.0, "fee": 0.08},
@@ -215,6 +290,10 @@ def test_fees_are_reported_and_netted_rather_than_buried(fresh_db, monkeypatch):
 
 
 def test_a_resolved_outcome_is_asked_for_once_and_then_remembered(fresh_db, monkeypatch):
+    """A resolved market never un-resolves, and the ledger reaches back over
+    580 of them on the real wallet. Re-asking Gamma for every one on every
+    12-second Track poll would be ~30 batched HTTP calls a refresh for an
+    answer that cannot change, so a known outcome is written down once."""
     _fills([{"cid": BTC_UP, "side": "yes", "action": "buy",
              "size": 5.0, "price": 40.0}])
     calls: list = []
@@ -233,6 +312,9 @@ def test_a_resolved_outcome_is_asked_for_once_and_then_remembered(fresh_db, monk
 
 def test_the_cache_does_not_survive_the_database_moving(fresh_db, monkeypatch,
                                                         tmp_path):
+    """A factory reset, a different wallet or a test's temp DB moves the file
+    under us. An in-process cache that outlived that move would answer
+    questions about somebody else's markets."""
     _fills([{"cid": BTC_UP, "side": "yes", "action": "buy",
              "size": 5.0, "price": 40.0}])
     _portfolio(monkeypatch, wallet=[], resolved={BTC_UP: "yes"})

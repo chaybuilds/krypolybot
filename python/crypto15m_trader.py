@@ -1,3 +1,25 @@
+"""15-minute crypto LIVE executor.
+
+A self-contained execution engine for the 15-min crypto strategy,
+DELIBERATELY ISOLATED from the scanner trader (trader.py): it uses its
+own `crypto15m_positions` table and never touches `bot_positions`, so it
+cannot destabilise the tested whale/momentum engine.
+
+Lifecycle (at most one open position per asset):
+  ENTRY   in the last `time_delay` minutes, when one side is a strong
+          favorite (>= entry threshold) and the delta filter passes
+          (i.e. the monitor's `signal` is true), BUY `order_size`
+          contracts of the favorite at ask + entryDiff.
+  STOP    if the held side's price falls below `exit_threshold`, SELL to
+          flatten — this is the capability the scanner engine lacks.
+  SETTLE  otherwise hold to the 15-min settlement and book pnl from the
+          binary outcome.
+
+The executor is fully INDEPENDENT of the main bot's enable_trading switch.
+It places REAL orders when `crypto15m_enabled` is on AND the Polymarket
+wallet is connected. There is no paper mode — if the wallet isn't connected
+the engine is a no-op (the Crypto tab still shows live market data).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import clob_ws
 import crypto15m
 import db
 import polymarket_api
@@ -19,9 +42,11 @@ logger = logging.getLogger("crypto15m")
 
 
 class _Unset:
+    """Sentinel for "caller supplied no market" — distinct from `None`, which
+    legitimately means "the market lookup returned nothing"."""
     __slots__ = ()
 
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:      # pragma: no cover - debug aid only
         return "<unset>"
 
 
@@ -114,6 +139,9 @@ _PARLAY_REFRESH_SEC = 10.0
 
 
 def parlay_state(force: bool = False) -> tuple[bool, Optional[dict]]:
+    """(armed, schedule) from the durable kv store, cached ~10s. Armed is only
+    True when a structurally valid schedule exists. A transient read failure
+    returns the last known state rather than disarming mid-session."""
     now = time.time()
     if not force and now - _parlay_cache["at"] < _PARLAY_REFRESH_SEC:
         return _parlay_cache["armed"], _parlay_cache["schedule"]
@@ -134,6 +162,37 @@ def parlay_state(force: bool = False) -> tuple[bool, Optional[dict]]:
     return _parlay_cache["armed"], _parlay_cache["schedule"]
 
 
+def parlay_stale_reason(sched: Optional[dict]) -> Optional[str]:
+    """Why a stored parlay schedule should be regenerated before it is
+    trusted, or None. Shown wherever the schedule is (status, the parlay
+    RPCs, the generator CLI).
+
+    A schedule generated before its series moved to 60s-TWAP settlement
+    (crypto15m.TWAP_SETTLEMENT_SINCE) was fit to windows that settled on a
+    single print, so its floors and windows answer a different question. One
+    generated before 2026-10-11 also qualified configs on its own holdout
+    (see parlay_generator._qualifies), so its holdout figures were part of
+    the selection rather than an out-of-sample check."""
+    if not isinstance(sched, dict):
+        return None
+    interval = str(sched.get("interval") or "15m")
+    gen = str(sched.get("generated_at") or "")[:10]
+    since = crypto15m.twap_settlement_since(interval)
+    if since and (not gen or gen < since):
+        return (
+            f"Generated {gen or 'at an unknown date'}, before {interval} windows "
+            f"moved to 60s-TWAP settlement on {since}: it was fit to a settlement "
+            "rule that no longer applies. Regenerate it before arming."
+        )
+    if not sched.get("holdout_untouched"):
+        return (
+            "Generated before 2026-10-11, when configs also had to clear the "
+            "holdout to be seated, so its holdout figures were used for "
+            "selection and are not an out-of-sample check. Regenerate it."
+        )
+    return None
+
+
 _C15_MIN_CONTRACTS = 5
 
 _underfunded_log_t: dict = {}
@@ -149,18 +208,27 @@ def _min_notional_ok(contracts: int, limit_cents: int) -> bool:
 
 
 def _leg_landed(row: Optional[dict]) -> bool:
+    """A paired leg row that actually took a position (FAK filled ≥ partial)."""
     return bool(row) and (row.get("status") in ("submitted", "filled", "partial"))
 
 
+
 def direction_for_favorite(favorite: str) -> str:
+    """Map the displayed favorite side to the Polymarket contract side."""
     return "yes" if favorite == "up" else "no"
 
 
 def _is_directional_rules(cfg: dict) -> bool:
+    """Directional rule mode is on when custom rules are enabled AND a NO-side
+    rule-set exists — then the rules pick the side (yes→up / no→down), the way
+    the imported Turbine strategies express entryYes/entryNo."""
     return bool(cfg.get("crypto15m_use_rules")) and bool(cfg.get("crypto15m_rules_no"))
 
 
 def _directional_rules_side(asset: dict, cfg: dict) -> tuple[Optional[str], str]:
+    """Which side the YES/NO rule-sets select for this asset. YES-side rules
+    (crypto15m_rules) → 'up'; NO-side rules (crypto15m_rules_no) → 'down'; None
+    when neither matches. YES wins if both somehow match (deterministic)."""
     ok_y, _ = evaluate_rules(asset, cfg.get("crypto15m_rules") or [])
     if ok_y:
         return "up", "yes-rules matched"
@@ -171,6 +239,11 @@ def _directional_rules_side(asset: dict, cfg: dict) -> tuple[Optional[str], str]
 
 
 def _entry_side(asset: dict, cfg: dict) -> str:
+    """The side we'd BUY for this asset: 'up' or 'down'. Directional rule mode
+    lets the YES/NO rule-sets pick the side; otherwise favorite mode buys the
+    favorite, contrarian buys the opposite (cheap) side, and model (sniper) mode
+    buys whichever side the settlement model calls. Shared by the entry gates
+    and the order path so they can't disagree."""
     if _is_directional_rules(cfg):
         return _directional_rules_side(asset, cfg)[0] or ""
     mode = (cfg.get("crypto15m_direction_mode") or "favorite").lower()
@@ -186,15 +259,28 @@ def _entry_side(asset: dict, cfg: dict) -> str:
 
 
 def taker_order_type(cfg: dict) -> str:
+    """CLOB order type for a 'cross the spread now' action (taker entry +
+    maker→taker escalation). FAK (Fill-And-Kill) is marketable: it fills
+    immediately against resting liquidity at-or-better than our capped price and
+    KILLS the unfilled remainder instead of resting it — so a near-close cross
+    either fills now or cleanly no-fills, rather than leaving an orphan GTC order
+    that drifts and later mis-cancels (the main cause of 'fills fail'). Defaults
+    on; set crypto15m_taker_fak=False to revert to the legacy resting GTC cross."""
     return "FAK" if cfg.get("crypto15m_taker_fak", True) else "GTC"
 
 
 def entry_limit_cents(entry_cost: float, entry_diff: float) -> int:
+    """Favorite ask in [0,1] crossed up by `entry_diff`, clamped 1..99¢."""
     cents = round((float(entry_cost) + float(entry_diff)) * 100)
     return max(1, min(99, int(cents)))
 
 
 def maker_limit_cents(side: str, yes_bid, yes_ask, entry_cost: float) -> int:
+    """Resting (maker) entry price: join the best bid on the side we're
+    buying, so the order adds liquidity instead of crossing the spread.
+
+    up/yes  -> yes best bid;  down/no -> no best bid = 1 - yes best ask.
+    Falls back to 1¢ under the side's ask when the book is unknown."""
     bid = None
     if side == "up":
         bid = yes_bid
@@ -206,6 +292,7 @@ def maker_limit_cents(side: str, yes_bid, yes_ask, entry_cost: float) -> int:
 
 
 def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[float]:
+    """Current probability (0..1) of the side we hold, from a market dict."""
     if not market:
         return None
     yes_bid = crypto15m._price_dollars(market, "yes_bid")
@@ -216,13 +303,20 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
 
 
 def evaluate_rules(asset: dict, rules: list) -> tuple[bool, str]:
+    """Evaluate the crypto entry rule-set against an asset snapshot (fields are
+    snapshot keys like favoritePrice / bookImbalance / minsLeft). Thin wrapper
+    over the shared engine so crypto and the main bot evaluate rules identically."""
     return rules_engine.evaluate_rules(asset, rules)
 
 
 _FM_MIN_PROB = 0.9985
 
 
+
 def paired_tilt(edge_cents, cfg: dict) -> int:
+    """Tilt multiplier from the model's fee-net edge (cents) on the dominant
+    side: below tilt1 → 0 (no trade), tilt1..tilt2 → 1x (balanced pair),
+    tilt2..tilt3 → 2x, at/above tilt3 → 3x."""
     if edge_cents is None:
         return 0
     try:
@@ -242,6 +336,11 @@ def paired_tilt(edge_cents, cfg: dict) -> int:
 
 
 def paired_sides(asset: dict) -> tuple[str, float, float]:
+    """(dominant_side, dominant_edge_cents, hedge_edge_cents) for a paired
+    entry. Dominant = the side the model says is UNDERPRICED (max fee-net
+    edge) — NOT necessarily the side with p ≥ 0.5: a 60%-up model against a
+    70c up-ask makes DOWN the underpriced leg. Returns ("", 0, 0) when the
+    model or either ask is missing."""
     mp = asset.get("modelProb")
     up_ask, down_ask = asset.get("upAsk"), asset.get("downAsk")
     if mp is None or not up_ask or not down_ask:
@@ -254,6 +353,23 @@ def paired_sides(asset: dict) -> tuple[str, float, float]:
     if up_edge >= down_edge:
         return "up", up_edge, down_edge
     return "down", down_edge, up_edge
+
+
+def _model_input_block(asset: dict, cfg: dict) -> str:
+    """Why the settlement model can't be trusted for this asset right now, or
+    "" when it can. Shared by every mode that sizes on the model (model and
+    paired), so neither trades on an input the other refuses."""
+    if cfg.get("crypto15m_model_autopause", True):
+        cal = check_model_calibration(trader.get_env(), crypto15m._interval(cfg))
+        if not cal.get("ok", True):
+            return (
+                f"model calibration degraded ({cal.get('rate') or 0:.0%} hit over "
+                f"last {cal.get('n', 0)} windows) — auto-paused"
+            )
+    ss = asset.get("strikeSource")
+    if ss is not None and ss not in crypto15m.STRIKE_SOURCES_OK:
+        return "strike is approximate (no TWAP at the window open) — model sits out"
+    return ""
 
 
 def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> tuple[bool, str]:
@@ -279,6 +395,9 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
     if cfg.get("crypto15m_paired_mode"):
         if asset.get("modelProb") is None:
             return False, "model unavailable (needs indicators + spot feed)"
+        blocked = _model_input_block(asset, cfg)
+        if blocked:
+            return False, f"paired: {blocked}"
         dom, dom_edge, _hedge_edge = paired_sides(asset)
         if not dom:
             return False, "paired: need live asks on BOTH sides"
@@ -331,16 +450,9 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
             return False, "model unavailable (needs indicators + spot feed)"
         mp = float(mp)
         p_side = mp if mp >= 0.5 else 1.0 - mp
-        if cfg.get("crypto15m_model_autopause", True):
-            cal = check_model_calibration(trader.get_env(), crypto15m._interval(cfg))
-            if not cal.get("ok", True):
-                return False, (
-                    f"model calibration degraded ({cal.get('rate') or 0:.0%} hit over "
-                    f"last {cal.get('n', 0)} windows) — auto-paused"
-                )
-        ss = asset.get("strikeSource")
-        if ss is not None and ss not in crypto15m.STRIKE_SOURCES_OK:
-            return False, "strike is approximate (no TWAP at the window open) — model sits out"
+        blocked = _model_input_block(asset, cfg)
+        if blocked:
+            return False, blocked
         ml = asset.get("minsLeft")
         final_minute = ml is not None and 0.0 < float(ml) < 1.0
         if final_minute:
@@ -419,6 +531,9 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
 
 
 def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> bool:
+    """A filled position trips the stop-loss when the side we hold falls
+    below `exit_threshold`. Only `filled` rows are eligible (not ones
+    already submitting/exiting/exited)."""
     if side_prob is None:
         return False
     if (position.get("strategy") or "").startswith("paired"):
@@ -446,6 +561,15 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
 
 
 def strength_exit_cents(position: dict, cfg: dict) -> Optional[int]:
+    """Sell-into-strength: the price of the resting GTC ask to park over a
+    filled position, or None when the feature is off / the position isn't
+    eligible. The SirMartingale pattern from the PRR reports (61% of its
+    alpha was exits): sell winners INTO the pump at ~80c instead of riding
+    to settlement — a resting ask catches spikes between engine ticks, pays
+    no taker fee (maker), sidesteps the stop-loss-never-fills problem, and
+    returns cash pre-settlement instead of stranding winnings unredeemed.
+    Only positions whose entry is comfortably BELOW the target qualify —
+    a 95c sniper entry has nothing to sell into at 80c."""
     if not cfg.get("crypto15m_sell_into_strength"):
         return None
     if position.get("script_id"):
@@ -468,6 +592,12 @@ def strength_exit_cents(position: dict, cfg: dict) -> Optional[int]:
 
 
 def should_take_profit(position: dict, bid_cents: Optional[int], cfg: dict) -> bool:
+    """A filled position hits the per-bet take-profit when the held side's best
+    BID reaches the configured cash-out price — i.e. we can sell the whole thing
+    at/above that price right now. Triggers on the REAL book bid (what we can
+    actually realize), not a lagged mid, so a take-profit only ever fires when
+    the money is genuinely there. 0 (the default) is disabled. Only `filled`
+    rows are eligible (not ones already submitting / exiting / exited)."""
     if position.get("script_id"):
         return False
     if (position.get("strategy") or "") == "parlay":
@@ -483,6 +613,12 @@ def should_take_profit(position: dict, bid_cents: Optional[int], cfg: dict) -> b
 
 
 def should_take_profit_pct(position: dict, bid_cents: Optional[int], cfg: dict) -> bool:
+    """A filled position hits the percent take-profit when the whole thing is
+    worth >= X% MORE than it cost at the current best BID. The win-side mirror of
+    should_stop_loss's percent-of-entry rule: uses the real book bid (what we can
+    actually realize), not a lagged mark, so it only fires when the profit is
+    genuinely there. 0 (the default) is disabled. Only `filled` rows are
+    eligible (not ones already submitting / exiting / exited)."""
     if (position.get("strategy") or "") == "parlay":
         return False
     if position.get("script_id"):
@@ -520,6 +656,17 @@ _STREAK_LOOKBACK_ROWS = 40
 
 
 def streak_multiplier(cfg: dict, env: str) -> float:
+    """Win/loss-conditioned size multiplier ("streak sizing"), 1.0 when off.
+
+    Reads the current run of same-outcome settled positions on this network
+    (most recent first; a scratch — pnl exactly 0 — ends the run) and scales:
+    loss streak -> (1 + streak_loss_pct/100) ** n, win streak ->
+    (1 + streak_win_pct/100) ** n, clamped to [0.1, streak_max_mult].
+
+    Recomputed from the DB at every entry rather than kept in memory, so it
+    survives restarts and never drifts from what actually settled. This
+    reshapes variance only — recorded outcomes are serially uncorrelated —
+    and the caller's risk caps still bound whatever this returns."""
     if not cfg.get("crypto15m_streak_sizing"):
         return 1.0
     loss_pct = float(cfg.get("crypto15m_streak_loss_pct", 20.0) or 0.0)
@@ -560,6 +707,26 @@ def compute_entry_contracts(
     cfg: dict, *, entry_limit_cents: int, balance_usd: float, order_size: int,
     balance_known: bool = False, streak_mult: float = 1.0,
 ) -> int:
+    """Contracts to buy for one entry.
+
+    fixed mode      -> `order_size` contracts.
+    balance_pct mode-> spend `crypto15m_balance_pct` of balance at the
+                       entry price (floored to whole contracts).
+    `streak_mult` (streak sizing, see streak_multiplier) scales the base
+    count BEFORE the risk caps below, so a martingale ramp can never bypass
+    them — a scaled bet still can't exceed max_loss_pct or the balance.
+    Either way, if `crypto15m_max_loss_pct` > 0 the capital at risk
+    (contracts x price — the most a buy-only binary can lose) is held to
+    that fraction of balance. Returns 0 when the risk budget can't fund a
+    single contract, so the caller skips the entry rather than overspend.
+
+    A balance of 0 is ambiguous: a failed read served 0 long before a real
+    account ever could. `balance_known=True` (the last balance read actually
+    succeeded) makes 0 authoritative — return 0 so the caller SKIPS instead
+    of sizing the full fixed order against money that isn't there (a genuinely
+    empty account otherwise spammed ~28 rejected 'not enough balance' orders
+    an hour until funds arrived). Unknown-balance keeps the historical
+    fall-back to the fixed `order_size`."""
     price = max(0.01, int(entry_limit_cents) / 100.0)
     bal = max(0.0, float(balance_usd or 0.0))
     if balance_known and bal <= 0.0:
@@ -588,6 +755,10 @@ def compute_entry_contracts(
 
 
 async def _bankroll_usd(cfg: dict, authed: bool) -> float:
+    """Balance to size against. Uses live cash when connected (cached by
+    `refresh_balance`); a CONFIRMED zero is returned as a real 0.0 (sizing
+    must skip, not spend the pinned bankroll that isn't there). Only an
+    unknown balance (read failed) falls back to `start_bankroll_usd`."""
     if authed:
         try:
             cents, _port = await trader.refresh_balance(cfg, force=False)
@@ -598,6 +769,7 @@ async def _bankroll_usd(cfg: dict, authed: bool) -> float:
         except Exception:
             pass
     return max(0.0, float(cfg.get("start_bankroll_usd", 0.0) or 0.0))
+
 
 
 def _iso(s):
@@ -652,7 +824,12 @@ def _pos_to_js(r: dict) -> dict:
     }
 
 
+
 async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optional[dict]:
+    """One single-leg entry, serialised against the main / copy / script engines
+    by `trader.order_gate`. run_tick snapshots `budget_usd` (the wallet-wide
+    exposure + reserve headroom) once per tick, so the locked body also
+    re-reads that headroom from the DB right before placing."""
     async with trader.order_gate("crypto15m"):
         return await _open_entry_locked(a, cfg, env, balance_usd)
 
@@ -739,6 +916,25 @@ async def _open_entry_locked(
         )
         return None
 
+    if mode == "model":
+        min_e = float(cfg.get("crypto15m_model_min_edge_cents", 2.0) or 0.0)
+        fs = a.get("feeSchedule")
+
+        def _edge_at(c: int) -> float:
+            return round(conf - c - crypto15m._fee_cents(c, fs), 2)
+
+        edge_cap = limit_cents
+        while edge_cap >= 1 and _edge_at(edge_cap) < min_e:
+            edge_cap -= 1
+        ask_now = real_ask if real_ask else int(math.ceil(round(entry_cost * 100.0, 6)))
+        if edge_cap < max(1, ask_now):
+            why = (f"edge gone at the live ask: {_edge_at(ask_now)}c at {ask_now}c "
+                   f"< {min_e:.1f}c (snapshot ask {entry_cost * 100:.0f}c)")
+            logger.info(f"[crypto15m] skip {a.get('asset')}: {why}")
+            _block_reasons[a.get("asset") or "?"] = why
+            return None
+        limit_cents = edge_cap
+
     streak_mult = streak_multiplier(cfg, env)
     if streak_mult != 1.0:
         logger.info(
@@ -824,6 +1020,9 @@ async def _open_entry_locked(
             count=order_size, price_cents=limit_cents, client_order_id=coid,
             order_type=entry_ot,
         )
+    except polymarket_api.OrderStatusUnknownError as e:
+        logger.warning(f"[crypto15m] entry {a['asset']}: {e}")
+        resp = e.response
     except Exception as e:
         row.update({"status": "error", "error": str(e)[:200], "dry_run": False})
         with db.get_db() as conn:
@@ -856,6 +1055,11 @@ async def _place_paired_leg(
     a: dict, cfg: dict, env: str, *, side: str, contracts: int,
     limit_cents: int, strategy: str, confidence: float,
 ) -> Optional[dict]:
+    """Place one leg of a paired entry (always a FAK cross) and record it as
+    its own position row — each leg then rides the existing fill-poll /
+    settlement machinery independently. Returns the inserted row, or None
+    when the exchange gave no usable response. A 0-fill (killed FAK) records
+    a quiet canceled row: the ticker is marked attempted for the window."""
     direction = direction_for_favorite(side)
     ticker = a.get("ticker")
     coid = f"krypt-c15p-{a['asset']}-{uuid.uuid4().hex[:8]}"
@@ -874,6 +1078,9 @@ async def _place_paired_leg(
             count=contracts, price_cents=limit_cents, client_order_id=coid,
             order_type="FAK",
         )
+    except polymarket_api.OrderStatusUnknownError as e:
+        logger.warning(f"[crypto15m] paired {strategy} leg {a['asset']}: {e}")
+        resp = e.response
     except Exception as e:
         row.update({"status": "error", "error": str(e)[:200], "dry_run": False})
         with db.get_db() as conn:
@@ -909,6 +1116,12 @@ async def _chase_missing_leg(
     filled_leg_limit: int, max_comb: float, markup: int, max_cents: int,
     strategy: str, confidence: float,
 ) -> Optional[dict]:
+    """One re-quoted, harder cross to restore a paired leg that missed while
+    its partner filled. Re-fetches the side's live ask (it moved — that is why
+    the first FAK missed) and crosses at ask + 2× the normal markup, but only
+    while the combined PAID price stays within `_PAIRED_CHASE_TOL_CENTS` of the
+    cap. If it cannot fit (or the book is gone) it returns None and the partner
+    leg is left standing single-side."""
     ticker = a.get("ticker")
     try:
         q = await polymarket_api.get_quote(ticker, "yes" if side == "up" else "no")
@@ -941,6 +1154,17 @@ async def _chase_missing_leg(
 async def _open_paired_entry(
     a: dict, cfg: dict, env: str, balance_usd: float
 ) -> list[dict]:
+    """Both-sides paired entry with the model-tilt ladder: `tilt`× contracts
+    on the model's underpriced (dominant) side + 1× on the other (hedge)
+    side. Re-prices both legs off the REAL top-of-book, re-checks the
+    combined-cost cap and the ladder at those live asks, sizes the pair as a
+    unit against the budget, then crosses the DOMINANT leg first (its edge is
+    the trade) and the hedge second. A missed hedge leaves the dominant leg
+    standing — that's the single-side model bet this mode generalizes.
+
+    Serialised as ONE unit by `trader.order_gate`: the pair's cap re-check and
+    both legs have to land without another engine slipping an order between
+    them, or the hedge could be placed against headroom that is already gone."""
     async with trader.order_gate("crypto15m-paired"):
         return await _open_paired_entry_locked(a, cfg, env, balance_usd)
 
@@ -1097,12 +1321,24 @@ async def _open_paired_entry_locked(
     return rows
 
 
+
 _V2_CRYPTO_FEE_BPS = 700.0
 
 
 def _order_fee_usd(
     order: dict, filled: int, price_cents: float | None, *, maker: bool = False,
 ) -> float:
+    """Taker fee for this order's filled portion: rate × p·(1−p) × size.
+    Uses the order's own fee_rate_bps when the venue reports one (legacy V1
+    orders did); V2 orders report none, so the crypto fee-v2 schedule applies
+    (this engine only trades the crypto up/down series).
+
+    `maker=True` = the fill matched from a RESTING order (a GTC entry that
+    filled without escalating, or the sell-into-strength ask being lifted):
+    fee-v2 is takerOnly, so those fills pay NOTHING. 2026-08-18 audit: the
+    default entry style IS maker, so charging every fill the taker fee
+    understated recorded P&L by the same ~1.7c/contract the 2026-07-16 audit
+    fixed in the other direction."""
     try:
         if maker or not filled or not price_cents:
             return 0.0
@@ -1116,6 +1352,8 @@ def _order_fee_usd(
 
 
 def paired_fee_cents(up_c: float, down_c: float) -> float:
+    """Taker fee, in cents per pair, for buying BOTH legs at these asks under
+    fee-v2 (rate × p(1−p) per contract, crypto rate)."""
     rate = _V2_CRYPTO_FEE_BPS / 10_000.0
 
     def leg(c: float) -> float:
@@ -1126,14 +1364,32 @@ def paired_fee_cents(up_c: float, down_c: float) -> float:
 
 
 def _entry_is_maker(pos: dict) -> bool:
+    """True when this row's entry RESTED (maker → no fee under takerOnly
+    fee-v2). Legacy rows (no entry_order_type recorded) keep taker-fee
+    accounting.
+
+    `entry_order_type` is written as the FEE fact rather than a copy of the
+    submitted CLOB order type: an entry that crossed is stamped 'FAK' even
+    when the order itself went out as a GTC (a maker whose re-quote failed and
+    landed at/above the ask, a taker cross with crypto15m_taker_fak off), and
+    a maker that ESCALATES is re-stamped at escalation time. Without that,
+    'GTC' outlived the cross and every later fee recomputation booked a taker
+    fill as free."""
     return (pos.get("entry_order_type") or "").upper() == "GTC"
 
 
 def _exit_is_maker(pos: dict) -> bool:
+    """The one resting (maker) exit path is sell-into-strength; every other
+    exit crosses the book and pays the taker fee."""
     return (pos.get("exit_reason") or "") == "sell_strength"
 
 
 def _fees_paid_usd(pos: dict, *extra) -> float:
+    """Taker fees attributable to this position: the recorded entry/exit fee
+    columns plus any fee computed in the current booking step. Every terminal
+    pnl_usd must be net of this — the 2026-07-16 audit found NO site
+    subtracted fees (and fees_usd itself was always 0), overstating recorded
+    crypto15m P&L by ~0.97c/contract and flipping its lifetime sign."""
     total = float(pos.get("fees_usd") or 0.0) + float(pos.get("exit_fees_usd") or 0.0)
     for f in extra:
         total += float(f or 0.0)
@@ -1149,11 +1405,22 @@ def _mark_resolved(conn, pid: int, **fields) -> None:
 
 async def _real_fill_cents(
     order_id: Optional[str], fallback_cents: Optional[float], filled: int,
+    pos: Optional[dict] = None,
 ) -> tuple[Optional[float], Optional[float]]:
+    """(avg_entry_cents, cost_usd) from the CLOB trades endpoint — the ACTUAL
+    execution prices. The order object's `price` is the LIMIT (and the
+    404-wallet rescue used entry_limit_cents), so every fill was booked at
+    limit: chase==0 on 75/75 audited fills, real slippage invisible, cost
+    overstated by the taker markup. Falls back to `fallback_cents` when the
+    trades endpoint has nothing yet (it can lag a fresh fill) — the fallback
+    is logged by callers so the source stays auditable. `pos` narrows the
+    venue's walk to this position's market and lifetime."""
     fills = []
     if order_id:
         try:
-            fills = await polymarket_api.get_fills_for_order(order_id)
+            fills = await polymarket_api.get_fills_for_order(
+                order_id, market=str((pos or {}).get("ticker") or ""),
+                after=trader._fills_after((pos or {}).get("created_at")))
         except Exception as e:
             logger.debug(f"[crypto15m] fills lookup {order_id}: {e}")
     tot, qty = 0.0, 0
@@ -1188,7 +1455,7 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
             booked = min(held, target) if held >= 1 else 0
             avg_c = cost_usd = None
             if booked:
-                avg_c, cost_usd = await _real_fill_cents(kid, float(limit_c), booked)
+                avg_c, cost_usd = await _real_fill_cents(kid, float(limit_c), booked, pos)
             with db.get_db() as conn:
                 if booked:
                     db.update_crypto15m_position(
@@ -1220,7 +1487,7 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
     remaining = int(parsed.get("remaining") or 0) if parsed else 0
 
     if filled > 0 and remaining <= 0:
-        avg_c, cost_usd = await _real_fill_cents(kid, parsed["avg_cents"], filled)
+        avg_c, cost_usd = await _real_fill_cents(kid, parsed["avg_cents"], filled, pos)
         with db.get_db() as conn:
             db.update_crypto15m_position(
                 conn, pid, status="filled",
@@ -1233,7 +1500,7 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
             return db.fetch_crypto15m_by_id(conn, pid)
 
     if filled > 0 and filled != int(pos.get("filled_contracts") or 0):
-        avg_c, cost_usd = await _real_fill_cents(kid, parsed["avg_cents"], filled)
+        avg_c, cost_usd = await _real_fill_cents(kid, parsed["avg_cents"], filled, pos)
         with db.get_db() as conn:
             db.update_crypto15m_position(
                 conn, pid,
@@ -1244,9 +1511,16 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
                                         maker=_entry_is_maker(pos)),
             )
 
+    from config import account_live
+    paper = not account_live(cfg)
     fast = _maker_fill_timed_out(pos, cfg)
-    if fast or _entry_expired(pos, cfg):
-        if fast:
+    if paper or fast or _entry_expired(pos, cfg):
+        if paper:
+            logger.info(
+                f"[crypto15m] paper: pulling the resting {pos.get('asset')} entry "
+                f"(Paper completes no real buy)"
+            )
+        elif fast:
             logger.info(
                 f"[crypto15m] fast-escalate {pos.get('asset')}: maker unfilled "
                 f"after {cfg.get('crypto15m_maker_fill_sec')}s -> crossing to taker"
@@ -1294,10 +1568,11 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
             return None
 
         t_filled, t_cost_cents = 0, 0
-        if (remaining > 0 and cfg.get("crypto15m_maker_escalate", True)
+        if (remaining > 0 and not paper
+                and cfg.get("crypto15m_maker_escalate", True)
                 and not pos.get("script_id")
                 and not _market_closed(pos)):
-            tk = await _escalate_to_taker(pos, cfg, remaining)
+            tk = await _escalate_to_taker(pos, cfg, remaining, already=m_filled)
             if tk:
                 t_filled = int(tk.get("filled") or 0)
                 t_cost_cents = int(tk.get("cost_cents") or 0)
@@ -1320,12 +1595,16 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
                     upd["entry_order_type"] = "FAK"
                 db.update_crypto15m_position(conn, pid, **upd)
             else:
-                _mark_resolved(conn, pid, status="canceled", exit_reason="unfilled_expired")
+                _mark_resolved(conn, pid, status="canceled",
+                               exit_reason="paper_pulled" if paper else "unfilled_expired")
             return db.fetch_crypto15m_by_id(conn, pid)
     return None
 
 
 async def _onchain_held(ticker: Optional[str], direction: Optional[str]) -> int:
+    """Contracts of (ticker, direction) we actually hold on-chain right now,
+    from the wallet's live positions. Used so maker→taker escalation never
+    re-buys a maker that filled between our poll and cancel."""
     if not ticker:
         return 0
     try:
@@ -1344,6 +1623,7 @@ async def _onchain_held(ticker: Optional[str], direction: Optional[str]) -> int:
 
 
 def _age_seconds(ts) -> Optional[float]:
+    """Seconds since a SQLite UTC timestamp string ('YYYY-MM-DD HH:MM:SS')."""
     if not ts:
         return None
     s = str(ts).replace("T", " ").split(".")[0]
@@ -1355,6 +1635,11 @@ def _age_seconds(ts) -> Optional[float]:
 
 
 def _maker_fill_timed_out(pos: dict, cfg: dict) -> bool:
+    """Fast escalate: True once a resting maker entry has gone unfilled longer
+    than `crypto15m_maker_fill_sec`. The cue to cross to a taker fill NOW —
+    while the price is still near our entry — instead of waiting for the cancel
+    lead and getting a late, worse fill. 0 disables (cancel-lead escalation only).
+    """
     wait = float(cfg.get("crypto15m_maker_fill_sec", 0) or 0)
     if wait <= 0:
         return False
@@ -1363,6 +1648,8 @@ def _maker_fill_timed_out(pos: dict, cfg: dict) -> bool:
 
 
 def _entry_expired(pos: dict, cfg: dict) -> bool:
+    """An unfilled entry is abandoned within `crypto15m_maker_cancel_min`
+    minutes of its market's close (0 = only once the market has closed)."""
     close_epoch = crypto15m._parse_close_epoch(pos.get("close_time") or "")
     if close_epoch is None:
         return False
@@ -1371,13 +1658,21 @@ def _entry_expired(pos: dict, cfg: dict) -> bool:
 
 
 def _market_closed(pos: dict) -> bool:
+    """Has the 15-min window actually closed? (vs `_entry_expired` = inside the
+    earlier cancel lead). No order — maker OR taker — can fill after close."""
     close_epoch = crypto15m._parse_close_epoch(pos.get("close_time") or "")
     if close_epoch is None:
         return False
     return datetime.now(timezone.utc).timestamp() >= close_epoch
 
 
-async def _escalate_to_taker(pos: dict, cfg: dict, remaining: int) -> Optional[dict]:
+async def _escalate_to_taker(
+    pos: dict, cfg: dict, remaining: int, *, already: Optional[int] = None,
+) -> Optional[dict]:
+    """Maker→taker escalation: cross the spread for the unfilled remainder so it
+    actually fills before close, capped at `entry_max` so we never chase an
+    already-decided contract. Returns the parsed fill, or None if it couldn't
+    place / the ask is too rich. LIVE path only (paper simulates in-place)."""
     ticker, direction = pos.get("ticker"), pos.get("direction")
     if not ticker:
         return None
@@ -1411,6 +1706,9 @@ async def _escalate_to_taker(pos: dict, cfg: dict, remaining: int) -> Optional[d
             count=remaining, price_cents=cross, client_order_id=coid,
             order_type=taker_order_type(cfg),
         )
+    except polymarket_api.OrderStatusUnknownError as e:
+        logger.warning(f"[crypto15m] escalate {pos.get('asset')}: {e}")
+        resp = e.response
     except Exception as e:
         logger.warning(f"[crypto15m] escalate place failed {pos.get('asset')}: {e}")
         return None
@@ -1422,6 +1720,19 @@ async def _escalate_to_taker(pos: dict, cfg: dict, remaining: int) -> Optional[d
             "filled": n, "cost_cents": n * cross, "avg_cents": float(cross),
             "status": "executed", "place_count": n, "remaining": 0,
         }
+
+    held_before = (int(pos.get("target_contracts") or 0) - remaining) if already is None else int(already)
+
+    async def _from_wallet(why: str) -> Optional[dict]:
+        for i in range(3):
+            got = max(0, min(remaining, await _onchain_held(ticker, direction) - held_before))
+            if got > 0:
+                logger.info(f"[live] escalate fill {pos.get('asset')} x{got} @ ~{cross}c ({why}; wallet)")
+                return _filled(got)
+            if i < 2:
+                await asyncio.sleep(0.8)
+        logger.info(f"[live] escalate {pos.get('asset')}: {why} but the wallet gained nothing — no fill")
+        return None
 
     if oid:
         for _ in range(3):
@@ -1437,18 +1748,19 @@ async def _escalate_to_taker(pos: dict, cfg: dict, remaining: int) -> Optional[d
                     return parsed
             except polymarket_api.PolymarketAPIError as e:
                 if e.status == 404:
-                    logger.info(f"[live] escalate fill {pos.get('asset')} x{remaining} @ ~{cross}c (matched)")
-                    return _filled(remaining)
+                    return await _from_wallet("order gone from the book")
             except Exception as e:
                 logger.debug(f"[crypto15m] escalate poll {pos.get('asset')}: {e}")
             await asyncio.sleep(0.6)
-    if "match" in str(order.get("status") or "").lower():
-        logger.info(f"[live] escalate fill {pos.get('asset')} x{remaining} @ ~{cross}c (placed=matched)")
-        return _filled(remaining)
+    status = str(order.get("status") or "").strip().lower()
+    if status in ("matched", "delayed"):
+        return await _from_wallet(f"placed={status}")
     return None
 
 
 async def _best_bid_cents(ticker: Optional[str], direction: Optional[str]) -> Optional[int]:
+    """Highest resting bid (cents) on our side's book — what we could sell into
+    right now. None if the book is empty/unavailable (caller falls back)."""
     if not ticker or not direction:
         return None
     try:
@@ -1460,9 +1772,57 @@ async def _best_bid_cents(ticker: Optional[str], direction: Optional[str]) -> Op
     return max(cents) if cents else None
 
 
+async def _live_side_prob(ticker: Optional[str], direction: Optional[str]) -> Optional[float]:
+    """The held side's probability (0..1) from the LIVE book: the websocket
+    quote when it's fresh, else the REST books (our ask is 100 minus the
+    other side's best bid). None when neither gives a sane two-sided book.
+
+    The stop-loss used to decide on Gamma's `outcomePrices`, which sit
+    20-27c (and up to 67c) behind the book near the close: a collapsed
+    position went unstopped, and a winner on a stale-low mark got sold
+    (2026-07-16: three of the first six momentum fills stopped, one 19s
+    after entry, with the book 20c higher). The entry and take-profit paths
+    already priced off the book; this is the stop's equivalent, with the
+    same sanity rule as the entry (crypto15m._ws_mid)."""
+    if not ticker or direction not in ("yes", "no"):
+        return None
+    try:
+        meta = await polymarket_api.get_market_meta(ticker)
+    except Exception:
+        meta = None
+    if not meta:
+        return None
+    yt, nt = meta.get("yes_token"), meta.get("no_token")
+    clob_ws.warm(yt, nt)
+    yes_q = no_q = None
+    try:
+        yes_q = clob_ws.feed.get_quote_cents(yt)
+        no_q = clob_ws.feed.get_quote_cents(nt)
+    except Exception:
+        pass
+    up = crypto15m._ws_up_price(yes_q, no_q)
+    if up is None:
+        try:
+            book = await polymarket_api.get_orderbook(ticker)
+        except Exception:
+            book = {}
+        yb = max((int(b[0]) for b in (book.get("yes") or []) if b and b[0] is not None), default=None)
+        nb = max((int(b[0]) for b in (book.get("no") or []) if b and b[0] is not None), default=None)
+        up = crypto15m._ws_up_price(
+            {"bid_cents": yb, "ask_cents": (100 - nb) if nb is not None else None},
+            {"bid_cents": nb, "ask_cents": (100 - yb) if yb is not None else None},
+        )
+    if up is None:
+        return None
+    return up if direction == "yes" else (1.0 - up)
+
+
 async def _place_exit_sell(
     pos: dict, cfg: dict, *, exit_cents: int, reason: str
 ) -> Optional[dict]:
+    """Cross the book to SELL the whole filled position at `exit_cents`, tagging
+    the row with `reason` (stop_loss | take_profit). Shared by the stop-loss and
+    take-profit paths — both flatten the same way; only the trigger differs."""
     pid, ticker, direction = pos["id"], pos["ticker"], pos["direction"]
     filled = int(pos.get("filled_contracts") or 0)
     exit_cents = max(1, min(99, int(exit_cents)))
@@ -1514,6 +1874,14 @@ async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Opti
 
 
 async def _book_exit_from_chain(pos: dict) -> Optional[dict]:
+    """Reconcile an exit whose SELL order 404'd. A 404 on the open-order endpoint
+    means the order left the book — it FULLY MATCHED (the normal case for a stop
+    that crosses the bid) or was canceled at close. We must NOT swallow it: if the
+    row stays 'exiting', _settle_if_closed later settles the ALREADY-SOLD contracts
+    as if still held, booking a stop-loss LOSS as a settlement WIN. Trust the
+    wallet — book the contracts that actually left it at the price we crossed
+    (exit_limit_cents; a crossing sell fills at-or-better, same proceeds convention
+    as the non-404 path)."""
     pid = pos["id"]
     filled = int(pos.get("filled_contracts") or 0)
     already = int(pos.get("exit_filled_contracts") or 0)
@@ -1588,6 +1956,15 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
 
 
 async def _settle_if_closed(pos: dict, *, market=_UNSET) -> Optional[dict]:
+    """An 'exiting' position whose market settled while the stop-loss sell
+    sat UNFILLED (thin/empty books — routine on demo) still holds its
+    contracts: Polymarket cancels resting orders at close and the binary
+    settles. Book that settlement, or the row stays 'exiting' forever and
+    pins an executor slot (live bug: 5 such rows froze the engine).
+
+    `market` may be supplied by the caller (run_tick batches ONE
+    fetch_markets_map for every open ticker per tick); omitted, it falls back
+    to the original per-position fetch so other callers/tests are unaffected."""
     if market is _UNSET:
         try:
             market = await polymarket_api.fetch_market(pos["ticker"])
@@ -1632,6 +2009,17 @@ async def _settle_if_closed(pos: dict, *, market=_UNSET) -> Optional[dict]:
 
 
 async def _resolved_payout_from_chain(pos: dict) -> Optional[float]:
+    """Fallback settlement for the fast crypto 'Up/Down' markets when Gamma's
+    `result`/`status` fields lag the on-chain settlement (which otherwise
+    leaves a settled position stuck 'open').
+
+    Once our shares are redeemable the market HAS settled — but redeemable does
+    NOT imply a win (losing tokens are redeemable for $0 too). So we book the
+    outcome from the held token's actual settled price (`cur_price` ≈ 1 = our
+    side won, ≈ 0 = lost), never from the mere existence of a redeemable
+    balance. Returns the YES-side payout, or None if not found / not yet a
+    decisive 0-or-1 settlement (in which case the Gamma path confirms it later).
+    """
     try:
         positions = await polymarket_api.get_positions()
     except Exception:
@@ -1723,7 +2111,11 @@ async def _manage_position(
             if row is not None and row.get("status") == "exiting":
                 return row
 
-    side_prob = side_prob_from_market(market, direction)
+    side_prob = None
+    if should_stop_loss(pos, 0.0, cfg):
+        side_prob = await _live_side_prob(pos.get("ticker"), direction)
+    if side_prob is None:
+        side_prob = side_prob_from_market(market, direction)
     if should_stop_loss(pos, side_prob, cfg):
         if time.time() - _stop_retry_at.get(pid, 0.0) < _STOP_RETRY_SEC:
             return None
@@ -1734,9 +2126,23 @@ async def _manage_position(
     return None
 
 
+
 async def reconcile_filled_from_chain(
     cfg: dict, env: str, *, lookback_sql: str = "-45 minutes"
 ) -> list[dict]:
+    """Authoritative wallet reconcile for fills the polling missed.
+
+    These fast 15-min markets lag on the open-order/trades endpoints, so an entry
+    can FILL on-chain while every poll still reports it resting — the engine then
+    writes it off as 'canceled' (0 fill, $0) even though the contracts are in the
+    wallet, and the cost, the loss, and the settlement all go unbooked. The wallet
+    is the one source that aggregates EVERY fill regardless of which order id
+    matched (resting maker OR escalation taker), so it gets the final word: any
+    canceled/error 0-fill row whose contracts we actually hold is promoted to its
+    true state — re-opened for management if still live, or booked from the held
+    token's settled value if it already resolved. Returns the rows it corrected.
+    `lookback_sql` is a SQLite datetime modifier ('-45 minutes' per tick; widen it
+    for a one-off backfill)."""
     try:
         with db.get_db() as conn:
             candidates = db.crypto15m_reconcile_candidates(conn, env, lookback_sql)
@@ -1834,6 +2240,7 @@ async def reconcile_filled_from_chain(
     return fixed
 
 
+
 _last_heartbeat_t = 0.0
 _last_halt_log_t = 0.0
 _last_lifetime_halt_log_t = 0.0
@@ -1842,6 +2249,12 @@ _last_reconcile_ok_t = 0.0
 
 
 def _lifetime_loss_tripped(cfg: dict, env: str) -> tuple[bool, str]:
+    """Durable cumulative realized-loss guard. The daily breaker resets every UTC
+    midnight, so a net-negative engine bleeds the daily cap forever with no
+    ceiling. This uses a counter that SURVIVES a stats wipe (db.lifetime_realized_pnl):
+    once cumulative realized loss reaches the absolute-$ override (if > 0) or the
+    configured fraction of the starting bankroll, pause NEW entries. Returns
+    (tripped, human reason)."""
     limit_usd = float(cfg.get("crypto15m_lifetime_loss_limit_usd") or 0.0)
     limit_pct = _clamp01(cfg.get("crypto15m_lifetime_loss_limit_pct", 0.0))
     if limit_usd <= 0 and limit_pct <= 0:
@@ -1869,11 +2282,14 @@ _auto_off_cb = None
 
 
 def set_auto_off_callback(cb) -> None:
+    """Register the host's 'turn the engine off' callback (see _auto_off_cb)."""
     global _auto_off_cb
     _auto_off_cb = cb
 
 
 def _heartbeat(open_count: int) -> None:
+    """Once-a-minute proof-of-life so the log shows the executor keeps ticking
+    regardless of whether the Crypto tab is open (it runs in the backend loop)."""
     global _last_heartbeat_t
     import time as _t
     now = _t.time()
@@ -1883,9 +2299,16 @@ def _heartbeat(open_count: int) -> None:
 
 
 async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
+    """One execution pass: manage open positions, then (if enabled) consider new
+    entries. Returns the list of changed position rows. Places REAL orders — no
+    paper mode. Open positions are managed to settlement whenever the wallet is
+    connected, EVEN IF the engine is disabled, so a bet is never stranded after
+    the engine is turned off (manual toggle or the overall take-profit
+    kill-switch). New entries are opened only when crypto15m_enabled is on."""
     if not authed:
         return []
-    enabled = bool(cfg.get("crypto15m_enabled"))
+    from config import engine_on
+    enabled = engine_on(cfg, "crypto15m_enabled")
     env = trader.get_env()
 
     global _last_reconcile_t, _last_reconcile_ok_t
@@ -2117,6 +2540,8 @@ async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
 
 
 async def _sizing_preview(cfg: dict, authed: bool) -> dict:
+    """A worked example of the current sizing settings for the UI, so the
+    user can see roughly how much each bet costs before placing one."""
     mode = (cfg.get("crypto15m_sizing_mode") or "fixed").lower()
     balance_pct = _clamp01(cfg.get("crypto15m_balance_pct", 0.02))
     max_loss_pct = _clamp01(cfg.get("crypto15m_max_loss_pct", 0.0))
@@ -2156,6 +2581,7 @@ async def _sizing_preview(cfg: dict, authed: bool) -> dict:
 
 
 async def status(cfg: dict, *, authed: bool = False) -> dict:
+    """Snapshot of the executor's positions + stats for the UI."""
     env = trader.get_env()
     with db.get_db() as conn:
         open_rows = db.get_open_crypto15m(conn, env)
@@ -2172,9 +2598,10 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
         except (TypeError, ValueError):
             parlay_js["hours"] = []
         parlay_js["generatedAt"] = p_sched.get("generated_at")
+        parlay_js["staleReason"] = parlay_stale_reason(p_sched)
     return {
         "enabled": bool(cfg.get("crypto15m_enabled")),
-        "trading": bool(cfg.get("crypto15m_enabled")) and bool(authed),
+        "trading": __import__("config").engine_on(cfg, "crypto15m_enabled") and bool(authed),
         "authed": bool(authed),
         "parlay": parlay_js,
         "haltReason": _halt_reason,

@@ -8,6 +8,9 @@ import { startDiscordRpc, stopDiscordRpc } from './system/discord';
 import { pythonBackend } from './system/python-backend';
 import * as store from './system/settings-store';
 import { destroyTray, installTray, rebuild as rebuildTray } from './system/tray';
+import { cleanAgentConfigPatch } from './system/sanitize';
+import { sanitizeChannelPatch } from './system/configPatch';
+import { liveOrderNotice } from '../shared/agentOrderNotice';
 
 process.env.DIST_ELECTRON = __dirname;
 process.env.DIST = join(__dirname, '..', 'dist');
@@ -114,6 +117,13 @@ function createMainWindow(): BrowserWindow {
   };
   mainWindow.on('move', persistBounds);
   mainWindow.on('resize', persistBounds);
+  const sendVisibility = (): void => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('window:visibility', mainWindow.isVisible() && !mainWindow.isMinimized());
+  };
+  for (const ev of ['minimize', 'restore', 'hide', 'show'] as const) {
+    mainWindow.on(ev as 'minimize', sendVisibility);
+  }
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window:maximizeChange', true));
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window:maximizeChange', false));
 
@@ -168,6 +178,51 @@ function notifyStanding(data: unknown): void {
   }
 }
 
+function notifyApproval(data: unknown): void {
+  try {
+    const e = (data ?? {}) as { approvalId?: unknown; message?: unknown; mode?: unknown };
+    if (typeof e.approvalId !== 'number' || !Number.isFinite(e.approvalId)) return;
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+      title: 'An AI agent is asking to place a LIVE order',
+      body: `${typeof e.message === 'string' ? e.message.slice(0, 180) : 'Open AI Agents to approve or reject it.'}`
+        + ' It expires in 10 minutes.',
+      icon: iconPath(),
+      urgency: 'critical',
+    });
+    n.on('click', () => {
+      const w = createMainWindow();
+      if (w.isMinimized()) w.restore();
+      w.show();
+      w.focus();
+    });
+    n.show();
+  } catch {
+  }
+}
+
+function notifyAgentOrder(data: unknown): void {
+  try {
+    const notice = liveOrderNotice(data as Record<string, unknown> | null);
+    if (!notice) return;
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+      title: notice.title,
+      body: notice.body,
+      icon: iconPath(),
+      urgency: notice.critical ? 'critical' : 'normal',
+    });
+    n.on('click', () => {
+      const w = createMainWindow();
+      if (w.isMinimized()) w.restore();
+      w.show();
+      w.focus();
+    });
+    n.show();
+  } catch {
+  }
+}
+
 let quitting = false;
 
 const gotLock = app.requestSingleInstanceLock();
@@ -192,8 +247,8 @@ function installCsp(): void {
         ...details.responseHeaders,
         'Content-Security-Policy': [
           "default-src 'self'; script-src 'self'; " +
-          "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-          "font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; " +
+          "style-src 'self' 'unsafe-inline'; " +
+          "font-src 'self'; img-src 'self' data:; " +
           "connect-src 'self'",
         ],
       },
@@ -201,65 +256,17 @@ function installCsp(): void {
   });
 }
 
-const CONFIG_PATCH_ALLOW: Record<string, 'boolean' | 'number' | 'directionMode'> = {
-  enableTrading: 'boolean',
-  tradeWhales: 'boolean',
-  tradeMomentum: 'boolean',
-  crypto15mEnabled: 'boolean',
-  copyEnabled: 'boolean',
-  scriptsLiveEnabled: 'boolean',
-  crypto15mDirectionMode: 'directionMode',
-  crypto15mEntryThreshold: 'number',
-  crypto15mEntryMax: 'number',
-  crypto15mMinDeltaPct: 'number',
-  crypto15mTimeDelayMin: 'number',
-};
-
 function sanitizeConfigPatch(
   source: string, patch: Record<string, unknown>,
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
   const drop = (k: string, why: string) =>
     console.error(`[${source}] dropped config key '${k}': ${why}`);
-  const agentLive = !!store.get().config.mcpLiveTradingEnabled;
-  for (const [k, v] of Object.entries(patch)) {
-    if (source === 'mcp') {
-      const def = (store.DEFAULT_CONFIG as unknown as Record<string, unknown>)[k];
-      const safe = v === false || (k === 'terminalPaperMode' && v === true);
-      if (/^(mcp|remote|ai)[A-Z]/.test(k) || k === 'network') {
-        drop(k, 'never patchable by an AI agent'); continue;
-      }
-      if (k === 'terminalPaperMode' && v !== true) {
-        drop(k, 'only the user can turn paper mode off'); continue;
-      }
-      if (!agentLive && !safe) { drop(k, 'AI agent live trading is off'); continue; }
-      if (def === undefined || def === null) { drop(k, 'not a known setting'); continue; }
-      const ok = Array.isArray(def) ? Array.isArray(v)
-        : typeof def === 'object' ? (!!v && typeof v === 'object' && !Array.isArray(v))
-          : typeof def === 'number' ? (typeof v === 'number' && Number.isFinite(v))
-            : typeof v === typeof def;
-      if (!ok) { drop(k, `expected ${Array.isArray(def) ? 'array' : typeof def}`); continue; }
-      out[k] = v;
-      continue;
-    }
-    const kind = CONFIG_PATCH_ALLOW[k];
-    if (!kind) { drop(k, 'not patchable from this channel'); continue; }
-    if (kind === 'boolean') {
-      if (typeof v !== 'boolean') { drop(k, `expected boolean, got ${typeof v}`); continue; }
-      if (k === 'enableTrading' && v && source !== 'remote' && source !== 'mcp') {
-        drop(k, 'live trading can only be turned OFF from a script'); continue;
-      }
-      out[k] = v;
-    } else if (kind === 'number') {
-      if (typeof v !== 'number' || !Number.isFinite(v)) { drop(k, 'not a finite number'); continue; }
-      out[k] = v;
-    } else if (v === 'favorite' || v === 'contrarian' || v === 'model') {
-      out[k] = v;
-    } else {
-      drop(k, 'not a valid direction mode');
-    }
+  if (source === 'mcp') {
+    return cleanAgentConfigPatch(
+      patch, store.DEFAULT_CONFIG as unknown as Record<string, unknown>,
+      store.get().config.mcpAllowLiveSwitches === true, drop);
   }
-  return out;
+  return sanitizeChannelPatch(source, patch, drop);
 }
 
 async function bootstrap(): Promise<void> {
@@ -277,6 +284,7 @@ async function bootstrap(): Promise<void> {
     rebuildTray({
       openWindow: () => createMainWindow(),
       toggleTrading: toggleTradingFromTray,
+      stopAgents: stopAgentsFromTray,
       isTrading: () => store.get().config.enableTrading,
       quit: () => {
         quitting = true;
@@ -311,7 +319,7 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {});
+            .catch(() => { });
         }
       } catch {
       }
@@ -325,7 +333,7 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {});
+            .catch(() => { });
         }
       } catch {
       }
@@ -339,10 +347,14 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {});
+            .catch(() => { });
         }
       } catch {
       }
+    }
+    if (name === 'mcp:order') {
+      notifyApproval(data);
+      notifyAgentOrder(data);
     }
     if (name === 'crypto15m:autoOff') {
       try {
@@ -375,6 +387,10 @@ async function bootstrap(): Promise<void> {
         w.webContents.send('scripts:status', data);
       } else if (name === 'script:log') {
         w.webContents.send('scripts:log', data);
+      } else if (name === 'mcp:order') {
+        w.webContents.send('mcp:order', data);
+      } else if (name === 'mcp:toolCall') {
+        w.webContents.send('mcp:toolCall', data);
       } else if (name === 'terminal:standing') {
         notifyStanding(data);
         w.webContents.send('terminal:standing', data);
@@ -408,6 +424,7 @@ async function bootstrap(): Promise<void> {
   installTray({
     openWindow: () => createMainWindow(),
     toggleTrading: toggleTradingFromTray,
+    stopAgents: stopAgentsFromTray,
     isTrading: () => store.get().config.enableTrading,
     quit: () => {
       quitting = true;
@@ -434,6 +451,17 @@ async function bootstrap(): Promise<void> {
   }
 }
 
+async function stopAgentsFromTray(): Promise<void> {
+  const next = store.patchConfig({ mcpTradeMode: 'off', autopilotEnabled: false });
+  broadcastState(next);
+  if (pythonBackend.isRunning()) {
+    try {
+      await pythonBackend.request('setConfig', { config: next.config });
+    } catch {
+    }
+  }
+}
+
 async function toggleTradingFromTray(): Promise<void> {
   const cur = store.get();
   const next = store.patchConfig({ enableTrading: !cur.config.enableTrading });
@@ -447,6 +475,7 @@ async function toggleTradingFromTray(): Promise<void> {
   rebuildTray({
     openWindow: () => createMainWindow(),
     toggleTrading: toggleTradingFromTray,
+    stopAgents: stopAgentsFromTray,
     isTrading: () => store.get().config.enableTrading,
     quit: () => {
       quitting = true;

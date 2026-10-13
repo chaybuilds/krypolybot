@@ -1,3 +1,8 @@
+"""Tests for DB retention / compaction (db.cleanup_old_data + run_maintenance).
+
+The whale feed and market poller insert millions of rows over time; these
+guard the pruning that keeps the SQLite file from ballooning to multi-GB.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -81,6 +86,8 @@ def test_run_maintenance_compacts_when_forced(fresh_db):
 
 
 def _seed_history(c) -> None:
+    """Seed one row in every table clear_trade_history should wipe, plus a
+    keeper row (a public market trade) it must preserve."""
     db.insert_bot_position(c, {
         "signal_source": "whale", "signal_id": "s1", "ticker": "KX-A",
         "direction": "yes", "target_contracts": 10, "limit_price_cents": 55,
@@ -144,6 +151,7 @@ def test_factory_reset_wipes_crypto15m_positions(fresh_db):
     assert summary.get("crypto15m_positions") == 1
     with db.get_db() as c:
         assert c.execute("SELECT COUNT(*) FROM crypto15m_positions").fetchone()[0] == 0
+
 
 
 def test_unresolved_alerts_and_whales_age_out(fresh_db):
@@ -256,6 +264,7 @@ def test_factory_reset_takes_backup_first(fresh_db):
     assert n == 1
 
 
+
 def _make_marker_db(path) -> None:
     import sqlite3 as _sq
     conn = _sq.connect(str(path))
@@ -339,6 +348,7 @@ def test_no_restore_when_db_already_exists(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.setattr(db, "_restore_checked", False)
     assert _marker_survived(db.db_path())
+
 
 
 def _open_main_position(c) -> None:
@@ -433,3 +443,177 @@ def test_run_maintenance_vacuums_once_the_position_closes(fresh_db):
     summary = db.run_maintenance(force_vacuum=True)
     assert summary["vacuumed"] is True
     assert summary["vacuumSkipped"] == ""
+
+
+_RESEARCH = {
+    "crypto15m_signals": "observed_at",
+    "crypto15m_ticks": "observed_at",
+    "whale_trades": "created_at",
+    "alerts": "created_at",
+}
+
+
+def _archived(table: str) -> list[dict]:
+    import sqlite3 as _sq
+    conn = _sq.connect(str(db.research_archive_path()))
+    conn.row_factory = _sq.Row
+    try:
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+    finally:
+        conn.close()
+
+
+def _days_ago(n: float) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _seed_research(c, when: str, tag: str) -> None:
+    """One row in each archived research table, all stamped `when`."""
+    c.execute(
+        "INSERT INTO crypto15m_signals (ticker, asset, observed_at, close_time, favorite,"
+        " favorite_price, entry_cost, resolved, up_won, interval, network)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (f"C15-{tag}", "BTC", when, when, "up", 0.7, 0.71, 1, 1, "15m", "mainnet"),
+    )
+    c.execute(
+        "INSERT INTO crypto15m_ticks (ticker, asset, observed_at, mins_left, yes_bid,"
+        " yes_ask, model_prob, interval, network) VALUES (?,?,?,?,?,?,?,?,?)",
+        (f"C15-{tag}", "BTC", when, 4.0, 0.69, 0.71, 0.8, "15m", "mainnet"),
+    )
+    c.execute(
+        "INSERT INTO whale_trades (trade_id, ticker, taker_side, price, confidence,"
+        " resolved, outcome_correct, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (f"W-{tag}", f"M-{tag}", "yes", 0.4, 70, 1, 1, when),
+    )
+    c.execute(
+        "INSERT INTO alerts (ticker, signal_type, direction, price, confidence,"
+        " resolved, created_at) VALUES (?,?,?,?,?,?,?)",
+        (f"A-{tag}", "trade_cluster", "yes", 0.4, 60, 0, when),
+    )
+
+
+def test_retention_moves_research_rows_into_the_archive(fresh_db):
+    """Retention used to DELETE research rows past 60/45 days, and the 7
+    rotating nightlies kept them only a week longer: the corpus every strategy
+    verdict came from was lost for good. Now it is moved, column for column."""
+    with db.get_db() as c:
+        _seed_research(c, _OLD, "old")
+        _seed_research(c, _now(), "new")
+
+    db.cleanup_old_data()
+
+    with db.get_db() as c:
+        for t in _RESEARCH:
+            assert c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 1, t
+    for t, tcol in _RESEARCH.items():
+        assert [r[tcol] for r in _archived(t)] == [_OLD], t
+    sig = _archived("crypto15m_signals")[0]
+    assert (sig["ticker"], sig["up_won"], sig["interval"]) == ("C15-old", 1, "15m")
+    assert _archived("crypto15m_ticks")[0]["model_prob"] == pytest.approx(0.8)
+    assert _archived("whale_trades")[0]["trade_id"] == "W-old"
+    assert _archived("alerts")[0]["ticker"] == "A-old"
+
+
+def test_archiving_again_never_duplicates(fresh_db):
+    with db.get_db() as c:
+        _seed_research(c, _OLD, "old")
+        tick = dict(c.execute("SELECT * FROM crypto15m_ticks").fetchone())
+    db.cleanup_old_data()
+    with db.get_db() as c:
+        cols = ", ".join(tick)
+        c.execute(f"INSERT INTO crypto15m_ticks ({cols}) VALUES ({', '.join('?' * len(tick))})",
+                  tuple(tick.values()))
+    with db.get_db() as c:
+        src = db.research_source(c, "crypto15m_ticks")
+        assert c.execute(f"SELECT COUNT(*) FROM {src} t").fetchone()[0] == 1
+    db.cleanup_old_data()
+    assert len(_archived("crypto15m_ticks")) == 1
+    with db.get_db() as c:
+        assert c.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0] == 0
+
+
+def test_factory_reset_keeps_the_archive_and_reused_ids_archive_as_new_rows(fresh_db):
+    with db.get_db() as c:
+        c.execute("INSERT INTO alerts (ticker, created_at) VALUES ('A-before', ?)", (_OLD,))
+    db.cleanup_old_data()
+    db.factory_reset()
+    assert [r["ticker"] for r in _archived("alerts")] == ["A-before"]
+    with db.get_db() as c:
+        c.execute("INSERT INTO alerts (ticker, created_at) VALUES ('A-after', ?)",
+                  ("2001-01-01 00:00:00",))
+        assert c.execute("SELECT id FROM alerts").fetchone()[0] == 1
+    db.cleanup_old_data()
+    assert [r["ticker"] for r in _archived("alerts")] == ["A-before", "A-after"]
+
+
+def test_the_archive_gains_columns_the_live_table_gains(fresh_db):
+    with db.get_db() as c:
+        _seed_research(c, _OLD, "a")
+    db.cleanup_old_data()
+    with db.get_db() as c:
+        c.execute("ALTER TABLE crypto15m_ticks ADD COLUMN future_feature REAL")
+        c.execute("INSERT INTO crypto15m_ticks (ticker, asset, observed_at, future_feature)"
+                  " VALUES ('C15-b', 'ETH', ?, 1.5)", (_OLD,))
+    db.cleanup_old_data()
+    rows = {r["ticker"]: r for r in _archived("crypto15m_ticks")}
+    assert rows["C15-b"]["future_feature"] == pytest.approx(1.5)
+    assert rows["C15-a"]["future_feature"] is None
+
+
+def test_research_rows_stay_when_the_archive_cannot_take_them(fresh_db):
+    db.research_archive_path().mkdir()
+    with db.get_db() as c:
+        _seed_research(c, _OLD, "old")
+        _add_trade(c, "old-trade", _OLD)
+    db.cleanup_old_data()
+    with db.get_db() as c:
+        for t in _RESEARCH:
+            assert c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 1, t
+        assert c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+
+
+def test_a_research_backlog_moves_in_batches(fresh_db):
+    with db.get_db() as c:
+        for i in range(250):
+            c.execute("INSERT INTO crypto15m_ticks (ticker, asset, observed_at)"
+                      " VALUES (?, 'BTC', ?)", (f"T{i}", _OLD))
+    with db._research_archive() as ac:
+        n = db._archive_batched(ac, "observed_at < ?", (_now(),), "crypto15m_ticks", batch=100)
+    assert n == 250
+    assert len(_archived("crypto15m_ticks")) == 250
+    with db.get_db() as c:
+        assert c.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0] == 0
+
+
+def test_backtest_and_replay_readers_see_archived_rows(fresh_db):
+    import sqlite3 as _sq
+
+    import backtest
+    import replay
+    from config import merge_with_defaults
+
+    with db.get_db() as c:
+        _seed_research(c, _days_ago(70), "c15")
+        _seed_research(c, _days_ago(50), "whale")
+        c.execute("DELETE FROM crypto15m_signals WHERE ticker='C15-whale'")
+        c.execute("DELETE FROM crypto15m_ticks WHERE ticker='C15-whale'")
+        c.execute("DELETE FROM whale_trades WHERE trade_id='W-c15'")
+    db.cleanup_old_data()
+    with db.get_db() as c:
+        for t in _RESEARCH:
+            assert c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0, t
+
+    conn = _sq.connect(f"file:{fresh_db}?mode=ro", uri=True)
+    try:
+        assert len(backtest.load_crypto15m_signals(conn, interval="15m")) == 1
+        assert [s["source"] for s in backtest.load_resolved_signals(conn)] == ["whale"]
+        with pytest.raises(_sq.OperationalError):
+            conn.execute("DELETE FROM research_archive.whale_trades")
+    finally:
+        conn.close()
+    assert list(replay.load_windows("mainnet", "15m", since_days=90)) == ["C15-c15"]
+    assert replay.load_windows("mainnet", "15m", since_days=60) == {}
+    assert replay.replay_main(merge_with_defaults({}), since_days=60)["windowsScanned"] == 1
+    with db.get_db() as c:
+        assert db.research_source(c, "crypto15m_ticks", 60) == "crypto15m_ticks"

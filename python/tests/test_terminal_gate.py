@@ -1,3 +1,32 @@
+"""The per-host gate: fast, but still disciplined.
+
+The gate used to hold its lock across the WHOLE round trip plus the min-gap
+sleep, so every request to a host was strictly serial. A Discover load that
+needs ~20 Gamma calls paid 20 × (RTT + 0.12s) — five to eight seconds of
+skeletons for work that overlaps almost perfectly. The lock now covers only
+the spacing DECISION (next allowed start, sleep the gap, stamp the start) and
+a per-host semaphore bounds how many requests are actually in flight.
+
+Speed is the easy half. The hard half is that nothing the gate exists for may
+be lost in the process, so this file pins both sides:
+
+  • overlap        — N slow requests cost far less than N × latency
+  • spacing        — request STARTS are still ≥ min_gap apart (cost discipline)
+  • the park       — a 429 parks the host, and a request during the park fails
+                     FAST rather than queueing behind a doomed retry
+  • the park holds — an in-flight request that lands after a 429 must not
+                     clear or shorten the park
+  • serial hosts   — the AI providers stay strictly one-at-a-time, because
+                     their SDKs run with max_retries=0 and this park is the
+                     single retry authority
+  • the counters   — every request that STARTS is counted, so the privacy
+                     panel's numbers stay true
+  • single flight  — two identical concurrent requests still cost one call
+
+Wall-clock assertions are deliberately generous: Windows' timer granularity is
+~15.6ms, so an `asyncio.sleep(0.01)` really takes ~16ms. The bounds below are
+still several times smaller than the serial behaviour they guard against.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +38,10 @@ import terminal as t
 
 
 def _run(coro):
+    """A brand new loop per test: the gate's lock and semaphore are created
+    lazily and then bound to whichever loop first used them."""
     return asyncio.new_event_loop().run_until_complete(coro)
+
 
 
 class _Resp:
@@ -22,6 +54,8 @@ class _Resp:
 
 
 class _Stub:
+    """A stand-in HTTP client that records when each request started and how
+    many were in flight at once."""
 
     def __init__(self, delay: float = 0.05, status=200) -> None:
         self.delay = delay
@@ -49,6 +83,7 @@ class _Stub:
 
 @pytest.fixture
 def stub(monkeypatch):
+    """Installs a fake client and hands the test the stub it will see."""
     def _install(**kw) -> _Stub:
         s = _Stub(**kw)
 
@@ -63,6 +98,8 @@ def stub(monkeypatch):
 
 @pytest.fixture
 def gate():
+    """A reset gate, with every field put back afterwards — `_gates` is module
+    state the rest of the suite shares."""
     touched: dict[str, dict] = {}
 
     def _get(host: str, *, min_gap=None, concurrency=None) -> t._Gate:
@@ -94,10 +131,16 @@ def gate():
 
 
 def _params(i: int) -> dict:
+    """Distinct params so each request is a distinct cache key — the point of
+    these tests is concurrency, not coalescing."""
     return {"limit": 1, "n": i}
 
 
+
 def test_eight_slow_requests_overlap_instead_of_queueing(gate, stub):
+    """The regression this whole change exists for. Serially this is
+    8 × (50ms + gap) ≈ half a second; with the lock released before the call
+    it is roughly two waves of 50ms."""
     g = gate("gamma", min_gap=0.01, concurrency=4)
     s = stub(delay=0.05)
 
@@ -120,6 +163,7 @@ def test_eight_slow_requests_overlap_instead_of_queueing(gate, stub):
 
 
 def test_in_flight_requests_are_bounded_by_the_host_concurrency(gate, stub):
+    """'Not serial' must not become 'unbounded'. Twelve requests, four slots."""
     gate("gamma", min_gap=0.0, concurrency=4)
     s = stub(delay=0.02)
 
@@ -133,7 +177,11 @@ def test_in_flight_requests_are_bounded_by_the_host_concurrency(gate, stub):
     assert s.peak == 4, f"peak concurrency was {s.peak}, expected the 4-slot bound"
 
 
+
 def test_request_starts_are_still_spaced_by_min_gap(gate, stub):
+    """Cost discipline. Overlapping the round trips is fine; machine-gunning
+    the provider is not, and that distinction is the entire reason the lock
+    still exists at all."""
     gap = 0.02
     gate("gamma", min_gap=gap, concurrency=4)
     s = stub(delay=0.05)
@@ -151,7 +199,11 @@ def test_request_starts_are_still_spaced_by_min_gap(gate, stub):
         f"min_gap is {gap * 1000:.0f}ms")
 
 
+
 def test_a_429_parks_the_host_and_the_next_request_fails_fast(gate, stub):
+    """The bug the park exists to prevent: a discovery burst 429s the
+    provider and the doomed retries starve the chart, which renders blank
+    while a plain curl to the same endpoint returns 200."""
     g = gate("gamma", min_gap=0.01, concurrency=4)
     s = stub(delay=0.01, status=429)
 
@@ -172,6 +224,9 @@ def test_a_429_parks_the_host_and_the_next_request_fails_fast(gate, stub):
 
 
 def test_a_parked_host_fails_fast_even_with_every_slot_busy(gate, stub):
+    """The park is checked BEFORE the semaphore. Checking it after would mean
+    a parked host with four requests on the wire made the fifth caller WAIT to
+    be told no — which is the starvation the park exists to prevent."""
     g = gate("gamma", min_gap=0.0, concurrency=4)
     stub(delay=0.1)
 
@@ -194,6 +249,9 @@ def test_a_parked_host_fails_fast_even_with_every_slot_busy(gate, stub):
 
 
 def test_an_in_flight_response_does_not_clear_or_shorten_the_park(gate, stub):
+    """With several requests in flight, a 429 lands while others are still on
+    the wire. Their completion — success or not — must not unpark the host,
+    and a second 429 must not pull the expiry back in."""
     g = gate("gamma", min_gap=0.0, concurrency=4)
     s = stub(delay=0.02, status=lambda n: 429 if n == 0 else 200)
 
@@ -212,13 +270,19 @@ def test_an_in_flight_response_does_not_clear_or_shorten_the_park(gate, stub):
     assert g.parked_until == far, "a second 429 pulled the park expiry back in"
 
 
+
 def test_the_ai_hosts_are_declared_serial():
+    """Both SDKs are constructed with max_retries=0 so this park is the single
+    retry authority. Letting several calls run at once would give a rate limit
+    several chances to compound before the park lands."""
     for host in ("anthropic", "openai"):
         assert t._HOSTS[host]["concurrency"] == 1
         assert t._gates[host].concurrency == 1
 
 
 def test_an_ai_host_runs_one_call_at_a_time(gate):
+    """The real check: ai_analysis holds `gate.lock()` across its whole SDK
+    call, so raising _fetch's concurrency must not have made these overlap."""
     import ai_analysis as ai
 
     g = gate("anthropic", min_gap=0.0, concurrency=1)
@@ -241,7 +305,10 @@ def test_an_ai_host_runs_one_call_at_a_time(gate):
     assert g.calls == 4
 
 
+
 def test_every_request_that_starts_is_counted(gate, stub):
+    """The panel's claim is 'requests this machine made'. A call still in
+    flight was still made, and one that failed on the wire was still made."""
     g = gate("gamma", min_gap=0.0, concurrency=4)
     s = stub(delay=0.01)
 
@@ -297,7 +364,12 @@ def test_health_reports_the_calls_the_gate_counted(gate, stub):
     assert row["errors"] == 0
 
 
+
 def test_identical_concurrent_requests_are_coalesced(gate, stub):
+    """Discover's `volume` and `volatility` columns send byte-identical Gamma
+    params, and so does a text search. The old gate deduped them only as a
+    side effect of serialising; now it is explicit, or one page load pays
+    three times for one answer."""
     g = gate("gamma", min_gap=0.0, concurrency=4)
     s = stub(delay=0.05)
 
@@ -315,6 +387,9 @@ def test_identical_concurrent_requests_are_coalesced(gate, stub):
 
 
 def test_a_cancelled_caller_does_not_strand_the_others(gate, stub):
+    """The panel closes mid-request. The shared in-flight future is shielded,
+    so the caller that walked away cannot cancel the request the others are
+    riding on — and the leader always resolves it, so nobody hangs."""
     gate("gamma", min_gap=0.0, concurrency=4)
     s = stub(delay=0.05)
 
@@ -338,6 +413,8 @@ def test_a_cancelled_caller_does_not_strand_the_others(gate, stub):
 
 
 def test_the_inflight_registry_is_empty_after_a_failure(gate, monkeypatch):
+    """A leaked entry would make every later request for that key await a
+    future nobody will ever resolve."""
     gate("gamma", min_gap=0.0, concurrency=4)
 
     class _Boom:
@@ -350,6 +427,7 @@ def test_the_inflight_registry_is_empty_after_a_failure(gate, monkeypatch):
     monkeypatch.setattr(t.api, "_get_client", _get_client)
     assert _run(t._fetch("gamma", "/markets", {"limit": 3}, ttl=30.0)) == (None, None)
     assert not t._inflight
+
 
 
 def test_offline_still_short_circuits_before_any_slot_is_taken(gate, stub):

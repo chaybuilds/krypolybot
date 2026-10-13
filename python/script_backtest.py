@@ -1,7 +1,30 @@
+"""Backtest a user strategy script over the recorded tick corpus.
+
+Same data, same fill honesty as `replay.py` (real-book asks only, fee-v2
+taker fees, optional quote-stability / latency toggles), but the entry
+decision comes from the script's `decide(ctx)` instead of the built-in
+gates. Windows are replayed in chronological close-time order so a stateful
+script sees history the way it would live; `state` persists across the whole
+run and `on_start` / `on_fill` / `on_settle` fire at the equivalent points.
+
+Structurally order-free: this module never imports polymarket_api —
+decide() returns data, the harness does the accounting. A backtest cannot
+place an order by construction. (Scripts are full Python and could import an
+HTTP client themselves; that is what the script audit is for. This guarantee
+is about the harness, not about what arbitrary user code can reach.)
+
+Hook calls here run TRACED (script_sandbox.call_budgeted(traced=True)) rather
+than thread-bounded like the live engine: one run makes thousands of calls,
+far too many to give each its own thread, and without an in-call budget a
+single `while True:` in decide() would hang the backend's RPC forever.
+"""
 from __future__ import annotations
 
 import json
+import heapq
+import math
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import backtest as bt
@@ -16,7 +39,16 @@ MAX_RUN_SECS = 90.0
 DECIDE_BUDGET_MS = 500.0
 
 
+
 def parse_asset_scope(raw: Any) -> Optional[list]:
+    """A script's own coin scope: None/empty = every coin the snapshot has.
+
+    Deliberately NOT crypto15m_assets. That key belongs to the 15m Crypto
+    tab's engine, and reading it here meant a preset applied over there (the
+    5m preset pins ['BTC']) silently narrowed every script in the app, in the
+    live engine AND in the backtest, with nothing in the Scripts UI hinting
+    at it — a script would simply stop finding setups on five of six coins.
+    """
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -37,6 +69,9 @@ def script_allows_asset(scope: Optional[list], asset: str) -> bool:
 
 
 def sanitize_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Coerce whatever decide() returned into a clean order intent, or a
+    human-readable rejection. Shared by backtest and the live engine so the
+    two can never disagree on the contract."""
     if raw is None:
         return None, None
     if not isinstance(raw, dict):
@@ -83,6 +118,9 @@ def sanitize_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def sanitize_market_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """decide_market() contract. Same shape as decide()'s intent except the
+    side names the outcome token directly ('yes'/'no') rather than the
+    crypto window's up/down, because a general market has no up/down."""
     if raw is None:
         return None, None
     if not isinstance(raw, dict):
@@ -121,6 +159,13 @@ def sanitize_market_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def _hours_to_close(close_time: Any) -> Optional[float]:
+    """Hours until a market resolves, or None if unknown.
+
+    Scripts cannot compute this themselves — the sandbox has no imports, so no
+    datetime and no way to parse an ISO string. Without it a strategy meant for
+    same-day games happily buys the NO side of "team X wins the 2027 finals" at
+    98c and holds it for 18 months, which is a completely different trade.
+    """
     s = str(close_time or "").strip()
     if not s:
         return None
@@ -139,6 +184,10 @@ def _hours_to_close(close_time: Any) -> Optional[float]:
 
 
 def market_to_js(m: dict) -> dict:
+    """A markets row as the dict handed to decide_market(). Prices are
+    FRACTIONS 0..1 to match every other script field, and are the app's last
+    cached quote — the live ask is fetched only if the script actually wants
+    to trade, so scanning stays cheap."""
     def _f(v):
         try:
             f = float(v)
@@ -179,6 +228,10 @@ def market_to_js(m: dict) -> dict:
 
 
 def sanitize_manage(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Coerce whatever manage() returned into a clean action, or a rejection.
+    None / "hold" = keep holding; "sell" (or {"action":"sell"}) = flatten the
+    whole position at the bid now; {"action":"update", take_profit_pct?,
+    stop_loss_cents?} = retune the exit targets (0 clears one)."""
     if raw is None or raw == "hold":
         return None, None
     if raw == "sell":
@@ -211,6 +264,11 @@ def sanitize_manage(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def sanitize_signal_action(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """decide_signal() contract: None = skip; True (or {"follow": True,
+    "sizeUsd"?}) = follow the signal's own side with follower economics.
+    Scripts FILTER and SIZE signals — they can't flip sides (side-flipped
+    fills aren't derivable from the recorded data, so they'd be
+    unbacktestable)."""
     if raw is None or raw is False:
         return None, None
     if raw is True:
@@ -232,6 +290,9 @@ def sanitize_signal_action(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def signal_to_js(sig: dict, source: str) -> dict:
+    """The dict handed to decide_signal(signal) — shared by the live engine
+    and the backtest so they can never drift. Numeric gate fields come from
+    the same builder the main engine's rules use."""
     import trader as trader_mod
     try:
         vals = trader_mod._signal_rule_values(sig, source)
@@ -264,71 +325,89 @@ def signal_to_js(sig: dict, source: str) -> dict:
     }
 
 
-def _sim_exits(
-    script: "script_sandbox.CompiledScript", ticks: list[dict], entry_idx: int,
-    *, side: str, cost: float, size: int, tp_pct: Optional[float],
-    sl_cents: Optional[int], ticker: str, asset_name: str, cfg: dict,
-    close_iso: str, portfolio: dict,
+def _exit_step(
+    script: "script_sandbox.CompiledScript", t2: dict, p: dict, cfg: dict,
+    portfolio: dict,
 ) -> Optional[tuple[float, str]]:
-    has_manage = "manage" in script.hooks
-    if not has_manage and not tp_pct and not sl_cents:
+    """One post-entry tick of the exit layer for open position `p`: static
+    tp/sl triggers (retunable by manage) checked first, then the script's
+    manage() hook. Sells fill into that tick's REAL bid with both taker fees
+    charged. Returns (pnl_per_contract, reason) when it exits, else None.
+    Raises ScriptError if manage() dies or returns garbage (matches live,
+    where that auto-disables the script)."""
+    side, cost = p["side"], p["cost"]
+    if side == "up":
+        bid = t2.get("yes_bid")
+    else:
+        ya = t2.get("yes_ask")
+        bid = (1.0 - float(ya)) if ya is not None else None
+    if bid is not None:
+        bid = float(bid)
+        if not (0.0 < bid < 1.0):
+            bid = None
+
+    def _sell(reason: str) -> tuple[float, str]:
+        exit_fee = bt.polymarket_fee_per_contract(bid, category="crypto")
+        return (bid - cost) - p["entry_fee"] - exit_fee, reason
+
+    if bid is not None:
+        if p["want_sell"]:
+            return _sell("script_exit")
+        if p["sl_cents"] and bid * 100.0 <= float(p["sl_cents"]):
+            return _sell("stop_loss")
+        if p["tp_pct"] and bid >= cost * (1.0 + float(p["tp_pct"])):
+            return _sell("take_profit")
+    if not p["has_manage"]:
         return None
-    entry_fee = bt.polymarket_fee_per_contract(cost, category="crypto")
-    want_sell = False
-    for t2 in ticks[entry_idx + 1:]:
-        if side == "up":
-            bid = t2.get("yes_bid")
-        else:
-            ya = t2.get("yes_ask")
-            bid = (1.0 - float(ya)) if ya is not None else None
+    ctx = replay.tick_to_asset(t2, cfg, p["close_iso"])
+    ctx["portfolio"] = portfolio
+    pos = {
+        "ticker": p["ticker"], "asset": p["asset"], "side": side,
+        "contracts": p["size"], "avgEntryCents": round(cost * 100, 1),
+        "curBidCents": round(bid * 100, 1) if bid is not None else None,
+        "minsLeft": ctx.get("minsLeft"),
+        "tpPct": p["tp_pct"], "slCents": p["sl_cents"],
+        "unrealizedPct": round((bid - cost) / cost, 4) if bid is not None and cost > 0 else None,
+    }
+    act_raw = script.call("manage", pos, ctx, budget_ms=DECIDE_BUDGET_MS)
+    act, err = sanitize_manage(act_raw)
+    if err:
+        raise script_sandbox.ScriptError(f"manage(): {err}")
+    if act is None:
+        return None
+    if act["action"] == "sell":
         if bid is not None:
-            bid = float(bid)
-            if not (0.0 < bid < 1.0):
-                bid = None
-
-        def _sell(reason: str) -> tuple[float, str]:
-            exit_fee = bt.polymarket_fee_per_contract(bid, category="crypto")
-            return (bid - cost) - entry_fee - exit_fee, reason
-
-        if bid is not None:
-            if want_sell:
-                return _sell("script_exit")
-            if sl_cents and bid * 100.0 <= float(sl_cents):
-                return _sell("stop_loss")
-            if tp_pct and bid >= cost * (1.0 + float(tp_pct)):
-                return _sell("take_profit")
-        if not has_manage:
-            continue
-        ctx = replay.tick_to_asset(t2, cfg, close_iso)
-        ctx["portfolio"] = dict(portfolio, openCount=1)
-        pos = {
-            "ticker": ticker, "asset": asset_name, "side": side,
-            "contracts": size, "avgEntryCents": round(cost * 100, 1),
-            "curBidCents": round(bid * 100, 1) if bid is not None else None,
-            "minsLeft": ctx.get("minsLeft"),
-            "tpPct": tp_pct, "slCents": sl_cents,
-            "unrealizedPct": round((bid - cost) / cost, 4) if bid is not None and cost > 0 else None,
-        }
-        act_raw = script.call("manage", pos, ctx, budget_ms=DECIDE_BUDGET_MS)
-        act, err = sanitize_manage(act_raw)
-        if err:
-            raise script_sandbox.ScriptError(f"manage(): {err}")
-        if act is None:
-            continue
-        if act["action"] == "sell":
-            if bid is not None:
-                return _sell("script_exit")
-            want_sell = True
-        else:
-            if "take_profit_pct" in act:
-                tp_pct = act["take_profit_pct"] or None
-            if "stop_loss_cents" in act:
-                sl_cents = act["stop_loss_cents"] or None
+            return _sell("script_exit")
+        p["want_sell"] = True
+    else:
+        if "take_profit_pct" in act:
+            p["tp_pct"] = act["take_profit_pct"] or None
+        if "stop_loss_cents" in act:
+            p["sl_cents"] = act["stop_loss_cents"] or None
     return None
+
+
+def _epoch(ts: Any) -> float:
+    """Epoch seconds from a tick's observed_at ('YYYY-MM-DD HH:MM:SS') or a
+    window's close ('YYYY-MM-DDTHH:MM:SSZ'); +inf when unparseable, which
+    settles that window last (never early)."""
+    txt = str(ts or "").strip().replace("T", " ")
+    try:
+        return datetime.strptime(txt[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return math.inf
 
 
 def run(cfg: dict, code: str, *, assets: Optional[list] = None,
         env: str = "mainnet", since_days: int = 60) -> dict:
+    """Backtest `code` over recorded resolved windows. Returns the standard
+    Crypto15mBacktest payload extended with scriptLogs / scriptError /
+    intent-rejection counters.
+
+    `assets` is the SCRIPT's own coin scope (None = all). It is not read from
+    cfg, so a backtest replays the same universe the live engine would give
+    this script no matter how the 15m Crypto tab is currently configured."""
     cfg = dict(cfg)
     scope = parse_asset_scope(assets)
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
@@ -353,10 +432,12 @@ def run(cfg: dict, code: str, *, assets: Optional[list] = None,
                 "interval": interval, "scriptLogs": []}
 
     with dbmod.get_db() as conn:
+        ticks = dbmod.research_source(conn, "crypto15m_ticks", since_days)
+        sigs = dbmod.research_source(conn, "crypto15m_signals", since_days)
         rows = conn.execute(
-            """SELECT t.*, s.up_won, s.close_time AS sig_close
-               FROM crypto15m_ticks t
-               JOIN crypto15m_signals s
+            f"""SELECT t.*, s.up_won, s.close_time AS sig_close
+               FROM {ticks} t
+               JOIN {sigs} s
                  ON s.ticker = t.ticker AND s.network = t.network
                WHERE s.resolved = 1 AND s.up_won IS NOT NULL
                  AND t.network = ?
@@ -393,110 +474,176 @@ def run(cfg: dict, code: str, *, assets: Optional[list] = None,
     if no_window_hook:
         windows = []
 
+    wins: dict[str, dict] = {}
+    timeline: list[tuple[float, str, str, int]] = []
     for ticker, ticks in windows:
+        if not script_allows_asset(scope, str(ticks[0].get("asset") or "")):
+            continue
+        close_iso = str(ticks[0].get("sig_close") or "")
+        wins[ticker] = {
+            "ticks": ticks, "close_iso": close_iso, "close_at": _epoch(close_iso),
+            "up_won": int(ticks[0].get("up_won") or 0), "done": False, "pos": None,
+            "seen": False,
+        }
+        for k, t in enumerate(ticks):
+            timeline.append((_epoch(t.get("observed_at")), str(t.get("observed_at") or ""), ticker, k))
+    timeline.sort()
+    pending: list[tuple[float, int, str]] = []
+    seq = 0
+    open_count = 0
+
+    def _portfolio(day: str) -> dict:
+        return {
+            "balanceUsd": None, "openCount": open_count, "openPositions": [],
+            "todayPnlUsd": round(day_pnl.get(day, 0.0), 4),
+            "totalPnlUsd": round(run_pnl, 4),
+        }
+
+    def _settle(ticker: str, at: float, *, hooks: bool) -> None:
+        """Deliver a position's outcome: on_settle, then the P&L the
+        portfolio shows from here on."""
+        nonlocal run_pnl, script_error, open_count
+        w = wins[ticker]
+        p = w["pos"]
+        if not p or p.get("settled"):
+            return
+        p["settled"] = True
+        open_count -= 1
+        pnl_usd = p["pnl_ct"] * p["size"]
+        pos_lite = {
+            "ticker": ticker, "asset": p["asset"], "side": p["side"],
+            "costCents": round(p["cost"] * 100, 1), "contracts": p["size"],
+            "won": bool(p["won"]), "pnlUsd": round(pnl_usd, 4),
+            "exitReason": p["exit_reason"], "reason": p["reason"],
+        }
+        if hooks and not script_error:
+            try:
+                script.call("on_settle", pos_lite, script.state,
+                            budget_ms=DECIDE_BUDGET_MS)
+            except script_sandbox.SCRIPT_FAILURES as e:
+                script_error = str(e)
+        trades.append({
+            "ticker": ticker, "asset": p["asset"], "side": p["side"],
+            "costCents": round(p["cost"] * 100, 1),
+            "minsLeft": p["mins_left"], "won": bool(p["won"]),
+            "pnlUsd": round(pnl_usd, 4), "contracts": p["size"],
+            "exitReason": p["exit_reason"], "at": p["at"],
+            "closeTime": p["close_iso"],
+        })
+        run_pnl += pnl_usd
+        sday = (datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%d")
+                if math.isfinite(at) else p["at"][:10])
+        day_pnl[sday] = day_pnl.get(sday, 0.0) + pnl_usd
+
+    for now, observed, ticker, i in timeline:
         if script_error:
             break
         if time.perf_counter() - started > MAX_RUN_SECS:
             partial = True
             break
-        if not script_allows_asset(scope, str(ticks[0].get("asset") or "")):
-            continue
-        n_windows += 1
-        up_won = int(ticks[0].get("up_won") or 0)
-        close_iso = str(ticks[0].get("sig_close") or "")
-        for i, t in enumerate(ticks):
-            asset = replay.tick_to_asset(t, cfg, close_iso)
-            day = str(t.get("observed_at") or "")[:10]
-            portfolio = {
-                "balanceUsd": None, "openCount": 0, "openPositions": [],
-                "todayPnlUsd": round(day_pnl.get(day, 0.0), 4),
-                "totalPnlUsd": round(run_pnl, 4),
-            }
-            ctx = dict(asset)
-            ctx["portfolio"] = portfolio
+        while pending and pending[0][0] <= now:
+            at, _, tk = heapq.heappop(pending)
+            _settle(tk, at, hooks=True)
+        w = wins[ticker]
+        ticks = w["ticks"]
+        t = ticks[i]
+        if not w["seen"]:
+            w["seen"] = True
+            n_windows += 1
+        day = observed[:10]
+        p = w["pos"]
+        if p is not None:
+            if p.get("settled") or not p["exits"] or i <= p["fill_idx"]:
+                continue
             try:
-                raw = script.call("decide", ctx, budget_ms=DECIDE_BUDGET_MS)
+                ex = _exit_step(script, t, p, cfg, _portfolio(day))
             except script_sandbox.SCRIPT_FAILURES as e:
                 script_error = str(e)
                 break
-            if raw is None:
-                continue
-            intent, err = sanitize_intent(raw)
-            if err:
-                rejected_intents += 1
-                if rejected_intents <= 5:
-                    script._log_lines.append(f"[harness] rejected intent: {err}")
-                continue
-            side = intent["side"]
-            ask = replay._exec_ask(t, side)
-            if ask is None:
-                continue
-            ask_cents = ask * 100.0
-            if intent["price"] != "ask":
-                limit_c = float(intent["price"])
-                if limit_c > max_entry_cents:
-                    rail_refusals += 1
-                    break
-                if ask_cents > limit_c:
-                    continue
-            if ask_cents > max_entry_cents:
-                rail_refusals += 1
-                break
-            if stable_secs > 0 and replay._quote_stable_secs(ticks, i, side) < stable_secs:
-                continue
-            cost, fill_idx = float(ask), i
-            if latency_secs > 0:
-                filled = replay._latency_fill(
-                    ticks, i, side, cost, latency_secs, slip_tol)
-                if filled is None:
-                    latency_misses += 1
-                    continue
-                cost, fill_idx = filled
-            size = min(int(intent.get("size") or contracts), max_contracts)
-            fee = bt.polymarket_fee_per_contract(cost, category="crypto")
-            won = up_won if side == "up" else (1 - up_won)
-            pnl_ct = (1.0 - cost - fee) if won else (-cost - fee)
-            exit_reason = "settlement"
-            try:
-                ex = _sim_exits(
-                    script, ticks, fill_idx, side=side, cost=cost, size=size,
-                    tp_pct=intent.get("take_profit_pct"),
-                    sl_cents=intent.get("stop_loss_cents"),
-                    ticker=ticker, asset_name=str(asset.get("asset")),
-                    cfg=cfg, close_iso=close_iso, portfolio=portfolio,
-                )
-            except script_sandbox.SCRIPT_FAILURES as e:
-                script_error = str(e)
-                ex = None
             if ex is not None:
-                pnl_ct, exit_reason = ex
-                won = pnl_ct > 0
-            pos_lite = {
-                "ticker": ticker, "asset": asset.get("asset"), "side": side,
-                "costCents": round(cost * 100, 1), "contracts": size,
-                "won": bool(won), "pnlUsd": round(pnl_ct * size, 4),
-                "exitReason": exit_reason, "reason": intent.get("reason"),
-            }
-            try:
-                fill_lite = dict(pos_lite, won=None, pnlUsd=None,
-                                 exitReason=None)
-                script.call("on_fill", fill_lite, script.state,
-                            budget_ms=DECIDE_BUDGET_MS)
-                script.call("on_settle", dict(pos_lite), script.state,
-                            budget_ms=DECIDE_BUDGET_MS)
-            except script_sandbox.SCRIPT_FAILURES as e:
-                script_error = str(e)
-            trades.append({
-                "ticker": ticker, "asset": asset.get("asset"), "side": side,
-                "costCents": round(cost * 100, 1),
-                "minsLeft": asset.get("minsLeft"), "won": bool(won),
-                "pnlUsd": round(pnl_ct * size, 4), "contracts": size,
-                "exitReason": exit_reason,
-                "at": t.get("observed_at"),
-            })
-            run_pnl += pnl_ct * size
-            day_pnl[day] = day_pnl.get(day, 0.0) + pnl_ct * size
+                p["pnl_ct"], p["exit_reason"] = ex
+                p["won"] = p["pnl_ct"] > 0
+                _settle(ticker, now, hooks=True)
+            continue
+        if w["done"]:
+            continue
+        close_iso = w["close_iso"]
+        asset = replay.tick_to_asset(t, cfg, close_iso)
+        ctx = dict(asset)
+        ctx["portfolio"] = _portfolio(day)
+        try:
+            raw = script.call("decide", ctx, budget_ms=DECIDE_BUDGET_MS)
+        except script_sandbox.SCRIPT_FAILURES as e:
+            script_error = str(e)
             break
+        if raw is None:
+            continue
+        intent, err = sanitize_intent(raw)
+        if err:
+            rejected_intents += 1
+            if rejected_intents <= 5:
+                script._log_lines.append(f"[harness] rejected intent: {err}")
+            continue
+        side = intent["side"]
+        ask = replay._exec_ask(t, side)
+        if ask is None:
+            continue
+        ask_cents = ask * 100.0
+        if intent["price"] != "ask":
+            limit_c = float(intent["price"])
+            if limit_c > max_entry_cents:
+                rail_refusals += 1
+                w["done"] = True
+                continue
+            if ask_cents > limit_c:
+                continue
+        if ask_cents > max_entry_cents:
+            rail_refusals += 1
+            w["done"] = True
+            continue
+        if stable_secs > 0 and replay._quote_stable_secs(ticks, i, side) < stable_secs:
+            continue
+        cost, fill_idx = float(ask), i
+        if latency_secs > 0:
+            filled = replay._latency_fill(
+                ticks, i, side, cost, latency_secs, slip_tol)
+            if filled is None:
+                latency_misses += 1
+                continue
+            cost, fill_idx = filled
+        size = min(int(intent.get("size") or contracts), max_contracts)
+        fee = bt.polymarket_fee_per_contract(cost, category="crypto")
+        won = w["up_won"] if side == "up" else (1 - w["up_won"])
+        tp_pct = intent.get("take_profit_pct")
+        sl_cents = intent.get("stop_loss_cents")
+        w["done"] = True
+        w["pos"] = p = {
+            "ticker": ticker, "asset": asset.get("asset"), "side": side,
+            "cost": cost, "size": size, "fill_idx": fill_idx,
+            "entry_fee": fee, "tp_pct": tp_pct, "sl_cents": sl_cents,
+            "want_sell": False, "has_manage": "manage" in script.hooks,
+            "exits": bool("manage" in script.hooks or tp_pct or sl_cents),
+            "close_iso": close_iso, "reason": intent.get("reason"),
+            "mins_left": asset.get("minsLeft"), "at": observed,
+            "won": won, "pnl_ct": (1.0 - cost - fee) if won else (-cost - fee),
+            "exit_reason": "settlement",
+        }
+        open_count += 1
+        try:
+            script.call("on_fill", {
+                "ticker": ticker, "asset": p["asset"], "side": side,
+                "costCents": round(cost * 100, 1), "contracts": size,
+                "won": None, "pnlUsd": None, "exitReason": None,
+                "reason": p["reason"],
+            }, script.state, budget_ms=DECIDE_BUDGET_MS)
+        except script_sandbox.SCRIPT_FAILURES as e:
+            script_error = str(e)
+        seq += 1
+        heapq.heappush(pending, (w["close_at"], seq, ticker))
+
+    while pending:
+        at, _, tk = heapq.heappop(pending)
+        _settle(tk, at, hooks=not partial)
 
     caveats = [
         f"Replayed the {interval} window series only (the interval this config trades).",
@@ -545,23 +692,29 @@ def run(cfg: dict, code: str, *, assets: Optional[list] = None,
             "windows before the error. Live, this same error would auto-disable "
             "the script."
         ))
+    not_backtestable = None
     if no_window_hook:
         hooks = sorted(script.hooks) or ["(none)"]
-        caveats.insert(0, (
+        not_backtestable = (
             f"NOT BACKTESTABLE: this script defines {', '.join(hooks)} but no "
             "decide(ctx). The recorded corpus is crypto Up/Down windows only, "
             "so decide_market() / decide_signal() / supervise() have nothing to "
             "replay against — that is why there are 0 trades, NOT a lack of "
             "recorded data. Validate this script in SHADOW mode instead."
-        ))
-    elif n_windows == 0:
-        caveats.insert(0, (
-            f"No resolved {interval} windows recorded in the last {since_days} "
-            "days — the recorder only captures the interval selected on the "
-            "Crypto tab, so let data accumulate first."
-        ))
-    missing = sorted(
-        set(script_sandbox.find_ctx_fields(code)) - replay._DERIVABLE)
+        )
+        caveats.insert(0, not_backtestable)
+    no_data = None
+    if not no_window_hook and n_windows == 0:
+        no_data = replay.empty_replay_report(
+            interval, since_days, env=env,
+            windows_for_interval=len(by_window), assets=scope,
+        )
+    ctx_fields = set(script_sandbox.find_ctx_fields(code))
+    if ctx_fields & replay.MODEL_FIELDS:
+        _n_old, pre_cav = replay.pre_twap_model_caveat(trades, interval)
+        if pre_cav:
+            caveats.insert(0, pre_cav)
+    missing = sorted(ctx_fields - replay._DERIVABLE)
     if missing:
         caveats.insert(0, (
             "Script reads ctx fields not recorded in ticks (None during "
@@ -579,7 +732,12 @@ def run(cfg: dict, code: str, *, assets: Optional[list] = None,
             "backtestable counterfactual. Only its decide/manage effects show here."
         )
 
-    out = replay._summarize(trades, contracts, n_windows, caveats)
+    out = replay._summarize(
+        trades, contracts, n_windows, caveats,
+        empty_reason=not_backtestable or (no_data["message"] if no_data else None),
+    )
+    if no_data:
+        out["noData"] = no_data
     if no_window_hook:
         cav = list(out.get("caveats") or [])
         lead = [c for c in cav if c.startswith("NOT BACKTESTABLE")]
@@ -605,6 +763,10 @@ def run(cfg: dict, code: str, *, assets: Optional[list] = None,
 
 def _replay_signals(script: "script_sandbox.CompiledScript", cfg: dict, *,
                     since_days: int = 60, slippage_cents: float = 1.0) -> dict:
+    """Replay recorded whale prints + momentum alerts through the script's
+    decide_signal(signal) filter with follower economics — the same model as
+    the main-engine backtest (entry at signal price + slippage, category
+    fee-v2, outcome from the recorded resolution)."""
     fixed_usd = float(cfg.get("fixed_trade_usd") or 5.0)
     sig_max_entry_cents = float(cfg.get("script_max_entry_cents") or 97)
     sig_max_contracts = max(1, int(cfg.get("script_max_contracts") or 20))
@@ -612,13 +774,15 @@ def _replay_signals(script: "script_sandbox.CompiledScript", cfg: dict, *,
     rail_skips = 0
     with dbmod.get_db() as conn:
         whales = conn.execute(
-            """SELECT * FROM whale_trades WHERE resolved=1
+            f"""SELECT * FROM {dbmod.research_source(conn, "whale_trades", since_days)}
+               WHERE resolved=1
                AND outcome_correct IS NOT NULL
                AND created_at >= datetime('now', ?)""",
             (f"-{int(since_days)} days",),
         ).fetchall()
         alerts = conn.execute(
-            """SELECT * FROM alerts WHERE resolved=1
+            f"""SELECT * FROM {dbmod.research_source(conn, "alerts", since_days)}
+               WHERE resolved=1
                AND outcome_correct IS NOT NULL
                AND created_at >= datetime('now', ?)""",
             (f"-{int(since_days)} days",),
@@ -663,6 +827,7 @@ def _replay_signals(script: "script_sandbox.CompiledScript", cfg: dict, *,
             "costCents": round(cost * 100, 1), "minsLeft": None,
             "won": won, "pnlUsd": round(pnl_ct * n_ct, 4),
             "contracts": n_ct, "at": sig.get("created_at"),
+            "event": sig.get("event_ticker") or "",
         })
     caveats = [
         f"Follower economics: entry at the signal price +{slippage_cents:.0f}c slippage — live fills on fast markets can be worse.",

@@ -248,6 +248,7 @@ export function ScriptEditor({
       view.destroy();
       viewRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readOnly]);
 
   useEffect(() => {

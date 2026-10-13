@@ -1,3 +1,4 @@
+"""Tests for the fee-aware signal backtest math (backtest.py)."""
 from __future__ import annotations
 
 import pytest
@@ -7,24 +8,27 @@ import backtest as bt
 
 def sig(cost, correct, confidence=60.0, source="whale"):
     return {"source": source, "confidence": confidence, "cost": cost,
-            "correct": correct, "category": ""}
+            "correct": correct, "category": "crypto"}
 
 
 def sig_ev(cost, correct, event, confidence=60.0, source="whale"):
     return {"source": source, "confidence": confidence, "cost": cost,
-            "correct": correct, "category": "", "event": event}
+            "correct": correct, "category": "crypto", "event": event}
+
 
 
 def test_fee_is_rate_times_p_one_minus_p():
-    assert bt.polymarket_fee_per_contract(0.50) == pytest.approx(0.0175)
-    assert bt.polymarket_fee_per_contract(0.0) == 0.0
-    assert bt.polymarket_fee_per_contract(1.0) == 0.0
+    assert bt.polymarket_fee_per_contract(0.50, category="crypto") == pytest.approx(0.0175)
+    assert bt.polymarket_fee_per_contract(0.0, category="crypto") == 0.0
+    assert bt.polymarket_fee_per_contract(1.0, category="crypto") == 0.0
+    assert bt.polymarket_fee_per_contract(0.50) == pytest.approx(0.0125)
 
 
 def test_fee_is_symmetric_and_vanishes_at_extremes():
-    assert bt.polymarket_fee_per_contract(0.9) == pytest.approx(bt.polymarket_fee_per_contract(0.1))
-    assert bt.polymarket_fee_per_contract(0.9) < bt.polymarket_fee_per_contract(0.5)
-    assert bt.polymarket_fee_per_contract(0.97) == pytest.approx(0.07 * 0.97 * 0.03)
+    fee = lambda p: bt.polymarket_fee_per_contract(p, category="crypto")  # noqa: E731
+    assert fee(0.9) == pytest.approx(fee(0.1))
+    assert fee(0.9) < fee(0.5)
+    assert fee(0.97) == pytest.approx(0.07 * 0.97 * 0.03)
 
 
 def test_fee_respects_category_and_override():
@@ -33,12 +37,14 @@ def test_fee_respects_category_and_override():
     assert bt.polymarket_fee_per_contract(0.50, fee_coeff=0.05) == pytest.approx(0.0125)
 
 
+
 def test_net_pnl_win_subtracts_fee():
-    assert bt.net_pnl_per_contract(0.30, True) == pytest.approx(0.6853)
+    assert bt.net_pnl_per_contract(0.30, True, category="crypto") == pytest.approx(0.6853)
 
 
 def test_net_pnl_loss_adds_fee_to_loss():
-    assert bt.net_pnl_per_contract(0.30, False) == pytest.approx(-0.3147)
+    assert bt.net_pnl_per_contract(0.30, False, category="crypto") == pytest.approx(-0.3147)
+
 
 
 def test_signal_cost_whale_uses_taker_price():
@@ -48,6 +54,7 @@ def test_signal_cost_whale_uses_taker_price():
 def test_signal_cost_momentum_no_side_inverts():
     assert bt.signal_cost({"price": 0.30, "direction": "no"}, "momentum") == pytest.approx(0.70)
     assert bt.signal_cost({"price": 0.30, "direction": "yes"}, "momentum") == pytest.approx(0.30)
+
 
 
 def test_fair_odds_lose_exactly_the_fee():
@@ -73,11 +80,13 @@ def test_empty_summary_is_zeroed():
     assert s["n"] == 0 and s["net_ev"] == 0.0
 
 
+
 def test_threshold_sweep_filters_by_confidence():
     signals = [sig(0.5, True, confidence=60), sig(0.5, True, confidence=80)]
     rows = bt.threshold_sweep(signals, [50, 70, 90])
     by_th = {r["threshold"]: r["n"] for r in rows}
     assert by_th == {50: 2, 70: 1, 90: 0}
+
 
 
 def test_solo_signals_have_per_event_t_equal_to_per_signal_t():
@@ -113,6 +122,7 @@ def test_verdict_inconclusive_when_too_few_events():
     assert "events" in rep["verdict"]
 
 
+
 def test_verdict_flags_small_samples_inconclusive():
     s = bt.summarize([sig(0.5, True)])
     assert "INCONCLUSIVE" in bt.verdict(s, [])
@@ -139,3 +149,30 @@ def test_taker_rebate_tier_nets_fee_estimates():
         bt.set_taker_rebate(0)
         crypto15m.set_taker_rebate(0)
     assert bt.polymarket_fee_per_contract(0.5, category="crypto") == pytest.approx(base)
+
+
+
+def test_report_charges_a_one_cent_spread_by_default():
+    signals = [sig(0.50, True) for _ in range(6)] + [sig(0.50, False) for _ in range(4)]
+    rep = bt.build_report(signals, None)
+    assert rep["spread_cents"] == 1.0
+    fee = bt.polymarket_fee_per_contract(0.51, category="crypto")
+    assert rep["overall"]["gross_ev"] == pytest.approx(0.09)
+    assert rep["overall"]["net_ev"] == pytest.approx(0.09 - fee)
+
+
+def test_report_prints_a_spread_sweep():
+    signals = [sig(0.50, i % 3 != 0) for i in range(60)]
+    rep = bt.build_report(signals, None)
+    by = {r["spread_cents"]: r["net_ev"] for r in rep["spread_sweep"]}
+    assert sorted(by) == [0.0, 1.0, 2.0]
+    assert by[0.0] > by[1.0] > by[2.0]
+    assert by[1.0] == pytest.approx(rep["overall"]["net_ev"])
+    text = bt.format_report(rep, "test")
+    assert "SPREAD / SLIPPAGE SWEEP" in text
+    assert "+ 1¢ spread" in text
+
+
+def test_fading_pays_the_spread_on_the_other_side():
+    f = bt.summarize_fade([sig(0.30, False)], spread_cents=1.0)
+    assert f["avg_cost"] == pytest.approx(0.71)

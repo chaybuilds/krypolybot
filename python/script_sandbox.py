@@ -1,3 +1,39 @@
+"""Compile / execute user strategy scripts, and contain how long they run.
+
+A user script is ordinary Python that defines `decide(ctx)` (plus optional
+`decide_market` / `manage` / `decide_signal` / `supervise` /
+`on_start` / `on_fill` / `on_settle` hooks).
+
+NO LANGUAGE SANDBOX. Scripts run as full Python with the real builtins, in
+the same process as the trading engine — which is the process holding the
+decrypted wallet key. This is deliberate: the AST whitelist that used to
+gate scripts blocked imports, classes, and most of the standard library,
+which made every non-trivial strategy fight the tool, while never being a
+real security boundary (CPython sandboxes are escapable, and the module said
+so). Rather than pretend, the app now REVIEWS instead of restricting:
+`script_audit.py` statically scans every script for network, filesystem,
+subprocess, dynamic-exec, environment and wallet/key access — plus
+obfuscation, which is flagged as its own critical finding — and the Scripts
+page shows those findings before the script is enabled or armed.
+
+Read a script before you run it. The audit is a smoke detector, not a lock.
+
+WHAT THIS MODULE STILL GUARANTEES is liveness, not safety: a script cannot
+wedge the engine.
+
+  • Live engine — every hook runs in a joined daemon thread with a hard
+    wall-clock timeout (`script_engine._run_bounded`). A hook that blocks
+    past it is abandoned and the script is auto-disabled, so the master loop
+    keeps its cadence no matter what the script does.
+  • Backtest — thousands of hook calls per run, far too many to give each
+    its own thread, so the replay path opts into `traced=True`: a wall-clock
+    tracer that raises inside the script's own frame. Without it a single
+    `while True:` in decide() would hang the backend's RPC forever.
+
+The MONEY rails (max entry price, max size, max open, per-script daily-loss
+breaker, one-entry-per-window) live in script_engine and apply to every
+script unconditionally. Removing the language sandbox did not touch them.
+"""
 from __future__ import annotations
 
 import ast
@@ -9,6 +45,10 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+import script_audit
+
+script_audit.pin_recursion_limit()
+
 MAX_CODE_BYTES = 128 * 1024
 HOOK_NAMES = ("decide", "decide_market", "manage", "decide_signal",
               "supervise", "on_start", "on_fill", "on_settle")
@@ -19,17 +59,32 @@ INJECTED_GLOBALS = ("math", "statistics", "state", "log", "ctx")
 
 
 class ScriptError(Exception):
-    pass
+    """A script failed validation, compilation, or raised at runtime."""
 
 
 class ScriptBudgetExceeded(BaseException):
-    pass
+    """A hook call exceeded its wall-clock budget (runaway-loop guard).
+
+    Deliberately NOT an Exception subclass. The tracer raises this INSIDE the
+    script's own frame, so a script's `except Exception:` would otherwise
+    swallow it — and because CPython drops the trace function the moment a
+    trace callback raises, the budget would then be gone for the rest of that
+    call (a runaway loop running unbounded, hanging the backtest).
+    BaseException walks straight past every `except Exception`, and
+    call_budgeted() re-checks after the call for anything that still gets by.
+
+    Engine code that means "any script failure" must catch ScriptError AND
+    this (or BaseException) — see _run_bounded in script_engine.py."""
 
 
 SCRIPT_FAILURES = (ScriptError, ScriptBudgetExceeded)
 
 
+
 def parse_header(code: str) -> dict:
+    """Read the `# krypt-script v1` metadata header from the top comment
+    block: name / description lines. Missing header is not fatal (the save
+    path fills defaults) but the AI import flow requires it."""
     meta = {"version": None, "name": "", "description": ""}
     for line in code.splitlines()[:15]:
         s = line.strip()
@@ -49,6 +104,9 @@ def parse_header(code: str) -> dict:
 
 
 def find_ctx_fields(code: str) -> list[str]:
+    """Static scan of the ctx fields a script reads (`ctx["x"]` and
+    `ctx.get("x")`), so validation can warn when a field isn't recorded in
+    ticks (it would be None in backtest — fail-closed, same as rules)."""
     fields: set[str] = set()
     try:
         tree = ast.parse(code)
@@ -70,7 +128,17 @@ def find_ctx_fields(code: str) -> list[str]:
     return sorted(fields)
 
 
+
 def validate(code: str) -> list[str]:
+    """Errors that make a script unrunnable: too big, doesn't parse, or
+    defines none of the hooks the engine calls. Returns [] when the script
+    will at least load.
+
+    This is a CORRECTNESS check, not a safety one — what a script is allowed
+    to DO is no longer restricted here. For "is this script doing something
+    alarming", call script_audit.audit(); its findings are surfaced beside
+    these errors in the UI and never block a save.
+    """
     if len(code.encode("utf-8", "replace")) > MAX_CODE_BYTES:
         return [f"script exceeds {MAX_CODE_BYTES // 1024}KB"]
     try:
@@ -93,7 +161,15 @@ def validate(code: str) -> list[str]:
     return []
 
 
+
 class _Tracer:
+    """Wall-clock tracer with a sticky `tripped` flag. The flag is what makes
+    the budget survive a script that intercepts the raise: once tripped, the
+    call is rejected even if the exception never reaches call_budgeted.
+
+    Time only — there is no step cap. A step cap punishes a legitimately
+    heavy computation for being efficient about wall-clock, and the clock is
+    the thing the engine actually cares about."""
 
     __slots__ = ("count", "deadline", "tripped", "why")
 
@@ -103,7 +179,7 @@ class _Tracer:
         self.tripped = False
         self.why = ""
 
-    def __call__(self, frame, event, arg):
+    def __call__(self, frame, event, arg):  # noqa: ANN001 - trace signature
         self.count += 1
         if self.count % 64 == 0 and time.perf_counter() > self.deadline:
             self.tripped = True
@@ -114,6 +190,17 @@ class _Tracer:
 
 def call_budgeted(fn: Callable, *args: Any, budget_ms: float = 250.0,
                   traced: bool = False) -> Any:
+    """Call a script hook. With `traced=False` (the live engine) the hook runs
+    bare and the caller provides containment — script_engine runs every hook
+    in a joined daemon thread with a hard timeout. With `traced=True` (the
+    backtest, which makes thousands of calls and cannot afford a thread each)
+    a wall-clock tracer bounds the call from inside.
+
+    Two layers when traced, because the tracer alone is defeatable: it raises
+    ScriptBudgetExceeded (a BaseException, so `except Exception:` misses it),
+    and afterwards we reject any call that tripped the budget or that lost its
+    trace function — CPython unsets tracing as soon as a trace callback raises,
+    so a call that comes back untraced ran part of its work unmetered."""
     if not traced:
         return fn(*args)
     deadline = time.perf_counter() + budget_ms / 1000.0
@@ -136,6 +223,7 @@ def call_budgeted(fn: Callable, *args: Any, budget_ms: float = 250.0,
     return out
 
 
+
 def code_hash(code: str) -> str:
     h = hashlib.sha256()
     h.update(code.encode("utf-8", "replace"))
@@ -143,6 +231,11 @@ def code_hash(code: str) -> str:
 
 
 class CompiledScript:
+    """A compiled script module: its hooks, persistent state dict, and log
+    sink. One instance per (script, code-hash).
+
+    `traced` is a per-instance default for hook calls: False for the live
+    engine (thread-bounded by the caller), True for the backtest."""
 
     def __init__(self, script_id: str, code: str, *,
                  log_sink: Optional[Callable[[str], None]] = None,
@@ -201,6 +294,10 @@ class CompiledScript:
         return out
 
     def call(self, hook: str, *args: Any, budget_ms: float = 250.0) -> Any:
+        """Invoke a hook. Raises ScriptError on any in-script failure and
+        ScriptBudgetExceeded (a BaseException) when a traced call runs past
+        its budget — callers catch SCRIPT_FAILURES and isolate (disable the
+        script), never crash."""
         if self.abandoned.is_set():
             raise ScriptError(
                 f"{hook}() refused: a previous hook overran its time budget "

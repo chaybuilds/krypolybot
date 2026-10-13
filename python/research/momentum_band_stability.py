@@ -1,10 +1,20 @@
+"""Is the U-shape real, or did I just overfit a cap sweep at larger n?
+
+Two checks the cap sweep can't answer:
+  1. ISOLATED bands, not cumulative caps — a cumulative cap mixes bands, so a
+     single strong band can carry everything below it.
+  2. WEEK-BY-WEEK stability — an edge driven by one good week is noise no
+     matter how large the pooled t-stat looks.
+
+Same momentum gate and same fill models as pmxt_backfill.simulate().
+"""
 import math
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB = Path(__file__).with_name("data") / "pmxt_btc15m.db"
+DB = Path(r"C:\Users\Krypt\Desktop\kryptware\krypt-polybot\python\research\data\pmxt_btc15m.db")
 FEE_RATE = 0.07
 WINDOW_S = 900
 BANDS = [(0.01, 0.10), (0.10, 0.20), (0.20, 0.30), (0.30, 0.40),

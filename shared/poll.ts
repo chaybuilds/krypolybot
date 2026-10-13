@@ -26,7 +26,7 @@ export function createPoll(
     busy = true;
     void Promise.resolve()
       .then(task)
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => { busy = false; });
   };
 

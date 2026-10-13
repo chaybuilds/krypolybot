@@ -1,3 +1,4 @@
+"""Category resolution shared by tracker + whale scanner."""
 from __future__ import annotations
 
 import re
@@ -118,6 +119,9 @@ MICRO_MARKET_FILTERS = ["-updown-5m-", "-updown-15m-", "-up-or-down-"]
 
 
 def is_micro_market(slug: str) -> bool:
+    """True for the recurring short-term crypto candle markets (matched on
+    the Polymarket market slug). ConditId hashes never match, so passing a
+    conditionId here is a harmless no-op."""
     s = (slug or "").lower()
     if not s:
         return False

@@ -21,6 +21,7 @@ interface TrayHandlers {
   openWindow: () => void;
   toggleTrading: () => void;
   isTrading: () => boolean;
+  stopAgents?: () => void;
   quit: () => void;
 }
 
@@ -69,9 +70,12 @@ export function rebuild(handlers: TrayHandlers): void {
     { label: `Status: ${statusLine}`, enabled: false },
     { type: 'separator' },
     {
-      label: trading ? 'Pause Trading' : 'Resume Trading',
+      label: trading ? 'Pause main engine' : 'Resume main engine',
       click: () => handlers.toggleTrading(),
     },
+    ...(handlers.stopAgents
+      ? [{ label: 'Stop AI agents', click: () => handlers.stopAgents?.() }]
+      : []),
     { type: 'separator' },
     { label: 'Quit', click: () => handlers.quit() },
   ]);

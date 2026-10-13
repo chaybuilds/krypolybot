@@ -1,3 +1,57 @@
+"""Paper trading for the manual terminal.
+
+The point of paper mode is to be WRONG IN THE SAME PLACES the real thing is.
+A simulator that fills your whole order at your limit price, instantly, for
+free, does not teach you to trade — it teaches you that trading is easy, and
+then the first real order behaves nothing like it. So every simplification
+here is deliberate, conservative, and stated to the user.
+
+What is simulated faithfully:
+
+* **Fills come out of the REAL book.** We walk the live depth exactly as the
+  order ticket's preview does. You get what was actually resting at your price
+  and no more; the rest is unfilled, not quietly granted.
+* **The price you get is the WALKED average**, not your limit. Sweeping three
+  levels costs what sweeping three levels costs.
+* **Fees are the real fee-v2 curve**, from the market's own Gamma schedule
+  where it has one. An unknown fee stays unknown rather than becoming zero.
+* **Tick size and minimum order size** are the venue's, so an order that the
+  real CLOB would reject is rejected here too.
+* **You cannot sell what you do not hold.** Polymarket has no naked short and
+  neither does this.
+* **Settlement is exact.** A resolved market pays 100¢ or 0¢, because that is
+  what a binary contract does — or 50¢ on BOTH sides when UMA resolves it
+  50-50 (Gamma ``outcomePrices == ["0.5","0.5"]``: a cancelled game, a map
+  that was never played). See ``split_resolution``.
+* **Fees are part of what a position cost.** A taker buy's fee goes into the
+  position's cost basis (so ``avgCostCents`` is fee-inclusive), and a sell's
+  fee comes off its realised P&L. For every book, at all times:
+  ``realised + unrealised == cash + position value − bankroll`` — the P&L the
+  record shows is exactly the money the account made, net of every fee.
+
+What is approximated, and why (all of this is surfaced in the UI):
+
+* **Queue position.** We cannot know where in the queue a resting order would
+  sit, so a resting order fills only when the market trades STRICTLY THROUGH
+  its price — never merely to it. That is the pessimistic assumption: in real
+  life you would sometimes fill at the touch. Erring the other way would
+  manufacture fills that never happened, which is the exact lie this module
+  exists to avoid. When it does fill, it fills at its OWN limit: a maker is
+  paid its price, not the better one the book has since moved to.
+* **Market impact.** Your paper order consumes real depth in the simulation
+  but does not move the real book, so a large order is modelled slightly
+  better than it would really be. The UI warns once an order eats a
+  meaningful share of the visible depth.
+
+Its own tables, its own totals. A paper number is never added to a real one.
+
+Two paper ACCOUNTS share the table: ``manual`` (the ticket) and ``ai`` (an AI
+agent over MCP). Every read and write is scoped to the account selected with
+``using_book()``; the default is ``manual``, so every existing caller is
+unchanged. An agent's paper record has to stand on its own, or nobody can tell
+whether the agent is any good.
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -25,9 +79,38 @@ def current_book() -> str:
     return _BOOK.get()
 
 
+def valid_book(book: str) -> bool:
+    """`manual`, `ai` (the Default agent), or `ai:<agent id>` — each named
+    agent's own account (mcp_agents.paper_book)."""
+    if book in BOOKS:
+        return True
+    if isinstance(book, str) and book.startswith("ai:"):
+        import mcp_agents
+        return mcp_agents.valid_id(book[3:])
+    return False
+
+
+def is_agent_book(book: str) -> bool:
+    return book == "ai" or (isinstance(book, str) and book.startswith("ai:"))
+
+
+def books_in_use() -> list[str]:
+    """Every paper account with a row, plus the two built-in ones."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT COALESCE(book,'manual') FROM terminal_paper_orders"
+        ).fetchall()
+    out = list(BOOKS)
+    for r in rows:
+        b = str(r[0] or "manual")
+        if b not in out and valid_book(b):
+            out.append(b)
+    return out
+
+
 @contextlib.contextmanager
 def using_book(book: str) -> Iterator[None]:
-    if book not in BOOKS:
+    if not valid_book(book):
         raise ValueError(f"unknown paper book {book!r}")
     token = _BOOK.set(book)
     try:
@@ -47,6 +130,7 @@ def _net() -> str:
     return tt._net()
 
 
+
 def _rows() -> list[dict]:
     with _conn() as conn:
         return [dict(r) for r in conn.execute(
@@ -56,6 +140,7 @@ def _rows() -> list[dict]:
 
 
 def _book_state() -> tuple[dict[tuple[str, str], dict], float, bool]:
+    """→ (positions by (conditionId, side), cash_delta, fees_all_known)."""
     pos: dict[tuple[str, str], dict] = {}
     cash = 0.0
     fees_known = True
@@ -75,15 +160,16 @@ def _book_state() -> tuple[dict[tuple[str, str], dict], float, bool]:
 
         if str(r["action"]) == "buy":
             st["size"] += sz
-            st["cost"] += sz * px / 100.0
+            st["cost"] += sz * px / 100.0 + fee
             cash -= sz * px / 100.0 + fee
         else:
             avg = (st["cost"] / st["size"]) if st["size"] > 0 else None
             close = min(sz, st["size"])
             if avg is not None and close > 0:
-                st["realized"] += close * (px / 100.0 - avg) - fee
+                st["realized"] += close * (px / 100.0 - avg)
                 st["cost"] -= close * avg
                 st["size"] -= close
+            st["realized"] -= fee
             cash += close * px / 100.0 - fee
             if str(r["order_type"]) == "SETTLE":
                 st["settled"] = True
@@ -91,6 +177,7 @@ def _book_state() -> tuple[dict[tuple[str, str], dict], float, bool]:
 
 
 def _held_gross(condition_id: str, side: str) -> float:
+    """Contracts held right now, before any resting sell is counted."""
     pos, _, _ = _book_state()
     return float((pos.get((condition_id, side)) or {}).get("size") or 0.0)
 
@@ -106,15 +193,70 @@ def _reserved_by_resting_sells(condition_id: str, side: str) -> float:
 
 
 def _held(condition_id: str, side: str) -> float:
+    """Contracts available to SELL: held, minus what resting sells already
+    claim. A resting sell reserves no inventory at the venue either — it is
+    simply rejected on fill — but here two GTC sells against one holding used
+    to both pass the naked-short check and both fill."""
     return max(0.0, _held_gross(condition_id, side)
                - _reserved_by_resting_sells(condition_id, side))
 
 
 def _bankroll(cfg: Optional[dict]) -> float:
-    key = ("mcp_paper_bankroll_usd" if current_book() == "ai"
+    key = ("mcp_paper_bankroll_usd" if is_agent_book(current_book())
            else "terminal_paper_bankroll_usd")
     v = num((cfg or {}).get(key))
     return v if v and v > 0 else DEFAULT_BANKROLL_USD
+
+
+
+def split_resolution(m: Optional[dict]) -> bool:
+    """Did this market resolve 50-50?
+
+    UMA can resolve a binary market as a split — a cancelled or postponed
+    game, a map or game of a series that was never played — and then BOTH
+    outcome tokens redeem for 50¢. Gamma shows it as ``closed`` with
+    ``umaResolutionStatus == "resolved"`` and ``outcomePrices ==
+    ["0.5","0.5"]`` (seen live on 2026-10-12, e.g. esports "Game 3: …"
+    markets). ``terminal.summary_from_gamma`` only knows a 100/0 resolution,
+    so such a market reads ``status: "settled"`` with ``resolvedOutcome:
+    None`` — which used to mean "never settles": paper cash stayed locked in a
+    position nobody could sell, and the record never included it.
+
+    Read from the summary's ``_raw`` Gamma row (``term._summaries_for`` keeps
+    it). All three conditions are required: a closed market that is merely
+    AWAITING resolution can show any pair of mids, 50/50 included, and
+    settling that at 50¢ would be an invented payout. No ``_raw`` → False.
+    """
+    if not isinstance(m, dict) or m.get("resolvedOutcome") is not None:
+        return False
+    raw = m.get("_raw")
+    if not isinstance(raw, dict) or not raw.get("closed"):
+        return False
+    if str(raw.get("umaResolutionStatus") or "").lower() != "resolved":
+        return False
+    prices = term._jlist(raw.get("outcomePrices"))
+    if len(prices) != 2:
+        return False
+    vals = [num(v) for v in prices]
+    return all(v is not None and abs(v - 0.5) < 1e-6 for v in vals)
+
+
+def payout_cents(m: Optional[dict], side: str) -> Optional[float]:
+    """What one contract of `side` pays in this market: 100 / 0 for a
+    decided market, 50 on a 50-50 split, None while it is unresolved (or the
+    market could not be read). Never a guess."""
+    resolved = (m or {}).get("resolvedOutcome")
+    if resolved in ("yes", "no"):
+        return 100.0 if resolved == side else 0.0
+    if split_resolution(m):
+        return 50.0
+    return None
+
+
+def _resolution_word(m: dict) -> str:
+    r = m.get("resolvedOutcome")
+    return str(r).upper() if r in ("yes", "no") else "50-50 (UMA split)"
+
 
 
 def _record(row: dict) -> int:
@@ -138,6 +280,7 @@ def _record(row: dict) -> int:
 
 
 async def place(req: dict, cfg: Optional[dict] = None) -> dict:
+    """Simulate one hand-placed order against the live book."""
     pv = await tt.preview({**req, "paper": True})
     blockers = pv["blockers"]
     if blockers:
@@ -277,7 +420,9 @@ async def cancel(local_id: int) -> dict:
     return {"ok": True, "message": "Paper order canceled."}
 
 
+
 async def tick() -> dict:
+    """Advance the paper book. Cheap and safe to call every few seconds."""
     filled = await _fill_resting()
     settled = await _settle_resolved()
     return {"filled": filled, "settled": settled}
@@ -320,10 +465,11 @@ async def _fill_resting() -> int:
             continue
 
         levels = bk["asks"] if buy else bk["bids"]
-        got, avg = tt._walk_book(levels, want, limit, buy)
+        got, _ = tt._walk_book(levels, want, limit, buy)
         got = got or 0.0
-        if got <= 0 or avg is None:
+        if got <= 0:
             continue
+        avg = limit
 
         if not buy:
             with using_book(str(r.get("book") or "manual")):
@@ -334,7 +480,7 @@ async def _fill_resting() -> int:
                         """UPDATE terminal_paper_orders
                            SET status='canceled', resting_size=0,
                                note = TRIM(COALESCE(note,'') || ?)
-                           WHERE id=?""",
+                           WHERE id=? AND status IN ('resting','partial')""",
                         (" Canceled: the position was no longer held when the "
                          "market traded through.", int(r["id"])))
                 continue
@@ -347,57 +493,74 @@ async def _fill_resting() -> int:
             (prev_size * float(prev_avg) + got * avg) / total
             if prev_avg is not None and total > 0 else avg)
         remaining = round(want - got, 4)
+        fee = r.get("fees_usd")
+        if fee is None and prev_size <= 0:
+            fee = 0.0
 
         with _conn() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """UPDATE terminal_paper_orders
                    SET filled_size=?, avg_fill_price_cents=?, resting_size=?,
-                       cost_usd=?, status=?, filled_at=COALESCE(filled_at, ?),
+                       cost_usd=?, fees_usd=?, status=?,
+                       filled_at=COALESCE(filled_at, ?),
                        note = TRIM(COALESCE(note,'') || ?)
-                   WHERE id=?""",
+                   WHERE id=? AND status IN ('resting','partial')""",
                 (total, round(new_avg, 3), max(0.0, remaining),
-                 round(total * new_avg / 100.0, 4),
+                 round(total * new_avg / 100.0, 4), fee,
                  "filled" if remaining <= 1e-9 else "partial",
                  _now_iso(),
-                 f" Market traded through {limit:g}¢, so {got:g} filled as "
-                 f"maker (no fee).",
+                 f" Market traded through {limit:g}¢, so {got:g} filled at "
+                 f"{limit:g}¢ as maker (no fee).",
                  int(r["id"])),
             )
-        n += 1
+        if cur.rowcount:
+            n += 1
     return n
 
 
 async def _settle_resolved() -> int:
+    """Pay out paper positions in markets that have actually resolved, in
+    every paper account."""
     n = 0
-    for book in BOOKS:
+    for book in books_in_use():
         with using_book(book):
             n += await _settle_resolved_book()
     return n
 
 
 async def _settle_resolved_book() -> int:
+    """Settle the CURRENT paper account.
+
+    Written as a synthetic sell at exactly 100¢ or 0¢ — 50¢ on both sides of
+    a 50-50 split (split_resolution) — with order_type='SETTLE',
+    so the average-cost and cash maths stay on one path. Orders still resting
+    on a resolved market are canceled: there is no book left to fill them,
+    and left resting a buy held its cash and a sell kept claiming contracts
+    the settlement already paid out.
+    """
     pos, _, _ = _book_state()
     open_keys = [(cid, side) for (cid, side), st in pos.items()
                  if st["size"] > 1e-9 and not st["settled"]]
-    if not open_keys:
+    resting = _resting_markets()
+    if not open_keys and not resting:
         return 0
 
     markets = {}
     try:
-        for m in await term._summaries_for([cid for cid, _ in open_keys]):
+        cids = {cid for cid, _ in open_keys} | resting
+        for m in await term._summaries_for(sorted(cids)):
             markets[m["conditionId"]] = m
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug("paper settle lookup failed: %s", e)
         return 0
 
     n = 0
     for cid, side in open_keys:
         m = markets.get(cid)
-        if not m or m.get("resolvedOutcome") is None:
+        settle_cents = payout_cents(m, side)
+        if m is None or settle_cents is None:
             continue
-        won = m["resolvedOutcome"] == side
         size = pos[(cid, side)]["size"]
-        settle_cents = 100.0 if won else 0.0
         _record({
             "condition_id": cid, "title": m.get("title") or "", "side": side,
             "action": "sell", "order_type": "SETTLE",
@@ -408,12 +571,38 @@ async def _settle_resolved_book() -> int:
             "cost_usd": round(size * settle_cents / 100.0, 4),
             "status": "settled",
             "note": (
-                f"Market resolved {str(m['resolvedOutcome']).upper()} — this "
+                f"Market resolved {_resolution_word(m)} — this "
                 f"side paid {settle_cents:.0f}¢ per contract. Exact, not a mark."),
             "filled_at": _now_iso(),
         })
         n += 1
+
+    for cid in resting:
+        m = markets.get(cid)
+        if not m or payout_cents(m, "yes") is None:
+            continue
+        with _conn() as conn:
+            conn.execute(
+                """UPDATE terminal_paper_orders
+                   SET status='canceled', resting_size=0,
+                       note = TRIM(COALESCE(note,'') || ?)
+                   WHERE condition_id=? AND COALESCE(book,'manual')=?
+                     AND status IN ('resting','partial') AND resting_size > 0""",
+                (f" Canceled: the market resolved "
+                 f"{_resolution_word(m)} while this was resting.",
+                 cid, current_book()))
     return n
+
+
+def _resting_markets() -> set[str]:
+    """conditionIds the CURRENT account has any resting order in."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT condition_id FROM terminal_paper_orders "
+            "WHERE status IN ('resting','partial') AND resting_size > 0 "
+            "AND COALESCE(book,'manual')=?", (current_book(),)).fetchall()
+    return {str(r[0]) for r in rows}
+
 
 
 async def portfolio(cfg: Optional[dict] = None) -> dict:
@@ -424,31 +613,37 @@ async def portfolio(cfg: Optional[dict] = None) -> dict:
     marks: dict[str, dict] = {}
     if open_keys:
         try:
-            for m in await term._summaries_for([cid for (cid, _), _ in open_keys]):
+            for m in await term.marked_summaries([cid for (cid, _), _ in open_keys]):
                 marks[m["conditionId"]] = m
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug("paper portfolio mark lookup failed: %s", e)
 
     positions = []
     tot_val = 0.0
-    any_marked = False
+    tot_unreal = 0.0
+    any_unmarked = False
     for (cid, side), st in sorted(pos.items(), key=lambda kv: -kv[1]["size"]):
         if st["size"] <= 1e-9:
             continue
         m = marks.get(cid)
         resolved = (m or {}).get("resolvedOutcome")
-        if resolved is not None:
-            mark = 100.0 if resolved == side else 0.0
+        payout = payout_cents(m, side)
+        if payout is not None:
+            mark = payout
+            stamp = {"source": "gamma", "observedAt": _now_iso(), "ageSec": 0.0}
         else:
             p = (m or {}).get("probability")
             mark = p if side == "yes" else (None if p is None else round(100.0 - p, 2))
+            stamp = ((m or {}).get("sources") or {}).get("probability")
         avg = round(st["cost"] / st["size"] * 100.0, 3) if st["size"] > 0 else None
-        value = round(st["size"] * mark / 100.0, 2) if mark is not None else None
-        pnl = (round(st["size"] * (mark - avg) / 100.0, 2)
-               if (mark is not None and avg is not None) else None)
-        if value is not None:
-            tot_val += value
-            any_marked = True
+        exact_val = st["size"] * mark / 100.0 if mark is not None else None
+        value = round(exact_val, 2) if exact_val is not None else None
+        pnl = round(exact_val - st["cost"], 2) if exact_val is not None else None
+        if exact_val is not None:
+            tot_val += exact_val
+            tot_unreal += exact_val - st["cost"]
+        else:
+            any_unmarked = True
         positions.append({
             "conditionId": cid, "venue": "polymarket",
             "title": (m or {}).get("title") or st["title"] or None,
@@ -463,14 +658,11 @@ async def portfolio(cfg: Optional[dict] = None) -> dict:
             "status": (m or {}).get("status") or "unknown",
             "resolvedOutcome": resolved,
             "closeTime": (m or {}).get("closeTime"),
-            "settled": resolved is not None,
+            "settled": payout is not None,
             "redeemable": False,
             "unreconciled": False, "unreconciledSize": None,
-            "origin": "ai" if current_book() == "ai" else "manual",
-            "sources": ({} if mark is None else {
-                "probability": {
-                    "source": "gamma" if resolved is not None else "clob-ws",
-                    "observedAt": _now_iso(), "ageSec": 0.0}}),
+            "origin": "ai" if is_agent_book(current_book()) else "manual",
+            "sources": ({"probability": stamp} if (mark is not None and stamp) else {}),
             "unknowns": ([] if mark is not None else [{
                 "field": "markCents",
                 "reason": (
@@ -481,6 +673,7 @@ async def portfolio(cfg: Optional[dict] = None) -> dict:
 
     realized = round(sum(st["realized"] for st in pos.values()), 2)
     cash = round(bankroll + cash_delta, 2)
+    totals_known = not any_unmarked
 
     note = None
     if not fees_known:
@@ -492,20 +685,17 @@ async def portfolio(cfg: Optional[dict] = None) -> dict:
     return {
         "positions": positions,
         "walletReadable": True,
-        "totalValueUsd": round(tot_val, 2) if any_marked else None,
+        "totalValueUsd": round(tot_val, 2) if totals_known else None,
         "totalCostUsd": round(sum(st["cost"] for st in pos.values()), 2),
-        "totalUnrealizedPnlUsd": (
-            round(sum(p["unrealizedPnlUsd"] for p in positions
-                      if p["unrealizedPnlUsd"] is not None), 2)
-            if any(p["unrealizedPnlUsd"] is not None for p in positions) else None),
+        "totalUnrealizedPnlUsd": round(tot_unreal, 2) if totals_known else None,
         "realizedPnlUsd": realized,
         "settledPnlUsd": None,
         "cashUsd": cash,
         "bankrollUsd": bankroll,
-        "equityUsd": round(cash + tot_val, 2) if any_marked else None,
+        "equityUsd": round(bankroll + cash_delta + tot_val, 2) if totals_known else None,
         "returnPct": (
-            round((cash + tot_val - bankroll) / bankroll * 100.0, 2)
-            if any_marked and bankroll > 0 else None),
+            round((cash_delta + tot_val) / bankroll * 100.0, 2)
+            if totals_known and bankroll > 0 else None),
         "unreconciledCount": 0,
         "unreconciledNote": note,
         "redeemableCount": 0, "redeemableValueUsd": None,
@@ -513,6 +703,127 @@ async def portfolio(cfg: Optional[dict] = None) -> dict:
         "fetchedAt": _now_iso(),
         "costBasisConvention": "average",
     }
+
+
+async def day_pnl(today: str) -> dict:
+    """Today's (UTC date `today`, "YYYY-MM-DD") P&L of the CURRENT paper
+    account, for the agents' daily loss stop.
+
+    Same fee convention as `portfolio` (see _book_state): a buy's fee is in
+    the position's cost, a sell's fee comes off that sell. Realised: closes
+    and settlements filled today against that fee-inclusive average cost,
+    less every sell fee paid today. Unrealised: open positions at the price
+    they could be SOLD at now — the bid, not the mid — minus their cost, fee
+    included (an entry fee is an open loss until the position earns it back);
+    a position nobody bids (or whose market could not be read) at its whole
+    cost, because the stop must not fail open exactly when the book goes
+    quiet. For a book whose whole history is today, realised + unrealised is
+    exactly the portfolio's realised + unrealised, marked at the bid."""
+    pos: dict[tuple[str, str], dict] = {}
+    realized = 0.0
+    for r in _rows():
+        key = (str(r["condition_id"]), str(r["side"]))
+        st = pos.setdefault(key, {"size": 0.0, "cost": 0.0, "settled": False})
+        sz = float(r["filled_size"] or 0.0)
+        px = float(r["avg_fill_price_cents"] or 0.0)
+        fee = float(r["fees_usd"] or 0.0)
+        is_today = str(r["filled_at"] or r["created_at"] or "")[:10] == today
+        if str(r["action"]) == "buy":
+            st["size"] += sz
+            st["cost"] += sz * px / 100.0 + fee
+        else:
+            avg = (st["cost"] / st["size"]) if st["size"] > 0 else None
+            close = min(sz, st["size"])
+            if avg is not None and close > 0:
+                if is_today:
+                    realized += close * (px / 100.0 - avg)
+                st["cost"] -= close * avg
+                st["size"] -= close
+            if is_today:
+                realized -= fee
+            if str(r["order_type"]) == "SETTLE":
+                st["settled"] = True
+
+    open_keys = [(k, st) for k, st in pos.items() if st["size"] > 1e-9]
+    marks: dict[str, dict] = {}
+    if open_keys:
+        try:
+            for m in await term.marked_summaries([cid for (cid, _), _ in open_keys]):
+                marks[m["conditionId"]] = m
+        except Exception as e:  # noqa: BLE001 — unread marks count at full cost
+            logger.debug("paper day_pnl mark lookup failed: %s", e)
+    unreal = open_loss = unmarked_cost = 0.0
+    unmarked: list[str] = []
+    for (cid, side), st in open_keys:
+        m = marks.get(cid) or {}
+        payout = payout_cents(m, side)
+        if payout is not None:
+            bid = payout
+        elif side == "yes":
+            bid = num(m.get("bid"))
+        else:
+            ask = num(m.get("ask"))
+            bid = None if ask is None else 100.0 - ask
+        if bid is None:
+            unmarked.append(cid)
+            unmarked_cost += st["cost"]
+        else:
+            u = st["size"] * bid / 100.0 - st["cost"]
+            unreal += u
+            open_loss += max(0.0, -u)
+    return {"realizedUsd": round(realized, 4), "unrealizedUsd": round(unreal, 4),
+            "openLossUsd": round(open_loss, 4),
+            "unmarked": unmarked, "unmarkedCostUsd": round(unmarked_cost, 4)}
+
+
+def reserved_buy_usd() -> float:
+    """Cash the CURRENT account's resting paper buys would still spend if they
+    filled. A resting order is not a position, but it is a claim on the cash:
+    without this, ten resting buys that each fit the balance could all fill."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(resting_size * requested_price_cents / 100.0), 0) "
+            "FROM terminal_paper_orders WHERE action='buy' "
+            "AND status IN ('resting','partial') AND COALESCE(book,'manual')=?",
+            (current_book(),)).fetchone()
+    return float(row[0] or 0.0)
+
+
+def _resting_buys() -> dict[str, float]:
+    """conditionId -> contracts the CURRENT account's resting buys could
+    still add."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT condition_id, COALESCE(SUM(resting_size), 0) "
+            "FROM terminal_paper_orders WHERE action='buy' "
+            "AND status IN ('resting','partial') AND COALESCE(book,'manual')=? "
+            "GROUP BY condition_id", (current_book(),)).fetchall()
+    return {str(r[0]): float(r[1]) for r in rows if float(r[1] or 0.0) > 1e-9}
+
+
+def open_markets() -> set[str]:
+    """conditionIds the CURRENT paper account holds a position in or has a
+    resting buy in. For the agents' position caps: a resting buy is a
+    position it can still get, and the live caps count it the same way —
+    otherwise any number of resting buys pass the cap and all fill later."""
+    pos, _, _ = _book_state()
+    return ({cid for (cid, _), st in pos.items() if st["size"] > 1e-9}
+            | set(_resting_buys()))
+
+
+def exposure(condition_id: str) -> float:
+    """Contracts the CURRENT account has in one market, both sides, or could
+    still get there: what it holds before any resting sell (shares are held
+    until a sell FILLS) plus what its resting buys could add. For the agents'
+    per-market cap, so it errs high like the live count (mcp_rails.live_exposure)."""
+    pos, _, _ = _book_state()
+    held = sum(st["size"] for (cid, _), st in pos.items() if cid == condition_id)
+    return max(0.0, held) + _resting_buys().get(condition_id, 0.0)
+
+
+def held(condition_id: str, side: str) -> float:
+    """Contracts the CURRENT paper account may sell (net of resting sells)."""
+    return _held(condition_id, side)
 
 
 def orders(limit: int = 100) -> dict:
@@ -547,6 +858,7 @@ def orders(limit: int = 100) -> dict:
 
 
 def reset() -> dict:
+    """Wipe the paper account back to the starting bankroll."""
     with _conn() as conn:
         book = current_book()
         n = int(conn.execute(

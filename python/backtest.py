@@ -1,3 +1,41 @@
+"""Fee-aware signal backtest for Krypt PolyBot.
+
+Answers the only question that matters before hardening anything else:
+**do the scanner's signals have positive expectancy after Polymarket fees?**
+
+It replays every *resolved* signal the scanners recorded (`whale_trades`
+and `alerts`), computes the per-contract P&L of having followed it at the
+recorded entry price given the binary outcome, **subtracts an estimate of
+the Polymarket trading fee**, and reports net edge with a significance check
+and a confidence-threshold sweep.
+
+This is a realized-signal backtest, not an academic one: it measures the
+net-of-fee edge of the signals this bot actually produces. It does NOT
+prove forward performance (no look-ahead controls, the scoring is the
+same one that generated the signals), but it is the honest first cut at
+"does this make money after costs."
+
+    python backtest.py                 # auto-find your Krypt PolyBot DB
+    python backtest.py --db PATH       # explicit DB
+    python backtest.py --fee 0.07      # override the taker-fee rate coefficient
+    python backtest.py --spread 2      # cents paid over each signal's price (default 1)
+    python backtest.py --demo          # synthetic data, to see the format
+
+FEE MODEL (fee v2, re-verified 2026-08-18 against docs.polymarket.com; first
+verified 2026-07-03 against a live market's Gamma `feeSchedule`): Polymarket
+charges TAKERS ONLY a fee per contract = rate × P·(1−P) — a symmetric curve
+peaking at mid prices and vanishing at the extremes. Rates by category:
+Crypto 0.07, Sports 0.05 (raised from 0.03 in July 2026),
+Finance/Politics/Mentions/Tech 0.04, Economics/Culture/Weather/Other 0.05,
+Geopolitics free. Makers pay 0 (and earn rebates). This replaces the
+June-2026 flat rate×price model, which overestimated fees ~8.6× at the
+95-98c prices the 15m engine buys. When a signal carries a category the rate
+is looked up (the bot's own climate / entertainment / world ids map onto
+weather / culture / other); a blank or unknown category is rated 'other'
+(0.05), the same fallback the live accounting uses. --fee forces a single
+rate coefficient for everything. Schedule re-checked 2026-10-11 against
+docs.polymarket.com/trading/fees: unchanged.
+"""
 from __future__ import annotations
 
 import argparse
@@ -22,8 +60,28 @@ CATEGORY_TAKER_FEE: dict[str, float] = {
     "other": 0.05,
     "geopolitics": 0.0,
 }
-DEFAULT_FEE_RATE = CATEGORY_TAKER_FEE["crypto"]
+CATEGORY_FEE_ALIAS: dict[str, str] = {
+    "climate": "weather",
+    "entertainment": "culture",
+    "world": "other",
+}
+FALLBACK_FEE_CATEGORY = "other"
+DEFAULT_FEE_RATE = CATEGORY_TAKER_FEE[FALLBACK_FEE_CATEGORY]
 DEFAULT_FEE_COEFF = DEFAULT_FEE_RATE
+
+
+def fee_category(category) -> Optional[str]:
+    """The fee-schedule category `category` falls under, or None when it is
+    blank or not one we know (callers that must not guess check for None)."""
+    cat = str(category or "").strip().lower()
+    cat = CATEGORY_FEE_ALIAS.get(cat, cat)
+    return cat if cat in CATEGORY_TAKER_FEE else None
+
+
+def taker_fee_rate(category) -> float:
+    """Taker fee-v2 rate for `category`, with the shared fallback."""
+    return CATEGORY_TAKER_FEE[fee_category(category) or FALLBACK_FEE_CATEGORY]
+
 
 
 TAKER_REBATE_TIERS = (0.0, 3.0, 8.0, 18.0, 32.0, 44.0, 50.0)
@@ -38,26 +96,42 @@ def set_taker_rebate(pct) -> None:
         TAKER_REBATE = 0.0
 
 
+def venue_fee_per_contract(
+    price: float, fee_coeff: Optional[float] = None, category: str = "",
+) -> float:
+    """What Polymarket CHARGES per contract on a taker fill at `price`
+    (dollars, 0..1): rate × P·(1−P), the full fee-v2 curve. Realised P&L
+    books this one: the taker rebate is paid back separately, once a day in
+    pUSD, so it is income on top, not a smaller fee at match time.
+    `fee_coeff` forces a rate; otherwise the category sets it (taker_fee_rate)."""
+    p = max(0.0, min(1.0, float(price)))
+    rate = float(fee_coeff) if fee_coeff is not None else taker_fee_rate(category)
+    return rate * p * (1.0 - p)
+
+
 def polymarket_fee_per_contract(
     price: float, fee_coeff: Optional[float] = None, category: str = "",
 ) -> float:
-    p = max(0.0, min(1.0, float(price)))
-    rate = (
-        float(fee_coeff) if fee_coeff is not None
-        else CATEGORY_TAKER_FEE.get((category or "").strip().lower(), DEFAULT_FEE_RATE)
-    )
-    return rate * p * (1.0 - p) * (1.0 - TAKER_REBATE)
+    """Per-contract Polymarket TAKER fee at execution price `price` for a
+    FORWARD-LOOKING estimate (edge gates, backtests, replays): the venue fee
+    net of the user's taker-rebate tier. Realised accounting uses
+    venue_fee_per_contract instead."""
+    return venue_fee_per_contract(price, fee_coeff, category) * (1.0 - TAKER_REBATE)
 
 
 def net_pnl_per_contract(
     cost: float, correct: bool, fee_coeff: Optional[float] = None,
     category: str = "",
 ) -> float:
+    """Net P&L of one $1 binary contract bought at `cost` (the price paid
+    for the chosen side), settled at $1 if `correct` else $0, minus the
+    trading fee."""
     gross = (1.0 - cost) if correct else (-cost)
     return gross - polymarket_fee_per_contract(cost, fee_coeff, category)
 
 
 def signal_cost(row: dict, source: str) -> float:
+    """Price paid (0..1) for the side the signal points at."""
     price = float(row.get("price") or 0.0)
     if source == "whale":
         return max(0.0, min(1.0, price))
@@ -66,37 +140,104 @@ def signal_cost(row: dict, source: str) -> float:
     return max(0.0, min(1.0, cost))
 
 
+
 def _cluster_key(s: dict, idx: int):
+    """Grouping key for clustered significance. A labelled event groups all its
+    signals; a blank/absent event makes the signal its own cluster (unique key)
+    so unlabelled data degrades gracefully to the per-signal t rather than
+    collapsing every blank into one giant fake cluster."""
     ev = s.get("event")
     return ev if ev else ("\0__solo__", idx)
 
 
-def _event_t(nets: list[float], keys: list) -> tuple[int, float]:
+def _event_t(nets: list[float], keys: list) -> tuple[int, float, float]:
+    """The EVENT-weighted view: each event's mean return counts once.
+    Returns (n_events, mean of the event means, t across the event means).
+    Its mean is not the per-signal headline (an event with 30 signals counts
+    as much as one with 1), so its t belongs next to that mean, not next to
+    the per-signal net_ev. Equals the per-signal figures when every signal is
+    its own event."""
     groups: dict = defaultdict(list)
     for net, k in zip(nets, keys):
         groups[k].append(net)
     means = [sum(v) / len(v) for v in groups.values()]
     ne = len(means)
-    if ne < 2:
-        return ne, 0.0
+    if ne == 0:
+        return 0, 0.0, 0.0
     m = sum(means) / ne
+    if ne < 2:
+        return ne, m, 0.0
     var = sum((x - m) ** 2 for x in means) / (ne - 1)
     se = math.sqrt(var) / math.sqrt(ne)
-    return ne, ((m / se) if se > 0 else 0.0)
+    return ne, m, ((m / se) if se > 0 else 0.0)
 
 
-def summarize(signals: list[dict], fee_coeff: Optional[float] = None) -> dict:
+def cluster_robust_t(values: list[float], keys: list) -> tuple[int, Optional[float]]:
+    """t-statistic of the plain (per-trade) mean of `values`, with a
+    cluster-robust standard error: each cluster's deviations from the mean
+    are summed, and the variance is taken over those cluster sums (CR1, with
+    the G/(G−1) small-sample factor). Trades in one cluster (signals on one
+    event, crypto windows closing at the same moment, ~7 coins that move
+    together) count as ONE draw, not seven. Returns (n_clusters, t); t is
+    None with fewer than two clusters or no variance. With every trade its
+    own cluster this is exactly the ordinary t; with equal-size clusters it
+    equals the t across cluster totals.
+
+    The one significance helper for the backtest, the crypto replays and the
+    script backtester."""
+    n = len(values)
+    if n < 2:
+        return len(set(keys)), None
+    mean = sum(values) / n
+    sums: dict = defaultdict(float)
+    for v, k in zip(values, keys):
+        sums[k] += v - mean
+    g = len(sums)
+    if g < 2:
+        return g, None
+    var_mean = g / (g - 1) * sum(s * s for s in sums.values()) / (n * n)
+    if var_mean <= 1e-18:
+        return g, None
+    return g, mean / math.sqrt(var_mean)
+
+
+def _paid(cost: float, spread_cents: float) -> float:
+    """What a follower pays: the recorded price plus `spread_cents` of
+    spread/slippage, capped at 99¢ (a 100¢ contract can only lose)."""
+    return min(0.99, float(cost) + spread_cents / 100.0) if spread_cents else float(cost)
+
+
+def summarize(signals: list[dict], fee_coeff: Optional[float] = None,
+              spread_cents: float = 0.0) -> dict:
+    """Aggregate net-of-fee economics for a list of signals.
+
+    `spread_cents` is added to every recorded price before fees: a follower
+    buys at the ask after the signal printed, never at the print itself.
+
+    Each signal dict needs: cost (float), correct (bool), confidence (float);
+    optionally `event` for clustered significance (the event ticker, or a
+    crypto window's close time). Two means, each with its own t:
+      * `net_ev` (the headline): mean net P&L per contract over SIGNALS,
+        and `t_cluster`, its t with an event-clustered standard error
+        (cluster_robust_t) — the one to trust, because signals on one market
+        are not independent bets. `t` is the same mean's naive per-signal t.
+      * `net_ev_event`: the mean over EVENTS (each event's mean counts once),
+        and `t_event`, the t across those event means.
+    |t| < 2 ≈ noise."""
     n = len(signals)
     if n == 0:
         return {"n": 0, "wins": 0, "win_rate": 0.0, "gross_ev": 0.0,
                 "fee_ev": 0.0, "net_ev": 0.0, "se": 0.0, "t": 0.0,
                 "total_net": 0.0, "avg_cost": 0.0, "net_roi": 0.0,
-                "n_events": 0, "t_event": 0.0}
+                "n_events": 0, "t_event": 0.0, "net_ev_event": 0.0,
+                "t_cluster": 0.0}
 
     nets, grosses, fees, keys = [], [], [], []
     wins = 0
+    costs = []
     for i, s in enumerate(signals):
-        cost, correct = s["cost"], bool(s["correct"])
+        cost, correct = _paid(s["cost"], spread_cents), bool(s["correct"])
+        costs.append(cost)
         if correct:
             wins += 1
         grosses.append((1.0 - cost) if correct else (-cost))
@@ -109,8 +250,9 @@ def summarize(signals: list[dict], fee_coeff: Optional[float] = None) -> dict:
     var = sum((x - mean_net) ** 2 for x in nets) / (n - 1) if n > 1 else 0.0
     sd = math.sqrt(var)
     se = sd / math.sqrt(n) if n > 0 else 0.0
-    avg_cost = sum(s["cost"] for s in signals) / n
-    n_events, t_event = _event_t(nets, keys)
+    avg_cost = sum(costs) / n
+    n_events, mean_event, t_event = _event_t(nets, keys)
+    _g, t_cluster = cluster_robust_t(nets, keys)
     return {
         "n": n, "wins": wins, "win_rate": wins / n,
         "gross_ev": sum(grosses) / n,
@@ -118,20 +260,25 @@ def summarize(signals: list[dict], fee_coeff: Optional[float] = None) -> dict:
         "net_ev": mean_net,
         "se": se,
         "t": (mean_net / se) if se > 0 else 0.0,
+        "t_cluster": t_cluster if t_cluster is not None else 0.0,
         "total_net": sum(nets),
         "avg_cost": avg_cost,
         "net_roi": (mean_net / avg_cost) if avg_cost > 0 else 0.0,
-        "n_events": n_events, "t_event": t_event,
+        "n_events": n_events,
+        "net_ev_event": mean_event, "t_event": t_event,
     }
 
 
 def threshold_sweep(
-    signals: list[dict], thresholds: list[float], fee_coeff: Optional[float] = None
+    signals: list[dict], thresholds: list[float], fee_coeff: Optional[float] = None,
+    spread_cents: float = 0.0,
 ) -> list[dict]:
+    """Net economics when filtered to confidence >= each threshold —
+    shows whether the score actually selects for edge."""
     out = []
     for th in thresholds:
         sub = [s for s in signals if s["confidence"] >= th]
-        out.append({"threshold": th, **summarize(sub, fee_coeff)})
+        out.append({"threshold": th, **summarize(sub, fee_coeff, spread_cents)})
     return out
 
 
@@ -148,21 +295,28 @@ def _price_label(cost: float) -> str:
     return "?"
 
 
-def summarize_fade(signals: list[dict], fee_coeff: Optional[float] = None) -> dict:
+def summarize_fade(signals: list[dict], fee_coeff: Optional[float] = None,
+                   spread_cents: float = 0.0) -> dict:
+    """What you'd net by betting the OPPOSITE side of each signal (cost
+    becomes 1-cost, win becomes loss), paying the same `spread_cents` on the
+    opposite side. Approximate — the other side's real spread can differ —
+    but a strong tell for whether the signal is anti-predictive."""
     faded = [{"cost": 1.0 - s["cost"], "correct": (not s["correct"]),
               "confidence": s["confidence"], "category": s.get("category", ""),
               "event": s.get("event", "")} for s in signals]
-    return summarize(faded, fee_coeff)
+    return summarize(faded, fee_coeff, spread_cents)
 
 
-def group_summaries(signals: list[dict], key, fee_coeff: Optional[float] = None) -> dict:
+def group_summaries(signals: list[dict], key, fee_coeff: Optional[float] = None,
+                    spread_cents: float = 0.0) -> dict:
     groups: dict[str, list] = {}
     for s in signals:
         groups.setdefault(key(s), []).append(s)
-    return {k: summarize(v, fee_coeff) for k, v in groups.items()}
+    return {k: summarize(v, fee_coeff, spread_cents) for k, v in groups.items()}
 
 
-def format_breakdown(signals: list[dict], fee_coeff: float) -> str:
+def format_breakdown(signals: list[dict], fee_coeff: float,
+                     spread_cents: float = 0.0) -> str:
     L = ["", "════════════ BREAKDOWN ════════════"]
     for src in ("whale", "momentum"):
         sub = [s for s in signals if s["source"] == src]
@@ -170,22 +324,23 @@ def format_breakdown(signals: list[dict], fee_coeff: float) -> str:
             continue
         L.append("")
         L.append(f"── {src.upper()}  (n={len(sub)}) ──")
-        L.append("  by entry price:            (t = per-EVENT)")
-        pb = group_summaries(sub, lambda s: _price_label(s["cost"]), fee_coeff)
+        L.append("  by entry price:            (t clustered by event)")
+        pb = group_summaries(sub, lambda s: _price_label(s["cost"]), fee_coeff, spread_cents)
         for _, _, label in PRICE_BUCKETS:
             if label in pb:
                 r = pb[label]
                 L.append(f"    {label:<7} n={r['n']:<5} ev={r['n_events']:<4} win {r['win_rate']*100:4.0f}%  "
-                         f"net {_money(r['net_ev'])} (t={r['t_event']:+.1f})")
-        cb = group_summaries([s for s in sub if s["category"]], lambda s: s["category"], fee_coeff)
+                         f"net {_money(r['net_ev'])} (t={r['t_cluster']:+.1f})")
+        cb = group_summaries([s for s in sub if s["category"]], lambda s: s["category"],
+                             fee_coeff, spread_cents)
         if cb:
-            L.append("  by category (top 6 by n):    (t = per-EVENT)")
+            L.append("  by category (top 6 by n):    (t clustered by event)")
             for cat, r in sorted(cb.items(), key=lambda kv: -kv[1]["n"])[:6]:
                 L.append(f"    {cat:<13} n={r['n']:<5} ev={r['n_events']:<4} win {r['win_rate']*100:4.0f}%  "
-                         f"net {_money(r['net_ev'])} (t={r['t_event']:+.1f})")
-        follow = summarize(sub, fee_coeff)["net_ev"]
-        fade = summarize_fade(sub, fee_coeff)
-        L.append(f"  FADE (bet opposite): net {_money(fade['net_ev'])} (t/event={fade['t_event']:+.1f})   "
+                         f"net {_money(r['net_ev'])} (t={r['t_cluster']:+.1f})")
+        follow = summarize(sub, fee_coeff, spread_cents)["net_ev"]
+        fade = summarize_fade(sub, fee_coeff, spread_cents)
+        L.append(f"  FADE (bet opposite): net {_money(fade['net_ev'])} (t={fade['t_cluster']:+.1f} clustered)   "
                  f"vs follow {_money(follow)}")
     return "\n".join(L)
 
@@ -202,19 +357,31 @@ def verdict(overall: dict, sweep: list[dict]) -> str:
         (r for r in sweep if r["n"] >= 30 and r.get("n_events", 0) >= 10),
         key=lambda r: r["net_ev"], default=None,
     )
-    if overall["net_ev"] > 0 and overall["t_event"] > 2:
+    if overall["net_ev"] > 0 and overall["t_cluster"] > 2:
         return (f"POSITIVE net-of-fee edge, significant across {overall['n_events']} "
-                f"events (per-event t={overall['t_event']:+.1f}). Worth hardening.")
-    if best and best["net_ev"] > 0 and best["t_event"] > 2:
+                f"events (event-clustered t={overall['t_cluster']:+.1f}). Worth hardening.")
+    if best and best["net_ev"] > 0 and best["t_cluster"] > 2:
         return (f"Net edge appears only when filtered to confidence >= {best['threshold']:.0f} "
-                f"(net +${best['net_ev']:.4f}/contract, per-event t={best['t_event']:.1f}). "
+                f"(net +${best['net_ev']:.4f}/contract, event-clustered t={best['t_cluster']:.1f}). "
                 f"Tighten the gate — but beware in-sample overfitting to that threshold.")
     if overall["net_ev"] > 0:
-        return (f"Marginally positive but WITHIN NOISE (per-event t={overall['t_event']:+.1f}, "
+        return (f"Marginally positive but WITHIN NOISE (event-clustered t={overall['t_cluster']:+.1f}, "
                 f"need >2). The per-signal t={overall['t']:+.1f} looks better only because it "
                 f"over-counts clustered signals as independent. Not distinguishable from zero.")
     return ("NEGATIVE after fees. The signals do not have a net-of-fee edge as configured — "
             "fix the strategy/fees before trading real money.")
+
+
+
+def _with_archive(conn: sqlite3.Connection, table: str) -> str:
+    """`table` plus the rows retention moved into the research archive beside
+    this DB file (db.research_source), so a report covers the whole recorded
+    corpus rather than the last 45-60 days."""
+    import db
+    try:
+        return db.research_source(conn, table)
+    except sqlite3.Error:
+        return table
 
 
 def load_resolved_signals(conn: sqlite3.Connection) -> list[dict]:
@@ -223,7 +390,7 @@ def load_resolved_signals(conn: sqlite3.Connection) -> list[dict]:
     for src, table in (("whale", "whale_trades"), ("momentum", "alerts")):
         try:
             rows = conn.execute(
-                f"SELECT * FROM {table} "
+                f"SELECT * FROM {_with_archive(conn, table)} "
                 f"WHERE resolved=1 AND outcome_correct IS NOT NULL"
             ).fetchall()
         except sqlite3.OperationalError:
@@ -255,16 +422,27 @@ def resolve_db_path(arg_db: Optional[str]) -> Path:
     return Path(__file__).resolve().parent / "data" / "krypt-polybot.db"
 
 
-def build_report(signals: list[dict], fee_coeff: float) -> dict:
+
+DEFAULT_SPREAD_CENTS = 1.0
+SPREAD_SWEEP_CENTS = (0.0, 1.0, 2.0)
+
+
+def build_report(signals: list[dict], fee_coeff: float,
+                 spread_cents: float = DEFAULT_SPREAD_CENTS) -> dict:
     thresholds = [50, 55, 60, 65, 70, 75, 80, 85, 90]
-    overall = summarize(signals, fee_coeff)
+    overall = summarize(signals, fee_coeff, spread_cents)
     by_source = {
-        src: summarize([s for s in signals if s["source"] == src], fee_coeff)
+        src: summarize([s for s in signals if s["source"] == src], fee_coeff, spread_cents)
         for src in ("whale", "momentum")
     }
-    sweep = threshold_sweep(signals, thresholds, fee_coeff)
+    sweep = threshold_sweep(signals, thresholds, fee_coeff, spread_cents)
+    spread_sweep = [
+        {"spread_cents": sc, **summarize(signals, fee_coeff, sc)}
+        for sc in sorted({*SPREAD_SWEEP_CENTS, float(spread_cents)})
+    ]
     return {
         "overall": overall, "by_source": by_source, "sweep": sweep,
+        "spread_cents": spread_cents, "spread_sweep": spread_sweep,
         "verdict": verdict(overall, sweep), "fee_coeff": fee_coeff,
         "notes": [
             "Models entry → hold-to-settlement only. Per-position take-profit "
@@ -290,8 +468,10 @@ def format_report(report: dict, source_label: str) -> str:
     L.append(
         "fee model: per-category taker fee, rate × P·(1−P)"
         + (f" (forced rate {float(_fc):.4f})" if _fc is not None
-           else " (crypto 0.07 default when uncategorised)")
+           else " ('other' 0.05 when uncategorised)")
     )
+    L.append(f"entry: the recorded signal price + {report.get('spread_cents', 0.0):g}¢ "
+             "spread/slippage (--spread)")
     n_w = sum(1 for k in ('whale',) for _ in [0]) if False else report['by_source']['whale']['n']
     n_m = report['by_source']['momentum']['n']
     L.append(f"resolved signals: {o['n']}  (whale {n_w}, momentum {n_m})")
@@ -305,13 +485,16 @@ def format_report(report: dict, source_label: str) -> str:
     L.append(f"  win rate            {o['win_rate']*100:5.1f}%")
     L.append(f"  gross edge/contract {_money(o['gross_ev'])}")
     L.append(f"  fees/contract       {_money(-o['fee_ev'])}")
-    L.append(f"  NET edge/contract   {_money(o['net_ev'])}")
-    L.append(f"  significance        per-EVENT t = {o['t_event']:+.1f}  "
-             f"({o['n_events']} events)   [per-signal t = {o['t']:+.1f}, over-counts]")
+    L.append(f"  NET edge/contract   {_money(o['net_ev'])} per signal   "
+             f"t = {o['t_cluster']:+.1f} clustered by event ({o['n_events']} events)"
+             f"   [per-signal t = {o['t']:+.1f}, over-counts]")
+    L.append(f"                      {_money(o['net_ev_event'])} per event    "
+             f"t = {o['t_event']:+.1f} across event means")
     L.append(f"  net ROI on cost     {o['net_roi']*100:+.1f}%")
     L.append(f"  total net P&L       {_money(o['total_net'])}")
-    L.append("  → trust the per-EVENT t: signals on one market settle together,")
+    L.append("  → trust the clustered t: signals on one market settle together,")
     L.append("    so they are not independent bets. Per-signal t runs high on noise.")
+    L.append("    The per-event line weights every event once, however many signals it printed.")
     L.append("")
     L.append("BY SOURCE")
     for src in ("whale", "momentum"):
@@ -320,16 +503,22 @@ def format_report(report: dict, source_label: str) -> str:
             L.append(f"  {src:<9} (none)")
             continue
         L.append(f"  {src:<9} n={s['n']:<5} ev={s['n_events']:<4} win {s['win_rate']*100:4.0f}%  "
-                 f"net {_money(s['net_ev'])}  t/event {s['t_event']:+.1f}  "
+                 f"net {_money(s['net_ev'])}  t {s['t_cluster']:+.1f}  "
                  f"(t/sig {s['t']:+.1f})")
     L.append("")
     L.append("CONFIDENCE THRESHOLD SWEEP")
-    L.append("  conf≥   n     events  win    net/contract   t/event  (t/sig)")
+    L.append("  conf≥   n     events  win    net/contract   t(clustered)  (t/sig)")
     for r in report["sweep"]:
         if r["n"] == 0:
             continue
         L.append(f"  {r['threshold']:>4.0f}   {r['n']:<6}{r['n_events']:<7} {r['win_rate']*100:4.0f}%   "
-                 f"{_money(r['net_ev']):>9}    {r['t_event']:+.1f}     ({r['t']:+.1f})")
+                 f"{_money(r['net_ev']):>9}    {r['t_cluster']:+.1f}          ({r['t']:+.1f})")
+    if report.get("spread_sweep"):
+        L.append("")
+        L.append("SPREAD / SLIPPAGE SWEEP (all signals; ¢ added to every entry)")
+        L.append("  spread  net/contract   t(clustered)")
+        for r in report["spread_sweep"]:
+            L.append(f"  {r['spread_cents']:>4g}¢   {_money(r['net_ev']):>9}      {r['t_cluster']:+.1f}")
     L.append("")
     L.append(f"VERDICT: {report['verdict']}")
     for note in report.get("notes", []):
@@ -338,7 +527,10 @@ def format_report(report: dict, source_label: str) -> str:
     return "\n".join(L)
 
 
+
 def demo_signals(n: int = 4000, seed: int = 42) -> list[dict]:
+    """Synthetic resolved signals with a small genuine edge, so the report
+    runs end-to-end. NOT real data — labeled clearly in the CLI."""
     import random
     rng = random.Random(seed)
     out = []
@@ -354,11 +546,12 @@ def demo_signals(n: int = 4000, seed: int = 42) -> list[dict]:
     return out
 
 
+
 def load_crypto15m_signals(conn: sqlite3.Connection, interval: str = "15m") -> list[dict]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            """SELECT * FROM crypto15m_signals
+            f"""SELECT * FROM {_with_archive(conn, "crypto15m_signals")}
                WHERE resolved=1 AND up_won IS NOT NULL
                  AND COALESCE(interval, '15m') = ?""",
             (interval,),
@@ -400,6 +593,7 @@ def load_crypto15m_signals(conn: sqlite3.Connection, interval: str = "15m") -> l
             "macd_hist": _num("macd_hist"),
             "macd_cross": _num("macd_cross"),
             "rsi": _num("rsi"),
+            "close_time": str(r.get("close_time") or ""),
         })
     return out
 
@@ -409,6 +603,12 @@ def crypto15m_eval(
     max_fav: float = 1.0, min_delta_pct: float = 0.0,
     fee_coeff: Optional[float] = None,
 ) -> dict:
+    """Apply a 15m strategy variant and return its net-of-fee economics.
+
+    `mode`: 'favorite' buys the favorite at its cost; 'contrarian' buys the
+    cheap opposite side (cost ≈ 1 − favorite price, approximate — ignores
+    the spread). Filters on the favorite price band and the underlying
+    delta. Reuses summarize() so the stats match the main backtest."""
     built: list[dict] = []
     for s in signals:
         fp = s["favorite_price"]
@@ -425,11 +625,17 @@ def crypto15m_eval(
         else:
             cost = s["entry_cost"]
             correct = s["fav_won"]
-        built.append({"cost": cost, "correct": correct, "confidence": fp * 100.0})
+        built.append({"cost": cost, "correct": correct, "confidence": fp * 100.0,
+                      "category": "crypto", "event": s.get("close_time") or ""})
     return summarize(built, fee_coeff)
 
 
 def _macd_aligns(s: dict) -> Optional[bool]:
+    """Does the underlying MACD histogram point the SAME way as the favored
+    side? True = bullish hist + up favored (or bearish + down), False =
+    conflict, None = no MACD recorded or a flat histogram. This is the
+    side-aware cut: if MACD adds information, favorite-follow should fare
+    better on the 'aligned' subset than the 'conflict' subset."""
     mh = s.get("macd_hist")
     if mh is None or mh == 0:
         return None
@@ -439,6 +645,8 @@ def _macd_aligns(s: dict) -> Optional[bool]:
 def crypto15m_macd_breakdown(
     signals: list[dict], fee_coeff: Optional[float] = None
 ) -> dict:
+    """Favorite-follow economics split by whether the underlying MACD agrees
+    with the favored side — the honest first read on whether MACD helps."""
     classifiable = [s for s in signals if _macd_aligns(s) is not None]
     agree = [s for s in classifiable if _macd_aligns(s) is True]
     conflict = [s for s in classifiable if _macd_aligns(s) is False]
@@ -454,7 +662,11 @@ _DELTA_THRESHOLDS = [0.0, 0.05, 0.10, 0.20, 0.40]
 _FAV_BANDS = [(50, 70), (70, 80), (80, 85), (85, 90), (90, 95), (95, 100)]
 
 
-def crypto15m_report(signals: list[dict], fee_coeff: Optional[float] = None) -> dict:
+def crypto15m_report(signals: list[dict], fee_coeff: Optional[float] = None,
+                     interval: str = "15m") -> dict:
+    """Structured crypto up/down backtest for the CLI. `interval` names the
+    recorded window series `signals` came from (load_crypto15m_signals), so
+    the report never calls a 5m corpus "15m"."""
     favorite = {"mode": "favorite", **crypto15m_eval(signals, mode="favorite", fee_coeff=fee_coeff)}
     contrarian = {"mode": "contrarian", **crypto15m_eval(signals, mode="contrarian", fee_coeff=fee_coeff)}
     fav_sweep = [
@@ -479,6 +691,7 @@ def crypto15m_report(signals: list[dict], fee_coeff: Optional[float] = None) -> 
     n_variants = len(eligible)
     return {
         "n": len(signals),
+        "interval": interval,
         "favorite": favorite,
         "contrarian": contrarian,
         "favoriteSweep": fav_sweep,
@@ -487,11 +700,16 @@ def crypto15m_report(signals: list[dict], fee_coeff: Optional[float] = None) -> 
         "macdBreakdown": crypto15m_macd_breakdown(signals, fee_coeff=fee_coeff),
         "best": best,
         "fee_coeff": fee_coeff,
-        "verdict": _crypto15m_verdict(len(signals), favorite, contrarian, best, n_variants),
+        "verdict": _crypto15m_verdict(len(signals), favorite, contrarian, best,
+                                      n_variants, interval),
     }
 
 
 def _bonferroni_t(k: int) -> float:
+    """Two-sided normal quantile z_{1-0.025/k} — the significance bar for the
+    BEST of k comparisons (Bonferroni). A plain t>2 bar has a ~5% false-positive
+    rate PER variant, so the max over ~20 variants clears t>2 by luck alone far
+    more than 5% of the time. Short table covers the counts this sweep emits."""
     for kk, z in ((1, 1.96), (2, 2.24), (3, 2.39), (5, 2.58),
                   (8, 2.73), (12, 2.87), (20, 3.02), (30, 3.14)):
         if k <= kk:
@@ -500,12 +718,13 @@ def _bonferroni_t(k: int) -> float:
 
 
 def _crypto15m_verdict(n: int, favorite: dict, contrarian: dict,
-                       best: dict | None, n_variants: int = 1) -> str:
+                       best: dict | None, n_variants: int = 1,
+                       interval: str = "15m") -> str:
     if n < 30:
-        return (f"COLLECTING DATA — {n} settled 15m signals so far (need ~100+). "
-                "Leave the app open; the recorder logs every quarter automatically.")
+        return (f"COLLECTING DATA — {n} settled {interval} signals so far (need ~100+). "
+                "Leave the app open; the recorder logs every window automatically.")
     t_bar = _bonferroni_t(n_variants)
-    if best and best["net_ev"] > 0 and best["t"] > t_bar:
+    if best and best["net_ev"] > 0 and best["t_cluster"] > t_bar:
         mode = best.get("mode", "favorite")
         th = best.get("threshold")
         dd = best.get("minDeltaPct")
@@ -519,33 +738,40 @@ def _crypto15m_verdict(n: int, favorite: dict, contrarian: dict,
         else:
             tag = "favorite-follow" if mode == "favorite" else "contrarian-fade"
         return (f"Net edge found: {tag} → +{best['net_ev']*100:.1f}¢/contract "
-                f"(t={best['t']:.1f} > {t_bar:.1f} bar, best of {n_variants} "
-                f"variants, n={best['n']}). Still in-sample — paper-trade it.")
+                f"(t={best['t_cluster']:.1f} clustered by close time > {t_bar:.1f} "
+                f"bar, best of {n_variants} variants, n={best['n']} over "
+                f"{best['n_events']} closes). Still in-sample — paper-trade it.")
     if max(favorite["net_ev"], contrarian["net_ev"]) > 0:
         return (f"Marginally positive but WITHIN NOISE (best of {n_variants} "
                 f"variants clears no t > {t_bar:.1f} bar). Keep collecting — "
                 "not yet distinguishable from zero.")
-    return ("NEGATIVE after fees so far. No 15m variant shows a net edge on your "
+    return (f"NEGATIVE after fees so far. No {interval} variant shows a net edge on your "
             "data yet — keep collecting and try the delta filter.")
 
 
 def format_crypto15m_report(report: dict, source_label: str) -> str:
     fc = report.get("fee_coeff")
-    L = ["═══ Krypt PolyBot — 15-minute crypto backtest ═══",
+    iv = report.get("interval") or "15m"
+    L = [f"═══ Krypt PolyBot — crypto up/down backtest: {iv} windows ═══",
          f"source: {source_label}",
+         f"recording interval: {iv} (only windows recorded while the Crypto tab "
+         f"watched {iv}; pick another with --interval)",
          "fee model: taker fee rate × P·(1−P) "
          + (f"(forced rate {float(fc):.4f})" if fc is not None else "(crypto 0.07)"),
-         f"settled 15m signals: {report['n']}", ""]
+         f"settled {iv} signals: {report['n']}", ""]
     if report["n"] == 0:
-        L.append("No settled 15m signals yet. Leave the app open — the recorder logs")
-        L.append("each quarter's favorite + outcome automatically, then re-run this.")
+        L.append(f"No settled {iv} signals yet. Leave the app open with {iv} selected on")
+        L.append("the Crypto tab — the recorder logs each window's favorite + outcome")
+        L.append("automatically — then re-run this.")
         return "\n".join(L)
 
     def line(label: str, r: dict) -> str:
         return (f"  {label:<22} n={r['n']:<5} win {r['win_rate']*100:4.0f}%  "
-                f"net {_money(r['net_ev'])}/contract (t={r['t']:+.1f})")
+                f"net {_money(r['net_ev'])}/contract (t={r['t_cluster']:+.1f}, "
+                f"{r['n_events']} closes)")
 
-    L.append("OVERALL (1 contract per signal)")
+    L.append("OVERALL (1 contract per signal; t clustered by close time —")
+    L.append("         the coins closing together move together)")
     L.append(line("favorite-follow", report["favorite"]))
     L.append(line("contrarian-fade", report["contrarian"]))
     L.append("")
@@ -555,7 +781,7 @@ def format_crypto15m_report(report: dict, source_label: str) -> str:
         if r["n"] == 0:
             continue
         L.append(f"  {r['threshold']:>4}¢  {r['n']:<6} {r['win_rate']*100:4.0f}%   "
-                 f"{_money(r['net_ev']):>9}     {r['t']:+.1f}")
+                 f"{_money(r['net_ev']):>9}     {r['t_cluster']:+.1f}")
     L.append("")
     L.append("FAVORITE-FOLLOW by favorite-price band (disjoint)")
     L.append("  band      n      win    net/contract   t")
@@ -563,7 +789,7 @@ def format_crypto15m_report(report: dict, source_label: str) -> str:
         if r["n"] == 0:
             continue
         L.append(f"  {r['minFav']:>2}-{r['maxFav']:<3}¢  {r['n']:<6} {r['win_rate']*100:4.0f}%   "
-                 f"{_money(r['net_ev']):>9}     {r['t']:+.1f}")
+                 f"{_money(r['net_ev']):>9}     {r['t_cluster']:+.1f}")
     L.append("")
     L.append("FAVORITE-FOLLOW by minimum underlying delta")
     L.append("  Δ≥     n      win    net/contract   t")
@@ -571,7 +797,7 @@ def format_crypto15m_report(report: dict, source_label: str) -> str:
         if r["n"] == 0:
             continue
         L.append(f"  {r['minDeltaPct']:>4}%  {r['n']:<6} {r['win_rate']*100:4.0f}%   "
-                 f"{_money(r['net_ev']):>9}     {r['t']:+.1f}")
+                 f"{_money(r['net_ev']):>9}     {r['t_cluster']:+.1f}")
     mb = report.get("macdBreakdown")
     if mb and mb.get("nWithMacd"):
         L.append("")
@@ -581,7 +807,7 @@ def format_crypto15m_report(report: dict, source_label: str) -> str:
             if r["n"] == 0:
                 continue
             L.append(f"  {label:<12}  {r['n']:<6} {r['win_rate']*100:4.0f}%   "
-                     f"{_money(r['net_ev']):>9}     {r['t']:+.1f}")
+                     f"{_money(r['net_ev']):>9}     {r['t_cluster']:+.1f}")
     L.append("")
     L.append(f"VERDICT: {report['verdict']}")
     return "\n".join(L)
@@ -597,9 +823,12 @@ def main() -> int:
     ap.add_argument("--db", help="path to krypt-polybot.db (default: auto-detect)")
     ap.add_argument("--fee", type=float, default=None,
                     help="force a single taker-fee rate coefficient for everything "
-                         "(default: per-category schedule, crypto 0.07 when unknown)")
+                         "(default: per-category schedule, 'other' 0.05 when unknown)")
     ap.add_argument("--demo", action="store_true",
                     help="run on synthetic data instead of your DB")
+    ap.add_argument("--spread", type=float, default=DEFAULT_SPREAD_CENTS,
+                    help="cents of spread/slippage added to every whale/momentum entry "
+                         f"(default {DEFAULT_SPREAD_CENTS:g}; a 0/1/2 sweep is always printed)")
     ap.add_argument("--breakdown", action="store_true",
                     help="also break down by entry-price, category, and a fade check")
     ap.add_argument("--c15", action="store_true",
@@ -619,16 +848,17 @@ def main() -> int:
             sigs = load_crypto15m_signals(conn, interval=args.interval)
         finally:
             conn.close()
-        print(format_crypto15m_report(crypto15m_report(sigs, args.fee), str(db_path)))
+        print(format_crypto15m_report(
+            crypto15m_report(sigs, args.fee, interval=args.interval), str(db_path)))
         return 0
 
     if args.demo:
         print("⚠  SYNTHETIC DEMO DATA — not your real signals.\n")
         signals = demo_signals()
-        report = build_report(signals, args.fee)
+        report = build_report(signals, args.fee, args.spread)
         print(format_report(report, "synthetic demo (4000 signals)"))
         if args.breakdown:
-            print(format_breakdown(signals, args.fee))
+            print(format_breakdown(signals, args.fee, args.spread))
         return 0
 
     db_path = resolve_db_path(args.db)
@@ -641,10 +871,10 @@ def main() -> int:
         signals = load_resolved_signals(conn)
     finally:
         conn.close()
-    report = build_report(signals, args.fee)
+    report = build_report(signals, args.fee, args.spread)
     print(format_report(report, str(db_path)))
     if args.breakdown:
-        print(format_breakdown(signals, args.fee))
+        print(format_breakdown(signals, args.fee, args.spread))
     return 0
 
 

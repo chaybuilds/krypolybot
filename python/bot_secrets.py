@@ -1,3 +1,17 @@
+"""At-rest storage for the chat bots' tokens.
+
+A bot token is a credential: whoever holds it can speak as your bot. So it is
+stored the same way the wallet key is — through ``polymarket_auth``'s secret
+writer, which picks the best backend available (Windows DPAPI → OS keychain →
+a chmod-600 plaintext fallback that logs loudly about itself).
+
+Deliberately NOT in settings.json or app_kv: those are plain files the user
+copies around, pastes into support threads and syncs to cloud drives.
+
+Note the token is not the security boundary anyway — the paired-id allowlist
+in ``remote.py`` is. This is defence in depth, not the defence.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -32,7 +46,7 @@ def load_token(platform: str) -> Optional[str]:
         return None
     try:
         return auth._read_secret_bytes(p).decode("utf-8").strip() or None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("remote: could not read %s token: %s", platform, e)
         return None
 
@@ -52,6 +66,7 @@ def clear_token(platform: str) -> None:
 
 
 def masked(platform: str) -> Optional[str]:
+    """A shape the user can recognise without the screen leaking the token."""
     t = load_token(platform)
     if not t:
         return None

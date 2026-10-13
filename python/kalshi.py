@@ -1,3 +1,36 @@
+"""Kalshi — a second venue, read-only.
+
+Why this exists: Polymarket and Kalshi list overlapping questions, and seeing
+the SAME question priced on both is useful context — a second opinion from a
+different pool of traders. It needs no trust, because the user can open the
+Kalshi page and check the number themselves.
+
+This is REFERENCE DATA. The app reads Kalshi and never trades on it, and the
+difference between the two prices is presented as information about the two
+markets, not as an opportunity.
+
+Three rules specific to a second venue.
+
+1. **NEVER BLUR THE VENUES.** Kalshi is a CFTC-regulated US exchange;
+   Polymarket is not the same thing legally, and their fees, settlement
+   guarantees and resolution sources differ. Every row carries its venue, and
+   the comparison panel states the difference rather than implying the two
+   numbers are interchangeable.
+
+2. **A MATCH IS A CLAIM, NOT A FACT.** Nothing tells us these two markets ask
+   the same question; we are inferring it from words and dates. So a match
+   carries a confidence and the matched title verbatim, and below the
+   confidence bar we refuse to print a spread at all — a made-up "edge" on a
+   mismatched pair is worse than no panel.
+
+3. **PUBLIC ENDPOINTS ONLY.** No key, no auth, no orders. Everything here is
+   the read side of a venue we do not trade on from this app.
+
+Requests ride the SAME gate as the Polymarket providers (see terminal._HOSTS),
+so the offline switch, the 429 park and the privacy panel's counters all cover
+Kalshi automatically.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -17,6 +50,13 @@ TTL_CANDLES = 120.0
 
 
 def _from_cents(v: Any) -> Optional[float]:
+    """A field Kalshi names in whole cents (`yes_bid: 94`). Never rescaled.
+
+    The unit is in the field name, so there is nothing to infer: `1` here is
+    1¢. Reading it as $1.00 turned a genuine penny quote into 100¢, which
+    `_sentinel_free` then dropped as an empty book — a real, tradeable market
+    reported as unpriced.
+    """
     n = num(v)
     if n is None:
         return None
@@ -24,6 +64,7 @@ def _from_cents(v: Any) -> Optional[float]:
 
 
 def _from_dollars(v: Any) -> Optional[float]:
+    """A field Kalshi names in dollars (`yes_bid_dollars: "0.9400"`)."""
     n = num(v)
     if n is None:
         return None
@@ -31,6 +72,17 @@ def _from_dollars(v: Any) -> Optional[float]:
 
 
 def _cents(v: Any) -> Optional[float]:
+    """A field whose unit is NOT in its name — the candle tiers, where the
+    same key carries "0.94" from the historical tier and 94 from the live one.
+
+    Here the unit genuinely has to be read off the value, so read the thing
+    that actually distinguishes them: a written decimal point. "0.94" and
+    "1.0000" are dollars; a bare 1 or 94 is cents. The old test — "≤1.5 means
+    dollars" — had no way to tell 1¢ from $1.00 and always chose $1.00.
+
+    Neither 0 nor 100 is a real quote, so the same empty-book scrub applies as
+    on Polymarket.
+    """
     n = num(v)
     if n is None:
         return None
@@ -49,11 +101,21 @@ def _hours_to(close_iso: Optional[str]) -> Optional[float]:
 
 
 def _strike(v: Any) -> Optional[float]:
+    """A Kalshi strike, as a number. Distinct from a price: never scaled and
+    never scrubbed — 0 and 100 are perfectly good strikes."""
     return num(v)
 
 
 def market_row(m: dict, observed_at: Optional[str] = None,
                event: Optional[dict] = None) -> Optional[dict]:
+    """One Kalshi market → our MarketSummary shape, with venue='kalshi'.
+
+    ``event`` is the market's parent event when we already have it (the
+    ``/events?with_nested_markets`` route). It carries the two things a market
+    row on its own does NOT: the fixture or subject in words ("New York M vs
+    Tampa Bay") and the settlement MOMENT (``strike_date``). Both are load
+    bearing for cross-venue matching — see events_in_series.
+    """
     if not isinstance(m, dict):
         return None
     ticker = str(m.get("ticker") or "").strip()
@@ -210,6 +272,26 @@ TTL_SERIES = 1800.0
 
 
 async def series_index() -> tuple[list[dict], bool]:
+    """Every Kalshi SERIES, with its title and settlement sources.
+
+    This is the index cross-venue matching runs against, and choosing it over
+    a market sweep is the whole reason the feature is affordable. Measured
+    2026-08-25:
+
+      * `/markets?status=open` is useless for discovery — the first 4,000 rows
+        were 4,000 auto-generated multi-leg parlays, with every real market
+        behind them.
+      * A full `/events?with_nested_markets` sweep reaches everything but
+        costs ~11,900 events / ~101,000 markets and 20+ seconds, and its fixed
+        ordering put far-dated markets first: a 14-page sample held 312 Fed
+        markets and not one of the near-dated ones a trader would actually
+        compare.
+      * The series list is ~11,800 SHORT rows in ~4 seconds, and a series
+        title *is* the question — which is exactly what we are matching on.
+
+    So: match the question against series titles, then pull markets only from
+    the handful of series that look right.
+    """
     rows: list[dict] = []
     ok_any = False
     for cat in CATEGORIES:
@@ -243,6 +325,24 @@ TTL_EVENTS = 300.0
 
 
 async def events_in_series(series_ticker: str, limit: int = 200) -> list[dict]:
+    """Open markets in one series, WITH their event context — one call.
+
+    This replaced `markets_in_series` as the matcher's retrieval step, for two
+    reasons measured against the live API on 2026-09-02:
+
+    * **The subject is on the EVENT, not the market.** `/markets` gives
+      "Tampa Bay wins" and nothing else — no opponent, no date, no sport. The
+      event gives "New York M vs Tampa Bay / NYM vs TB (Sep 2)". Matching a
+      Polymarket question against the market row alone was hopeless for every
+      fixture-shaped market, which is most of what both venues list.
+    * **`/markets` truncates on the series that matter most.** A daily strike
+      series (KXBTCD) has ~200 markets PER DATE; a flat `limit=200` sweep came
+      back holding one date's ladder and nothing else, so the right strike on
+      the right day was simply never a candidate. Events are few and each
+      carries its own ladder nested, so nothing is cut off.
+
+    Same cost as the old call — one request — and the same gate.
+    """
     st = str(series_ticker or "").strip().upper()
     if not st:
         return []
@@ -270,6 +370,13 @@ async def events_in_series(series_ticker: str, limit: int = 200) -> list[dict]:
 
 
 async def markets_in_series(series_ticker: str, limit: int = 200) -> list[dict]:
+    """Open markets in one series, normalised. Small and cheap.
+
+    NOT the matcher's path — that is `events_in_series`, which carries the
+    event context and does not truncate a strike ladder. This is the plain
+    market route, kept because the live check uses it to prove the `/markets`
+    endpoint and its quote fields independently of the events one.
+    """
     st = str(series_ticker or "").strip().upper()
     if not st:
         return []
@@ -290,7 +397,12 @@ async def markets_in_series(series_ticker: str, limit: int = 200) -> list[dict]:
     return out
 
 
+
 def _candle_price(c: dict, group: str, key: str) -> Optional[float]:
+    """Historical tier: {"price": {"close": "0.94"}}. Live tier:
+    {"price": {"close_dollars": "0.9400"}}. The `_dollars` key says its unit;
+    the bare one does not, so only that one goes through the inferring reader.
+    """
     d = c.get(group)
     if not isinstance(d, dict):
         return None
@@ -301,6 +413,12 @@ def _candle_price(c: dict, group: str, key: str) -> Optional[float]:
 
 
 def normalize_candles(raw: list) -> list[dict]:
+    """→ ascending [{t, p}] in cents, duplicates collapsed.
+
+    Kalshi emits the same period stamp twice in one response; a repeat is a
+    correction, so the LAST record for a stamp wins. Never gap-filled: a
+    period with no trades simply produces no point.
+    """
     by_ts: dict[int, float] = {}
     for c in raw or []:
         if not isinstance(c, dict):
@@ -325,6 +443,12 @@ def normalize_candles(raw: list) -> list[dict]:
 async def candles(ticker: str, *, start_ts: int, end_ts: int,
                   period_interval: int = 60,
                   series_ticker: str = "") -> list[dict]:
+    """Price history for one Kalshi market, in cents.
+
+    Two tiers hold candles and which one has a given market depends on
+    Kalshi's rolling cutoff, so both are tried rather than guessed at. The
+    endpoint 400s without BOTH timestamps.
+    """
     t = str(ticker or "").strip().upper()
     if not t:
         return []
@@ -345,6 +469,7 @@ async def candles(ticker: str, *, start_ts: int, end_ts: int,
 
 
 def web_url(ticker: str, event_ticker: Optional[str] = None) -> str:
+    """The public Kalshi page for a market, so the user can check us."""
     ev = (event_ticker or str(ticker or "").split("-")[0]).strip().lower()
     return f"https://kalshi.com/markets/{ev}" if ev else "https://kalshi.com"
 

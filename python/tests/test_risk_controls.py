@@ -1,3 +1,15 @@
+"""Regression tests for the silent no-trade/stall fixes ported from
+krypt-trader (34704ed):
+
+  - the daily new-position cap must count ONLY rows that actually became
+    (or are still working toward) a real position — a run of unfilled
+    auto-cancels or CLOB rejections must not saturate
+    max_daily_new_positions while zero contracts are held ("runs for
+    hours then stops trading, empty portfolio, works next day");
+  - a partial fill whose remainder was CANCELED must collapse
+    target_contracts to the filled qty so current_total_exposure_usd
+    stops valuing the dead remainder's notional as committed capital.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +19,7 @@ import pytest
 
 import db
 import trader
+
 
 
 @pytest.fixture
@@ -64,6 +77,7 @@ def fetch(pid: int) -> dict:
         return db.fetch_position_by_id(conn, pid)
 
 
+
 def test_daily_cap_ignores_terminal_failed_orders(fresh_db):
     seed_position(status="submitted")
     seed_position(status="partial", filled_contracts=3)
@@ -104,6 +118,7 @@ def test_daily_cap_env_scoped(fresh_db):
     with db.get_db() as conn:
         assert db.count_new_positions_today(conn, "mainnet") == 1
         assert db.count_new_positions_today(conn) == 2
+
 
 
 async def _no_positions(*_a, **_k):
@@ -153,6 +168,7 @@ def test_poll_keeps_target_for_resting_partial(fresh_db, env_net, cfg, monkeypat
     row = fetch(pid)
     assert row["status"] == "partial"
     assert row["target_contracts"] == 5
+
 
 
 def test_crypto15m_strategy_stats_groups_and_sums(fresh_db):

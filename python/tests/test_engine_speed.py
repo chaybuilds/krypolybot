@@ -1,3 +1,11 @@
+"""Concurrency/round-trip regressions for the three trading engines.
+
+Each test here pins a hot loop that used to be SERIAL — N wallets, N pending
+orders, N open positions — and would silently go back to N × latency if someone
+"simplified" the gather away. They assert wall-clock, so the stubs sleep a fixed
+amount and the bound is generous (3-4× the ideal) to stay stable on a loaded CI
+box while still failing hard on a serial regression.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -74,6 +82,8 @@ def test_one_failing_wallet_falls_back_to_its_cache_others_still_succeed(monkeyp
 
 
 def test_wallet_with_no_cache_ever_still_disables_exits(monkeypatch):
+    """The one branch that must keep clearing all_ok: a wallet we have never
+    read successfully. Its holdings are unknown, so exits can't be decided."""
     monkeypatch.setattr(copy_trader, "_own_addresses", lambda: set())
     monkeypatch.setattr(copy_trader, "_wallet_pos_cache", {}, raising=False)
 
@@ -152,6 +162,8 @@ def test_pending_order_polls_run_concurrently(fresh_db, monkeypatch):
 
 
 def test_one_failing_order_does_not_stop_the_rest(fresh_db, monkeypatch):
+    """A single blown poll must still be isolated to its own row now that the
+    calls are gathered — the exception is replayed in that order's turn."""
     monkeypatch.setattr(trader, "get_env", lambda: "mainnet")
     trader._poll_failures.clear()
     bad_oid = "OID-BAD"
@@ -182,7 +194,7 @@ def test_one_failing_order_does_not_stop_the_rest(fresh_db, monkeypatch):
     assert trader._poll_failures.get(pid_bad) == 1
 
 
-import crypto15m_trader as ct
+import crypto15m_trader as ct  # noqa: E402
 
 
 def _seed_c15(n: int) -> int:
@@ -240,6 +252,8 @@ def test_crypto_tick_batches_markets_and_gathers_manage(fresh_db, monkeypatch):
 
 
 def test_manage_position_still_fetches_its_own_market_when_not_given(fresh_db, monkeypatch):
+    """The `market=` parameter is optional — other callers and the existing
+    tests must keep the old per-position fetch."""
     single_calls = []
 
     async def _single(ticker):
@@ -257,6 +271,8 @@ def test_manage_position_still_fetches_its_own_market_when_not_given(fresh_db, m
 
 
 def _wire_scan(monkeypatch, *, start_usd: float, cost_usd: float, n_candidates: int):
+    """Drive scan_for_trades past its gates with `n_candidates` accepted
+    signals, each committing `cost_usd`. Returns (forced, executed)."""
     forced: list[bool] = []
     executed: list[str] = []
 

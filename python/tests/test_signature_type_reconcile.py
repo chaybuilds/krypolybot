@@ -1,3 +1,16 @@
+"""Startup repair of a wrongly-persisted deposit-wallet signature type.
+
+Regression for the 2026-07-08 field reports. A shipped `detect_wallet_signature_type`
+concluded POLY_PROXY (1) from the mere ABSENCE of an EIP-1271 selector, and
+`check_trading_ready` persisted that -- downgrading the current-generation deposit
+wallet (the email/Google default, genuinely POLY_1271) so every order it signed was
+rejected with "the order signer address has to be the address of the api key".
+
+Fixing detection is not enough: it only runs from the manual Test/Save button, so a
+victim who installs the fix and just reopens the app keeps the corrupt type. The
+repair therefore runs on connect. These tests pin that it (a) heals, (b) never
+invents a type when the chain can't prove one, and (c) re-arms for a new wallet.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +22,7 @@ DEP = "0xDDDD000000000000000000000000000000000009"
 
 
 def _wire(monkeypatch, *, funder, stored, detected):
+    """Stub the reconcile's collaborators; capture what it persists."""
     written: list[tuple[str, int]] = []
     service._sig_type_reconciled = False
 

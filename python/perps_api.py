@@ -1,6 +1,31 @@
+"""Polymarket Perps REST client: public market data, the delegated proxy
+credential, signed trading commands, and private account reads.
+
+Perps is a separate exchange from the prediction-market CLOB (its own host,
+its own pUSD balance, its own order ids). Nothing here touches the CLOB.
+
+SIGNING. Every trading command is signed by a delegated *proxy* key, not the
+wallet key. The signed payload is the EIP-712 struct
+    Op(bytes32 data, uint64 salt, uint64 ts)    domain {Polymarket, 1, 137}
+where `data = keccak256(msgpack(compact_op))` and `compact_op` is the
+positional form of the command with `None` holes dropped, e.g.
+    ["createOrders", [[iid, buy, p, qty, tif, po, ro?, coid?, tr?]]]
+The request body carries the KEYED form of the same command ({"iid": .., ..});
+the server rebuilds the compact form from it, so both must agree exactly —
+`_order_row` / `_body_op` are a port of the official SDK's
+(`polymarket-client` 0.12, `_internal/actions/perps/trading.py`).
+
+msgpack is not a dependency of this app, and the compact ops only ever contain
+None/bool/int/str/list, so `_pack` implements exactly that subset of the spec.
+
+The wallet key is used once, to authorise a proxy (`link_account`). The proxy
+key, its secret and expiry are stored encrypted next to the wallet key
+(polymarket_auth.save_perps_creds).
+"""
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import math
 import secrets
@@ -29,6 +54,8 @@ _EIP712_DOMAIN = [
 
 
 class PerpsAPIError(RuntimeError):
+    """A rejected or failed Perps request. `error` is the exchange's stable
+    identifier when it sent one (e.g. "insufficient_margin")."""
 
     def __init__(self, message: str, *, status: int = 0, error: str = "",
                  retry_after: Optional[float] = None):
@@ -36,6 +63,7 @@ class PerpsAPIError(RuntimeError):
         self.status = status
         self.error = error or message
         self.retry_after = retry_after
+
 
 
 def _pack(obj: Any) -> bytes:
@@ -86,6 +114,8 @@ def _pack(obj: Any) -> bytes:
 
 
 def _compact(value: Any) -> Any:
+    """Drop None entries from sequences recursively — the server does the same
+    before hashing."""
     if isinstance(value, (list, tuple)):
         return [_compact(v) for v in value if v is not None]
     return value
@@ -113,6 +143,7 @@ def op_typed_data(op: list, salt: int, ts_ms: int) -> dict:
 
 
 def sign_op(private_key: str, op: list) -> dict:
+    """{salt, sig, ts} for `op`, signed with the proxy key."""
     from eth_account import Account
     salt = secrets.randbits(32)
     ts = int(time.time() * 1000)
@@ -122,9 +153,12 @@ def sign_op(private_key: str, op: list) -> dict:
     return {"salt": salt, "sig": "0x" + sig, "ts": ts}
 
 
+
 def order_row(iid: int, buy: bool, price: Optional[str], qty: str, *,
               tif: str = "gtc", post_only: bool = True, reduce_only: bool = False,
               coid: Optional[str] = None) -> list:
+    """Positional order row: [iid, buy, p?, qty, tif?, po, ro?, coid?, tr?].
+    `po` is always present (a bool); `ro` only when True."""
     return [iid, bool(buy), price, qty, tif, bool(post_only),
             True if reduce_only else None, coid, None]
 
@@ -143,6 +177,7 @@ def _order_body(row: list) -> dict:
 
 
 def body_op(op: list) -> dict:
+    """The keyed request-body form of a compact op."""
     kind = op[0]
     if kind == "createOrders":
         return {"type": kind, "args": [_order_body(r) for r in op[1]]}
@@ -158,7 +193,11 @@ def body_op(op: list) -> dict:
     raise ValueError(f"unsupported perps command {kind!r}")
 
 
+
 def price_step(price: float, price_decimals: int) -> float:
+    """The effective tick at `price`: the instrument's decimal step, coarsened
+    by the 5-significant-figure rule (BTC at 86,000 trades in whole dollars
+    even though its decimals allow 0.1)."""
     if price <= 0:
         return 10.0 ** -price_decimals
     mag = math.floor(math.log10(price))
@@ -166,6 +205,8 @@ def price_step(price: float, price_decimals: int) -> float:
 
 
 def fmt_price(price: float, price_decimals: int, *, side: str) -> str:
+    """Round a quote to a valid price, AWAY from the market: bids down, asks
+    up, so rounding can never turn a passive quote into a crossing one."""
     step = Decimal(str(price_step(price, price_decimals)))
     q = Decimal(str(price)) / step
     q = q.to_integral_value(rounding=ROUND_FLOOR if side == "buy" else ROUND_CEILING)
@@ -174,6 +215,7 @@ def fmt_price(price: float, price_decimals: int, *, side: str) -> str:
 
 
 def fmt_qty(qty: float, quantity_decimals: int) -> str:
+    """Floor a quantity to the instrument's decimals and 5 significant figures."""
     if qty <= 0:
         return "0"
     mag = math.floor(math.log10(qty))
@@ -189,6 +231,17 @@ def _plain(d: Decimal) -> str:
 
 
 _client: Optional[httpx.AsyncClient] = None
+_sent: collections.deque = collections.deque(maxlen=256)
+
+
+def _note_sent() -> None:
+    _sent.append(time.monotonic())
+
+
+def recent_requests(window: float = 1.0) -> int:
+    """How many Perps requests this process sent in the last `window` seconds."""
+    cutoff = time.monotonic() - window
+    return sum(1 for t in _sent if t >= cutoff)
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -240,6 +293,7 @@ async def _get(path: str, params: Optional[dict] = None, *, creds: Optional[dict
     if creds:
         headers = {"polymarket-proxy": creds["proxy"], "polymarket-secret": creds["secret"]}
     q = {k: v for k, v in (params or {}).items() if v is not None}
+    _note_sent()
     try:
         resp = await _get_client().get(path, params=q, headers=headers)
     except httpx.HTTPError as e:
@@ -249,6 +303,7 @@ async def _get(path: str, params: Optional[dict] = None, *, creds: Optional[dict
 
 async def _signed(method: str, path: str, op: list, creds: dict) -> Any:
     body = {"op": body_op(op), **sign_op(creds["privateKey"], op)}
+    _note_sent()
     try:
         resp = await _get_client().request(method, path, json=body)
     except httpx.HTTPError as e:
@@ -289,7 +344,9 @@ async def klines(iid: int, interval: str, start_ms: int, end_ms: Optional[int] =
     return (data or {}).get("data") or [] if isinstance(data, dict) else []
 
 
+
 def creds() -> Optional[dict]:
+    """The stored proxy credential, or None when not linked / expired."""
     c = auth.load_perps_creds()
     if not c or not all(c.get(k) for k in ("proxy", "privateKey", "secret")):
         return None
@@ -313,6 +370,8 @@ def creds_status() -> dict:
 
 
 async def link_account(label: str = "krypt-polybot") -> dict:
+    """Authorise a fresh proxy signer for the wallet's Perps account and store
+    it. The wallet key signs exactly once, here."""
     from eth_account import Account
     if not auth.credentials_present():
         raise PerpsAPIError("Connect your Polymarket wallet first (Wallet page).",
@@ -342,6 +401,7 @@ async def link_account(label: str = "krypt-polybot") -> dict:
         "op": {"type": "createProxy", "args": {"expiry": exp, "owner": owner, "proxy": proxy}},
         "salt": salt, "sig": sig, "ts": ts, "label": label,
     }
+    _note_sent()
     try:
         resp = await _get_client().post("/v1/account/proxy", json=body)
     except httpx.HTTPError as e:
@@ -366,25 +426,33 @@ def unlink_account() -> None:
 
 
 def needs_renewal(c: Optional[dict]) -> bool:
+    """True once the proxy is inside its renewal window (the market maker
+    re-links it then, while it still works)."""
     if not c:
         return False
     return int(c.get("expiresAt") or 0) - int(time.time() * 1000) < PROXY_RENEW_BEFORE_MS
 
 
+
 async def portfolio(c: dict) -> dict:
     data = await _get("/v1/account/portfolio", creds=c)
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        raise PerpsAPIError("Perps returned an unreadable portfolio.", error="bad_response")
+    return data
 
 
 async def open_orders(c: dict, iid: Optional[int] = None) -> list[dict]:
     data = await _get("/v1/account/open-orders", {"instrument_id": iid}, creds=c)
     if isinstance(data, dict):
         data = data.get("data") or []
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        raise PerpsAPIError("Perps returned an unreadable order list.", error="bad_response")
+    return data
 
 
 async def fills(c: dict, start_ms: int, end_ms: Optional[int] = None,
                 max_pages: int = 20) -> list[dict]:
+    """Fills in [start, end], oldest first, following `more` pages forward."""
     out: list[dict] = []
     cursor = start_ms
     for _ in range(max_pages):
@@ -416,6 +484,7 @@ async def rewards(c: dict) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+
 async def create_orders(c: dict, rows: list[list]) -> list[dict]:
     if not rows:
         return []
@@ -436,7 +505,13 @@ async def cancel_all(c: dict, iid: Optional[int] = None) -> None:
 
 
 async def auto_cancel(c: dict, at_ms: int) -> None:
-    await _signed("PATCH", "/v1/trade/auto-cancel", ["autoCancel", [int(at_ms)]], c)
+    """Arm the exchange-side dead man's switch (0 disarms). Raises unless the
+    exchange accepted it — the market maker places nothing without it, and a
+    rejection can come back as a 200 body (e.g. the daily trigger limit)."""
+    data = await _signed("PATCH", "/v1/trade/auto-cancel", ["autoCancel", [int(at_ms)]], c)
+    if isinstance(data, dict) and data.get("status") == "err":
+        err = str(data.get("error") or "auto-cancel rejected")
+        raise PerpsAPIError(err, status=200, error=err)
 
 
 async def update_leverage(c: dict, iid: int, leverage: int, cross: bool) -> Any:
@@ -445,5 +520,6 @@ async def update_leverage(c: dict, iid: int, leverage: int, cross: bool) -> Any:
 
 
 async def gather_quiet(*aws):
+    """asyncio.gather that turns exceptions into None (best-effort reads)."""
     res = await asyncio.gather(*aws, return_exceptions=True)
     return [None if isinstance(r, BaseException) else r for r in res]

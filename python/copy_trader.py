@@ -1,3 +1,25 @@
+"""Copy-trading engine (Phase 3).
+
+Mirror one or more Polymarket wallets. Each tick:
+
+  1. Pull the CURRENT holdings of every followed wallet (Data API
+     /positions) and union them into a set of (ticker, side) they're in,
+     filtered by `copy_min_trade_usd` (ignore their dust).
+  2. ENTER any (ticker, side) they hold that we don't have an open copy of
+     (sized by our own rules, inside the
+     `copy_entry_min_cents`..`copy_entry_max_cents` band).
+  3. EXIT any open copy of ours whose (ticker, side) NONE of the followed
+     wallets hold anymore — i.e. they all closed it, so we follow them out.
+
+This is deliberately STATELESS: "enter if they hold and we don't / exit if
+we hold and nobody does" needs no persisted last-seen snapshot, so a restart
+mid-session can't desync. Copies are ordinary `bot_positions` rows tagged
+`signal_source='copy'`, so the existing poll/reconcile/settlement/live-P&L
+machinery manages them for free — this module only opens and closes.
+
+Fully INDEPENDENT of the main bot and crypto engines (its own enable + live
+switches), exactly like crypto15m_trader.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +50,9 @@ _WALLET_CACHE_STALE_SEC = 90.0
 _WALLET_READ_CONCURRENCY = 8
 _WALLET_CACHE_UI_SEC = 10.0
 
+_wallet_too_large: dict[str, float] = {}
+_TOO_LARGE_RECHECK_SEC = 600.0
+
 last_open_count = 0
 
 
@@ -41,6 +66,8 @@ _pushed_changed: list[dict] = []
 
 
 def _own_addresses() -> set:
+    """Our own wallet addresses (EOA + funder) — never copy ourselves, which in
+    LIVE would just double our own exposure."""
     out = set()
     for fn in (polymarket_auth.trading_address, polymarket_auth.get_address,
                polymarket_auth.get_funder):
@@ -59,6 +86,10 @@ def _short_addr(a: str) -> str:
 
 
 async def _bankroll_usd(cfg: dict, authed: bool) -> float:
+    """Balance to size against — live cash when connected. A CONFIRMED zero
+    is a real 0.0 (skip entries; don't spend the pinned bankroll that isn't
+    there); only an unknown balance (read failed) falls back to
+    `start_bankroll_usd`."""
     if authed:
         try:
             cents, _port = await trader.refresh_balance(cfg, force=False)
@@ -72,11 +103,21 @@ async def _bankroll_usd(cfg: dict, authed: bool) -> float:
 
 
 def _today_copy_pnl(env: str) -> float:
+    """Realized copy-trade P&L today (UTC). Robust to a mid-day history wipe:
+    folds in any today-P&L banked when clear_trade_history/factory_reset removed
+    today's resolved copy rows, so wiping stats can't re-arm trading past the
+    daily loss limit."""
     with db.get_db() as conn:
         return db.engine_today_pnl(conn, "copy", env)
 
 
 def _lifetime_loss_tripped(cfg: dict, env: str) -> tuple[bool, str]:
+    """Durable cumulative realized-loss guard for the copy engine (mirrors
+    crypto15m's). The daily breaker resets every UTC midnight, so a net-negative
+    copy engine could bleed the daily cap forever; this caps TOTAL drawdown using
+    a counter that SURVIVES a stats wipe. Trips once cumulative realized copy loss
+    reaches the absolute-$ override (if > 0) or the configured fraction of the
+    starting bankroll. Returns (tripped, human reason)."""
     limit_usd = float(cfg.get("copy_lifetime_loss_limit_usd") or 0.0)
     try:
         limit_pct = max(0.0, min(1.0, float(cfg.get("copy_lifetime_loss_limit_pct", 0.0) or 0.0)))
@@ -123,6 +164,8 @@ _SEEN_MAX = 5000
 
 
 def _load_seen(env: str) -> dict:
+    """Baseline keys in stored (insertion) order — a dict used as an ordered
+    set (key -> None), so the cap can evict oldest-first."""
     try:
         with db.get_db() as conn:
             raw = db.kv_get(conn, _seen_key(env))
@@ -167,6 +210,9 @@ def _save_qty_base(env: str, m: dict) -> None:
 
 
 def _filter_new_entries(followed: dict, env: str, cfg: dict) -> dict:
+    """Return only the followed holdings that are a NEW entry for an
+    already-baselined wallet; baseline everything else. Persists the seen-set
+    only when it actually changed (it used to rewrite the kv row every tick)."""
     seen = _load_seen(env)
     changed = False
     cur_wallets = {w.strip().lower() for w in (cfg.get("copy_wallets") or [])
@@ -201,6 +247,13 @@ def _filter_new_entries(followed: dict, env: str, cfg: dict) -> dict:
 def _compute_copy_contracts(
     cfg: dict, *, price_cents: int, balance_usd: float, cap_usd: Optional[float] = None
 ) -> int:
+    """Contracts to buy for one copy, given the entry price. `fixed` spends
+    `copy_fixed_usd`; `balance_pct` spends a fraction of balance. Either way
+    clamped to what the balance can actually collateralize (a buy-only binary
+    locks contracts × price). `cap_usd` further caps spend to the shared-wallet
+    risk room (cash reserve / total-exposure cap) computed by the caller. Returns
+    0 when even one contract is unaffordable so the caller skips instead of
+    eating a 'not enough balance' rejection."""
     price = max(0.01, int(price_cents) / 100.0)
     bal = max(0.0, float(balance_usd or 0.0))
     mode = (cfg.get("copy_sizing_mode") or "fixed").lower()
@@ -217,11 +270,33 @@ def _compute_copy_contracts(
 
 
 async def _read_wallet_positions(w: str) -> tuple[Optional[list], bool]:
+    """One followed wallet's /positions read plus its last-good-cache fallback.
+
+    Returns (positions, read_ok). `positions is None` (with read_ok False) means
+    we have never had a good read for this wallet this session, so exits can't
+    be decided safely — same meaning the old `all_ok = False; continue` branch
+    had.
+
+    Split out of `_followed_holdings` purely so the per-wallet reads can be
+    gathered: the loop used to be N serial Data-API round-trips before ANY exit
+    or entry decision, on every 5 s tick. Every fallback semantic below is
+    unchanged."""
     wl = w.strip().lower()
+    flagged = _wallet_too_large.get(wl)
+    if flagged is not None and time.monotonic() - flagged < _TOO_LARGE_RECHECK_SEC:
+        return _too_large_fallback(wl)
     try:
         positions = await polymarket_api.get_positions(limit=500, user=w)
         _wallet_pos_cache[wl] = (time.time(), positions)
+        _wallet_too_large.pop(wl, None)
         return positions, True
+    except polymarket_api.PositionsTooLargeError as e:
+        _wallet_too_large[wl] = time.monotonic()
+        logger.warning(
+            f"[copy] {_short_addr(w)} is too large to mirror ({e}); not copying "
+            f"its trades, re-checking in {_TOO_LARGE_RECHECK_SEC / 60:.0f} min"
+        )
+        return _too_large_fallback(wl)
     except Exception as e:
         cached = _wallet_pos_cache.get(wl)
         age = (time.time() - cached[0]) if cached else None
@@ -242,7 +317,37 @@ async def _read_wallet_positions(w: str) -> tuple[Optional[list], bool]:
         return None, False
 
 
+def _too_large_fallback(wl: str) -> tuple[Optional[list], bool]:
+    """A too-large wallet is read like any wallet whose read keeps failing:
+    its last complete read if this session ever had one, else unknown, which
+    holds the exit pass for everyone. A partial list is never an option."""
+    cached = _wallet_pos_cache.get(wl)
+    return (cached[1], True) if cached else (None, False)
+
+
+def _too_large_message(wl: str) -> Optional[str]:
+    """What the Copy page shows for a wallet flagged too large, else None."""
+    if wl not in _wallet_too_large:
+        return None
+    msg = ("Too large to mirror: this wallet holds more open positions than the "
+           "app can read in full, so its trades aren't copied. Stop following it.")
+    if wl not in _wallet_pos_cache:
+        msg += (" Until you do, copy exits are paused for every wallet: the app "
+                "never saw this one's full holdings, so it can't tell what it sold.")
+    return msg
+
+
 async def _followed_holdings(cfg: dict) -> tuple[dict, bool]:
+    """Union of all followed wallets' current holdings, keyed by
+    (ticker, side). Value carries the live price, max cost across wallets,
+    title, and which wallets hold it. Dust below `copy_min_trade_usd` is
+    dropped so we don't mirror their rounding noise.
+
+    Returns (holdings, all_reads_ok). A wallet whose /positions read FAILED
+    is absent from the map — which downstream is indistinguishable from that
+    wallet having sold everything. Exits must therefore only run when every
+    read succeeded; entries can safely use the partial map (worst case a
+    missed entry, retried next tick)."""
     own = _own_addresses()
     wallets = [w for w in (cfg.get("copy_wallets") or [])
                if isinstance(w, str) and w.strip().lower() not in own]
@@ -307,6 +412,17 @@ _CATEGORY_CACHE_MAX = 500
 
 
 async def _market_category(ticker: str) -> str:
+    """The followed market's Polymarket category, or "" when it can't be read.
+
+    This is a MONEY field, not a label: the fee-v2 taker rate is per category
+    (crypto 0.07, sports/economics/culture/weather/other 0.05, finance /
+    politics / tech / mentions 0.04, geopolitics 0.0) and copy rows used to be
+    written with a hard-coded "" — which missed the table and billed every
+    copied position, sports and politics included, at the CRYPTO rate. That
+    fee lands in pnl_usd and in the daily/lifetime loss breakers.
+
+    Local `markets` row first (free, and the scanner keeps it fresh), Gamma
+    only on a miss, and the answer is cached per ticker either way."""
     if not ticker:
         return ""
     cached = _category_cache.get(ticker)
@@ -334,6 +450,18 @@ async def _market_category(ticker: str) -> str:
 async def _enter_copy(
     h: dict, cfg: dict, env: str, balance_usd: float, available_usd: Optional[float] = None
 ) -> Optional[dict]:
+    """Open one copy: a taker buy crossing to the current ask (cap-bounded).
+    Records a `bot_positions` row; the poll/reconcile loop then syncs the
+    fill, mark price, and eventual settlement just like any other position.
+    Always places a REAL order (the caller only runs when the wallet is
+    connected — there is no paper mode).
+
+    Serialised against the main / crypto15m / script engines by
+    `trader.order_gate`. Copy computes `available_usd` ONCE per tick (a
+    wallet-wide exposure + reserve snapshot), so the gate also re-reads that
+    headroom from the DB immediately before placing — without it, copy and
+    crypto ticking on their own tasks could both size against the same
+    headroom and both place."""
     async with trader.order_gate("copy"):
         return await _enter_copy_locked(h, cfg, env, balance_usd, available_usd)
 
@@ -401,6 +529,9 @@ async def _enter_copy_locked(
             ticker=ticker, side=side, action="buy",
             count=contracts, price_cents=limit_cents, client_order_id=coid,
         )
+    except polymarket_api.OrderStatusUnknownError as e:
+        logger.warning(f"[copy] enter {ticker}: {e}")
+        resp = e.response
     except Exception as e:
         row.update({"status": "error", "error": str(e)[:200]})
         with db.get_db() as conn:
@@ -430,6 +561,12 @@ async def _enter_copy_locked(
 
 
 async def _book_gone_copy(pos: dict) -> Optional[dict]:
+    """Book a copy whose shares the wallet NO LONGER HOLDS (our exit already
+    filled, or it was closed on Polymarket) as CLOSED — with real proceeds/P&L
+    from the wallet's /activity. Returns the closed row, or None when there's no
+    SELL/REDEEM evidence yet (left for the reconcile/external-exit sweep; we still
+    place NO order). This is what ENDS the 'not enough balance: balance 0' retry
+    loop where the engine kept trying to sell a position it no longer held."""
     pid = pos["id"]
     cost = float(pos.get("cost_usd") or 0.0)
     try:
@@ -442,12 +579,12 @@ async def _book_gone_copy(pos: dict) -> Optional[dict]:
         return None
     prior_proceeds = float(pos.get("settlement_usd") or 0.0)
     prior_pnl = float(pos.get("pnl_usd") or 0.0)
-    remaining_proceeds = max(0.0, round(float(info["proceeds"]) - prior_proceeds, 4))
+    sell_gross = float(info.get("sell_gross") or 0.0)
+    prior_fee = (float(info.get("sell_fee") or 0.0) * min(1.0, prior_proceeds / sell_gross)
+                 if sell_gross > 0 else 0.0)
+    remaining_proceeds = max(0.0, round(float(info["proceeds"]) + prior_fee - prior_proceeds, 4))
     total_proceeds = round(prior_proceeds + remaining_proceeds, 4)
-    held = int(pos.get("filled_contracts") or 0)
     fee = trader._position_fee_usd(pos)
-    if held > 0 and remaining_proceeds > 0 and trader._exit_was_sell(info):
-        fee += trader._sell_fee_usd(pos, held, remaining_proceeds / held * 100.0)
     pnl = round(prior_pnl + (remaining_proceeds - cost - fee), 4)
     with db.get_db() as conn:
         db.update_bot_position(
@@ -469,6 +606,16 @@ async def _book_gone_copy(pos: dict) -> Optional[dict]:
 async def _exit_copy(pos: dict, cfg: dict, held_qty: dict, holdings_ok: bool,
                      sell_qty: Optional[int] = None,
                      reason: str = "followed wallets exited") -> Optional[dict]:
+    """Close (or REDUCE) one copy. Full exit when every followed wallet left
+    the market; `sell_qty` sells only that slice when they materially reduced
+    (mirroring their scale-out) and keeps the rest open. Crosses DOWN to the
+    current bid with a FAK (fill-and-kill) sell so it NEVER rests on the book —
+    a resting GTC exit was what locked the shares and made the next tick fail
+    with 'not enough balance (active orders)'. Always real — the caller only
+    runs when authed.
+
+    `held_qty`/`holdings_ok` are the live wallet holdings: if we no longer hold
+    the shares the position is booked closed instead of re-selling nothing."""
     ticker, direction = pos["ticker"], pos["direction"]
     qty = int(pos.get("filled_contracts") or 0)
     cost = float(pos.get("cost_usd") or 0.0)
@@ -582,6 +729,34 @@ async def _entry_pass(
     cfg: dict, env: str, entry_map: dict, *,
     follows_ok: bool, anchor_qty_base: bool = True, source: str = "poll",
 ) -> list[dict]:
+    """THE copy-entry pipeline. One implementation, two callers:
+
+      * `run_tick` — the polled pass; `entry_map` is every followed wallet's
+        current Data-API holdings.
+      * `drain_pushed_entries` — the websocket pass; `entry_map` is holdings
+        SYNTHESISED from activity-tape trades that just executed.
+
+    Both run exactly the same gates in the same order: the account-wide daily
+    risk halt, copy's own daily realized-loss cap, the lifetime loss breaker,
+    balance, the shared cash-reserve / total-exposure caps, the wallet
+    mutual-exclusion lock, `copy_only_new_entries`, the per-market cooldown,
+    the open-copy / other-engine dedupe, `copy_allow_reentries`, and the entry
+    band + sizing + exchange minimum inside `_enter_copy`. Nothing can enter by
+    the push route that the poll route would have refused — that is the whole
+    contract of building entries from the socket.
+
+    `follows_ok` gates the baseline PRUNE: only a COMPLETE holdings read may
+    conclude a wallet no longer holds something, and a pushed map is by
+    definition a fragment.
+
+    `anchor_qty_base` writes the "their size when we copied" anchor. The pushed
+    path deliberately leaves it UNSET: a trade frame carries its own size, not
+    the wallet's total, so anchoring to the trade size would make the very next
+    poll read the difference (their pre-existing shares) as a fresh scale-in and
+    buy again. Left absent, the next poll takes the `base is None` branch below
+    — record their real total, do not retro-buy — which is exactly the
+    reconcile we want.
+    """
     changed: list[dict] = []
     now = time.time()
     global _last_halt_log_t
@@ -698,8 +873,12 @@ async def _entry_pass(
 
 
 async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
+    """One copy-trading cycle. Returns the rows that changed (opened/closed)
+    so the caller can emit position events. No-op when disabled, no wallets, or
+    the wallet isn't connected (there is no paper mode — copies are real)."""
     _remember_push_ctx(cfg, authed)
-    if not cfg.get("copy_enabled") or not (cfg.get("copy_wallets") or []):
+    from config import engine_on
+    if not engine_on(cfg, "copy_enabled") or not (cfg.get("copy_wallets") or []):
         return []
     if not authed:
         return []
@@ -800,8 +979,13 @@ _OWN_ADDR_TTL = 60.0
 
 
 def _remember_push_ctx(cfg: dict, authed: bool) -> None:
+    """Snapshot what the sync socket callback needs from cfg.
+
+    Called once per LOOP PASS (drain_pushed_entries runs unconditionally), not
+    once per copy tick, so it stays allocation-cheap: `_own_addresses` reads the
+    wallet sidecar off disk, which is fine per tick and wasteful per second."""
     try:
-        on = (bool(cfg.get("copy_enabled")) and bool(authed)
+        on = (__import__("config").engine_on(cfg, "copy_enabled") and bool(authed)
               and bool(cfg.get("copy_activity_ws", True)))
         global _own_addr_cache
         if time.time() - _own_addr_cache[0] > _OWN_ADDR_TTL:
@@ -811,13 +995,19 @@ def _remember_push_ctx(cfg: dict, authed: bool) -> None:
         _push_ctx["wallets"] = {
             str(w).strip().lower() for w in (cfg.get("copy_wallets") or [])
             if isinstance(w, str) and str(w).strip()
-        } - own
+        } - own - set(_wallet_too_large)
         _push_ctx["min_usd"] = float(cfg.get("copy_min_trade_usd") or 0.0)
     except Exception:
         _push_ctx["on"] = False
 
 
 def _trade_id(t: dict, wallet: str, ticker: str, idx: int) -> str:
+    """Stable identity for a pushed trade. The tape's transactionHash is one
+    per transaction and a transaction can settle several outcomes, so the
+    outcome index is part of the key; without a hash we fall back to the
+    (wallet, market, outcome, size, price, timestamp) tuple, which the same
+    print always reproduces and a genuinely separate fill practically never
+    collides with."""
     tx = str(t.get("transactionHash") or t.get("hash") or "").strip()
     if tx:
         return f"{tx}|{idx}"
@@ -826,6 +1016,20 @@ def _trade_id(t: dict, wallet: str, ticker: str, idx: int) -> str:
 
 
 def on_activity_trade(trade: dict) -> None:
+    """Ingest ONE trade frame from the activity websocket. Sync, cheap and
+    silent — it runs on the socket's read loop, so it validates, filters,
+    dedupes and enqueues, and does no I/O and never raises.
+
+    Accepts either the hit shape `activity_ws.drain_hits()` produces or a raw
+    tape payload (`proxyWallet`/`side`/…), so it doesn't care which side of
+    that module it is wired to.
+
+    Everything below is a REJECTION, not a decision: only a BUY, by a wallet
+    we actually follow, in a market we can identify, at a sane size and price,
+    that we have not already seen, is worth waking the entry pipeline for. The
+    pipeline itself (drain_pushed_entries -> _entry_pass) decides whether to
+    trade it, with the live config.
+    """
     try:
         if not _push_ctx.get("on") or not isinstance(trade, dict):
             return
@@ -883,11 +1087,25 @@ def on_activity_trade(trade: dict) -> None:
             cur["at"] = now
             if wallet not in cur["wallets"]:
                 cur["wallets"].append(wallet)
-    except Exception as e:
+    except Exception as e:   # pragma: no cover - defensive; the socket must live
         logger.debug(f"[copy] pushed trade ignored: {e}")
 
 
 async def drain_pushed_entries(cfg: dict, *, authed: bool = True) -> int:
+    """Run the entries queued by `on_activity_trade` through the normal copy
+    entry pipeline. Returns how many positions it opened.
+
+    Call it each tick BEFORE the Data-API read: that is the entire latency win
+    (the tape has the trade ~1s after it executes; /positions needs several
+    seconds more). Everything it opens still goes through `_entry_pass`, so
+    every gate — daily/lifetime loss, exposure and reserve caps, concurrency,
+    the wallet lock, cooldowns, `copy_only_new_entries`, the entry band, sizing
+    and the exchange minimum — applies exactly as on the polled route, and the
+    open-copy/other-engine dedupe is the same (ticker, side) key, so a pushed
+    entry and the poll that later sees the same position cannot both open one.
+
+    Opened rows are handed to the next `run_tick` return value so the service
+    emits position events for them without extra wiring."""
     _remember_push_ctx(cfg, authed)
     if not _push_ctx.get("on") or not (cfg.get("copy_wallets") or []):
         _pushed.clear()
@@ -927,10 +1145,13 @@ async def drain_pushed_entries(cfg: dict, *, authed: bool = True) -> int:
 
 
 def pending_pushes() -> int:
+    """Queued pushed trades — for status/diagnostics only."""
     return len(_pushed)
 
 
 async def status(cfg: dict, *, authed: bool = False) -> dict:
+    """Snapshot for the Copy Trading page: per-wallet holding counts, our open
+    copies, today's copy P&L, and the enabled/connected flags."""
     env = trader.get_env()
     wallets = cfg.get("copy_wallets") or []
 
@@ -938,9 +1159,12 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
     for w in wallets:
         n, value = 0, 0.0
         wl = (w or "").strip().lower()
+        error = _too_large_message(wl)
         try:
             cached = _wallet_pos_cache.get(wl)
-            if cached and time.time() - cached[0] <= _WALLET_CACHE_UI_SEC:
+            if error:
+                positions = cached[1] if cached else []
+            elif cached and time.time() - cached[0] <= _WALLET_CACHE_UI_SEC:
                 positions = cached[1]
             else:
                 positions = await polymarket_api.get_positions(limit=500, user=w)
@@ -954,6 +1178,7 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
         wallet_info.append({
             "address": w, "short": _short_addr(w),
             "positions": n, "valueUsd": round(value, 2),
+            "error": error,
         })
 
     open_copies = _our_open_copies(env)
@@ -963,7 +1188,7 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
     return {
         "enabled": bool(cfg.get("copy_enabled")),
         "authed": bool(authed),
-        "trading": bool(cfg.get("copy_enabled")) and bool(authed),
+        "trading": __import__("config").engine_on(cfg, "copy_enabled") and bool(authed),
         "wallets": wallet_info,
         "openCopies": len(open_copies),
         "todayPnlUsd": round(today_pnl, 2),

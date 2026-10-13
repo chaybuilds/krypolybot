@@ -1,8 +1,18 @@
+"""Polymarket Perps market maker: signing, formatting, planning, the board's
+reward model, the breakers, and one engine tick end to end against a fake
+exchange.
+
+The signing vectors were produced by the official SDK's own path
+(`polymarket-client` 0.12: real msgpack + keccak) — the app hand-rolls the
+msgpack subset, so these pin it byte-for-byte. A drift here means every order
+the engine sends is rejected as "invalid signature".
+"""
 from __future__ import annotations
 
 import asyncio
 import time
 
+import httpx
 import pytest
 
 import config
@@ -10,6 +20,7 @@ import db
 import perps_api as pa
 import perps_board as pb
 import perps_maker as pm
+import perps_ws
 
 
 def _run(coro):
@@ -74,6 +85,7 @@ def test_body_op_matches_sdk_keyed_form():
         "type": "updateLeverage", "args": {"cross": False, "iid": 6, "lev": 5}}
 
 
+
 def test_price_rounds_away_from_the_market_at_five_sig_figs():
     assert pa.fmt_price(86354.7, 1, side="buy") == "86354"
     assert pa.fmt_price(86354.2, 1, side="sell") == "86355"
@@ -132,6 +144,41 @@ def test_inventory_cap_pauses_the_adding_side_and_skews_toward_unloading():
     assert center < 86400
 
 
+@pytest.mark.parametrize("sign", [1, -1])
+def test_inventory_cap_counts_the_whole_ladder_and_shrinks_the_last_quote(sign):
+    mid = 86390.5
+    qs, _ = pm.plan_quotes(best_bid=86000, best_ask=86800, mid=mid, position_qty=sign * 250 / mid,
+                           inst=BTC, p={**P, "levels": 3})
+    adding = [q for q in qs if q.buy == (sign > 0)]
+    assert len(adding) == 1 and adding[0].trimmed
+    assert 40 < float(adding[0].qty) * mid <= 50
+    unloading = [q for q in qs if q.buy != (sign > 0)]
+    assert len(unloading) == 3 and not any(q.trimmed for q in unloading)
+    qs, note = pm.plan_quotes(best_bid=86000, best_ask=86800, mid=mid,
+                              position_qty=sign * 295 / mid, inst=BTC, p={**P, "levels": 3})
+    assert [q for q in qs if q.buy == (sign > 0)] == []
+    assert ("bids paused" if sign > 0 else "asks paused") in note
+
+
+def test_orders_that_may_have_filled_unseen_count_against_the_cap():
+    mid = 86390.5
+    qs, note = pm.plan_quotes(best_bid=86000, best_ask=86800, mid=mid, position_qty=150 / mid,
+                              inst=BTC, p=P, unseen_buy_qty=100 / mid)
+    bid = next(q for q in qs if q.buy)
+    assert bid.trimmed and float(bid.qty) * mid <= 50
+    qs, note = pm.plan_quotes(best_bid=86000, best_ask=86800, mid=mid, position_qty=0,
+                              inst=BTC, p=P, unseen_sell_qty=300 / mid)
+    assert [q.buy for q in qs] == [True] and "asks paused" in note
+
+
+def test_a_resting_order_bigger_than_a_trimmed_quote_is_replaced():
+    live = [{"order_id": 1, "buy": True, "price": "100", "resting_quantity": "1.4"}]
+    trimmed = pm.Quote(True, "100", "1", 100.0, 0, trimmed=True)
+    assert pm.diff_orders(live, [trimmed], requote_bps=2.0) == ([1], [trimmed])
+    full = pm.Quote(True, "100", "1", 100.0, 0)
+    assert pm.diff_orders(live, [full], requote_bps=2.0) == ([], [])
+
+
 def test_quote_below_min_notional_is_withheld():
     qs, note = pm.plan_quotes(best_bid=86390, best_ask=86391, mid=86390.5,
                               position_qty=0, inst=BTC, p={**P, "size_usd": 5.0})
@@ -177,6 +224,7 @@ def test_coids_are_ours_and_well_formed():
     assert pm.is_ours({"client_order_id": c})
     assert not pm.is_ours({"client_order_id": "7f9e4a2b6c8d0e1f1234567890abcdef"})
     assert not pm.is_ours({})
+
 
 
 def test_own_score_is_capped_per_tier_but_competition_is_not():
@@ -253,6 +301,7 @@ def test_board_build_and_pick_modes(monkeypatch):
     pb.reset_cache()
 
 
+
 def test_config_clamps_perps_knobs():
     c = config.merge_with_defaults({
         "perpsSelectMode": "yolo", "perpsSizeUsd": 1, "perpsLevels": 9,
@@ -269,6 +318,7 @@ def test_config_clamps_perps_knobs():
     assert c["perps_categories"] == ["equity"]
     assert c["perps_poll_sec"] == 1
     assert c["perps_enabled"] is False
+
 
 
 @pytest.fixture
@@ -314,16 +364,36 @@ def test_breakers_daily_loss_and_volume_target(perps_db):
 
 
 class FakeExchange:
+    """Just enough of perps_api for the engine, stubbed at its HTTP boundary.
 
-    def __init__(self, monkeypatch, *, open_orders=None, position=0.0):
+    It keeps the exchange's own list of resting orders, so a test can compare
+    it with what the engine believes rests, and it can be told to fail: a
+    whole request (`cancel_error`, `create_error`, `auto_error`,
+    `read_error`), single cancels (`cancel_codes`, oid -> rejection code), or
+    a create that lands but whose response is lost (`create_lands`)."""
+
+    def __init__(self, monkeypatch, *, open_orders=None, position=0.0,
+                 expires_in_ms=10**9):
         self.created: list[list] = []
         self.cancelled: list[int] = []
         self.autocancel: list[int] = []
         self.leverage: list[tuple] = []
-        self._orders = open_orders or []
+        self.calls: list[str] = []
+        self.create_proxies: list[str] = []
+        self.linked: list[str] = []
+        self._orders = [dict(o) for o in (open_orders or [])]
         self._position = position
-        creds = {"proxy": "0x" + "22" * 20, "privateKey": "0x" + "33" * 32,
-                 "secret": "s", "expiresAt": int(time.time() * 1000) + 10**9}
+        self._next_oid = 1000
+        self.cancel_error = None
+        self.cancel_codes: dict[int, str] = {}
+        self.create_error = None
+        self.create_lands = False
+        self.auto_error = None
+        self.read_error = None
+        self.link_error = None
+        self.load = 0
+        self.creds = {"proxy": "0x" + "22" * 20, "privateKey": "0x" + "33" * 32,
+                      "secret": "s", "expiresAt": int(time.time() * 1000) + expires_in_ms}
         inst = [{"instrument_id": 6, "symbol": "BTC-USD", "category": "crypto",
                  "close_only": False, "max_leverage": 20, "min_notional": "10",
                  "price_decimals": 1, "quantity_decimals": 5}]
@@ -349,7 +419,9 @@ class FakeExchange:
             return {"positions": pos, "margin": {"total_account_value": "1000"}}
 
         async def _open_orders(c, iid=None):
-            return list(self._orders)
+            if self.read_error:
+                raise self.read_error
+            return [dict(o) for o in self._orders]
 
         async def _fills(c, start, end=None, max_pages=20):
             return []
@@ -361,30 +433,75 @@ class FakeExchange:
             return []
 
         async def _create(c, rows):
+            self.calls.append("create")
             self.created.extend(rows)
-            return [{"status": "ok", "oid": i} for i, _ in enumerate(rows)]
+            self.create_proxies.append(c["proxy"])
+            if self.create_error and not self.create_lands:
+                raise self.create_error
+            acks = []
+            for r in rows:
+                oid = self._next_oid
+                self._next_oid += 1
+                self._orders.append({"order_id": oid, "instrument_id": r[0], "buy": r[1],
+                                     "price": r[2], "resting_quantity": r[3],
+                                     "quantity": r[3], "client_order_id": r[7]})
+                acks.append({"status": "ok", "oid": oid})
+            if self.create_error:
+                raise self.create_error
+            return acks
 
         async def _cancel(c, ids):
+            self.calls.append("cancel")
+            if self.cancel_error:
+                raise self.cancel_error
             self.cancelled.extend(ids)
-            return [{"status": "ok", "oid": i} for i in ids]
+            out = []
+            for i in ids:
+                code = self.cancel_codes.get(i)
+                if code:
+                    out.append({"status": "err", "error": code, "oid": i})
+                    if code in ("order_not_found", "order_already_terminal"):
+                        self._orders = [o for o in self._orders if o["order_id"] != i]
+                else:
+                    self._orders = [o for o in self._orders if o["order_id"] != i]
+                    out.append({"status": "ok", "oid": i})
+            return out
 
         async def _auto(c, at):
+            self.calls.append("auto")
+            if self.auto_error and at:
+                raise self.auto_error
             self.autocancel.append(at)
 
         async def _lev(c, iid, lev, cross):
             self.leverage.append((iid, lev, cross))
+
+        async def _link(label="krypt-polybot"):
+            self.linked.append(self.creds["proxy"])
+            if self.link_error:
+                raise self.link_error
+            self.creds = {"proxy": "0x" + "55" * 20, "privateKey": "0x" + "66" * 32,
+                          "secret": "s2", "expiresAt": int(time.time() * 1000) + pa.PROXY_TTL_MS}
+            return {"linked": True}
 
         for name, fn in (("instruments", _instruments), ("tickers", _tickers),
                          ("book", _book), ("klines", _klines), ("portfolio", _portfolio),
                          ("open_orders", _open_orders), ("fills", _fills), ("stats", _empty),
                          ("rewards", _rewards), ("create_orders", _create),
                          ("cancel_orders", _cancel), ("auto_cancel", _auto),
-                         ("update_leverage", _lev)):
+                         ("update_leverage", _lev), ("link_account", _link)):
             monkeypatch.setattr(pa, name, fn)
-        monkeypatch.setattr(pa, "creds", lambda: creds)
+        monkeypatch.setattr(pa, "recent_requests", lambda window=1.0: self.load, raising=False)
+        monkeypatch.setattr(pa, "creds", lambda: self.creds)
         monkeypatch.setattr(pa, "creds_status", lambda: {
-            "linked": True, "expired": False, "expiresAt": creds["expiresAt"],
-            "proxy": creds["proxy"], "owner": "0x" + "44" * 20, "walletPresent": True})
+            "linked": True, "expired": False, "expiresAt": self.creds["expiresAt"],
+            "proxy": self.creds["proxy"], "owner": "0x" + "44" * 20, "walletPresent": True})
+
+    def resting(self) -> list[dict]:
+        return list(self._orders)
+
+    def resting_ids(self) -> list[int]:
+        return sorted(int(o["order_id"]) for o in self._orders)
 
 
 def _enabled_cfg(**kw):
@@ -449,6 +566,28 @@ def test_inventory_cap_only_quotes_the_unloading_side(perps_db, monkeypatch):
     assert [r[1] for r in ex.created] == [False]
 
 
+def test_a_fast_requote_counts_a_vanished_bid_as_filled(perps_db, monkeypatch):
+    mid = 86390.5
+    ex = FakeExchange(monkeypatch, position=150 / mid)
+    feed = _live_feed(monkeypatch, mid)
+    cfg = _enabled_cfg()
+    _run(pm.run_tick(cfg))
+    bid = next(o for o in ex.resting() if o["buy"])
+    ex._orders.remove(bid)
+    ex._position += float(bid["resting_quantity"])
+    ex.cancel_codes = {int(bid["order_id"]): "order_already_terminal"}
+
+    def long_usd():
+        rest = sum(float(o["resting_quantity"]) for o in ex.resting() if o["buy"])
+        return (ex._position + rest) * feed["mid"]
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert ex.calls[-1] == "create" and long_usd() <= 300
+    feed["mid"] -= 26
+    _run(pm.run_fast(cfg, {6}))
+    assert any(o["buy"] for o in ex.resting()) and long_usd() <= 300
+
+
 def test_no_credentials_is_a_noop(perps_db, monkeypatch):
     monkeypatch.setattr(pa, "creds", lambda: None)
     called = []
@@ -462,6 +601,8 @@ def test_no_credentials_is_a_noop(perps_db, monkeypatch):
 
 
 def test_preview_without_an_account_plans_around_the_fresh_mid(perps_db, monkeypatch):
+    """Unlinked, the tab still shows what would be quoted — named by symbol,
+    centred on the ticker mid even when the sampled book has gone stale."""
     FakeExchange(monkeypatch)
     monkeypatch.setattr(pa, "creds", lambda: None)
     cfg = config.merge_with_defaults({"perpsSelectMode": "manual", "perpsMarkets": ["BTC-USD"]})
@@ -474,3 +615,340 @@ def test_preview_without_an_account_plans_around_the_fresh_mid(perps_db, monkeyp
     ask = next(q["price"] for q in m["desired"] if not q["buy"])
     assert bid < 86390.5 < ask
     assert abs((ask - 86390.5) - (86390.5 - bid)) <= 1.0
+
+
+_RATE_LIMITED = pa.PerpsAPIError("ip_rate_limited", status=429, error="ip_rate_limited",
+                                 retry_after=1.0)
+_NETWORK = pa.PerpsAPIError("Perps API unreachable: ReadTimeout", error="network")
+
+
+def _live_feed(monkeypatch, mid=86390.5):
+    """The live feed's touch, under the test's control (`state["mid"]`)."""
+    state = {"mid": mid}
+
+    def _bbo(iid, max_age=5.0):
+        m = state["mid"]
+        return {"iid": int(iid), "bid": m - 0.5, "ask": m + 0.5, "mid": m,
+                "ts": 0, "at": time.monotonic()}
+    monkeypatch.setattr(perps_ws.feed, "bbo", _bbo)
+    return state
+
+
+def _shift_clock(monkeypatch, sec):
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + sec)
+
+
+def _tracked() -> list[int]:
+    return sorted(int(o["order_id"]) for os_ in pm._our_orders.values() for o in os_)
+
+
+def _quoting(monkeypatch, **kw):
+    """A fake exchange with the engine's two quotes resting after one tick."""
+    ex = FakeExchange(monkeypatch)
+    feed = _live_feed(monkeypatch)
+    cfg = _enabled_cfg(**kw)
+    assert _run(pm.run_tick(cfg)) is True
+    assert len(ex.resting()) == 2 and _tracked() == ex.resting_ids()
+    return ex, feed, cfg
+
+
+def test_a_failed_cancel_never_stacks_replacement_quotes(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    before = ex.resting_ids()
+    ex.cancel_error = _RATE_LIMITED
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert ex.calls[-1] == "cancel"
+    assert ex.resting_ids() == before
+    assert _tracked() == before
+    sent = len(ex.calls)
+    _run(pm.run_fast(cfg, {6}))
+    assert len(ex.calls) == sent
+    ex.cancel_error = None
+    _shift_clock(monkeypatch, 1.5)
+    _run(pm.run_fast(cfg, {6}))
+    assert ex.calls[-2:] == ["cancel", "create"]
+    assert len(ex.resting()) == 2 and _tracked() == ex.resting_ids()
+
+
+@pytest.mark.parametrize("code,held", [
+    ("order_in_flight", True),
+    ("order_not_pending_engine", True),
+    ("order_not_found", False),
+    ("order_already_terminal", False),
+])
+def test_only_a_confirmed_cancel_releases_the_replacement(perps_db, monkeypatch, code, held):
+    ex, feed, cfg = _quoting(monkeypatch)
+    bid = next(int(o["order_id"]) for o in ex.resting() if o["buy"])
+    ex.cancel_codes = {bid: code}
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert len([o for o in ex.resting() if o["buy"]]) <= 1
+    if held:
+        assert ex.calls[-1] == "cancel"
+        assert _tracked() == [bid] == ex.resting_ids()
+        ex.cancel_codes = {}
+        _run(pm.run_fast(cfg, {6}))
+        assert ex.calls[-2:] == ["cancel", "create"]
+    else:
+        assert [o["buy"] for o in ex.resting()] == [False]
+        _run(pm.run_fast(cfg, {6}))
+    assert len(ex.resting()) == 2 and _tracked() == ex.resting_ids()
+
+
+def test_cancel_results_without_ids_are_matched_by_position(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ask = next(int(o["order_id"]) for o in ex.resting() if not o["buy"])
+    real = pa.cancel_orders
+
+    async def _no_ids(c, ids):
+        res = await real(c, ids)
+        return [{k: v for k, v in r.items() if k != "oid"} for r in res]
+    monkeypatch.setattr(pa, "cancel_orders", _no_ids)
+    ex.cancel_codes = {ask: "order_in_flight"}
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert _tracked() == [ask] == ex.resting_ids()
+
+
+def test_autocancel_is_armed_before_the_first_quote(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch)
+    _run(pm.run_tick(_enabled_cfg()))
+    assert "create" in ex.calls
+    assert ex.calls.index("auto") < ex.calls.index("create")
+
+
+def test_no_quotes_go_out_when_the_autocancel_cannot_be_armed(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch)
+    ex.auto_error = pa.PerpsAPIError("auto_cancel_daily_limit_reached", status=400,
+                                     error="auto_cancel_daily_limit_reached")
+    _run(pm.run_tick(_enabled_cfg()))
+    assert ex.created == [] and ex.resting() == []
+    assert "auto-cancel" in pm.status(_enabled_cfg())["lastError"]
+
+
+def test_a_fast_requote_refreshes_a_lapsing_autocancel_first(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch, perpsPollSec=30)
+    _shift_clock(monkeypatch, pm._AUTOCANCEL_EVERY_SEC + 1)
+    n = len(ex.calls)
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    new = ex.calls[n:]
+    assert "create" in new
+    assert "auto" in new and new.index("auto") < new.index("create")
+
+
+def test_switching_off_keeps_the_autocancel_until_our_quotes_are_gone(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    off = _enabled_cfg(perpsEnabled=False)
+    ex.cancel_error = _NETWORK
+    _run(pm.run_tick(off))
+    assert 0 not in ex.autocancel
+    assert len(ex.resting()) == 2
+    ex.cancel_error = None
+    _shift_clock(monkeypatch, 5)
+    _run(pm.run_tick(off))
+    assert ex.resting() == [] and ex.autocancel[-1] == 0
+
+
+def test_shutdown_leaves_the_autocancel_armed_if_a_cancel_failed(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex.cancel_error = _NETWORK
+    _run(pm.shutdown())
+    assert 0 not in ex.autocancel and len(ex.resting()) == 2
+    ex.cancel_error = None
+    _run(pm.shutdown())
+    assert ex.resting() == [] and ex.autocancel[-1] == 0
+
+
+def test_a_create_with_an_unknown_outcome_is_not_repeated_blind(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex.create_error, ex.create_lands = _NETWORK, True
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert len(ex.resting()) == 2
+    ex.create_error = None
+    monkeypatch.setattr(pm, "_backoff_until", 0.0, raising=False)
+    feed["mid"] -= 26
+    _run(pm.run_fast(cfg, {6}))
+    assert len(ex.resting()) == 2
+    _run(pm.run_tick(cfg))
+    assert len(ex.resting()) == 2 and _tracked() == ex.resting_ids()
+
+
+def test_a_tick_cancelled_mid_create_does_not_requote_blind(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex.create_error, ex.create_lands = asyncio.CancelledError(), True
+    feed["mid"] += 26
+    with pytest.raises(asyncio.CancelledError):
+        _run(pm.run_fast(cfg, {6}))
+    assert len(ex.resting()) == 2
+    ex.create_error = None
+    feed["mid"] -= 26
+    _run(pm.run_fast(cfg, {6}))
+    assert len(ex.resting()) == 2
+    _run(pm.run_tick(cfg))
+    assert len(ex.resting()) == 2 and _tracked() == ex.resting_ids()
+
+
+def test_fast_requotes_stop_while_full_ticks_are_not_syncing(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    _shift_clock(monkeypatch, 6)
+    n = len(ex.calls)
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert ex.calls[n:] == []
+
+
+def test_fast_requotes_yield_when_the_request_budget_is_spent(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex.load = 7
+    n = len(ex.calls)
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    assert ex.calls[n:] == []
+
+
+def test_the_trading_key_is_renewed_before_it_lapses(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch, expires_in_ms=3_600_000)
+    old = ex.creds["proxy"]
+    _run(pm.run_tick(_enabled_cfg()))
+    assert ex.linked == [old]
+    assert ex.creds["expiresAt"] > time.time() * 1000 + 6 * 86_400_000
+    assert ex.create_proxies == [ex.creds["proxy"]]
+    _run(pm.run_tick(_enabled_cfg()))
+    assert len(ex.linked) == 1
+
+
+def test_the_key_is_not_renewed_while_the_engine_is_off(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch, expires_in_ms=3_600_000)
+    _run(pm.run_tick(_enabled_cfg(perpsEnabled=False)))
+    assert ex.linked == []
+
+
+def test_an_unrenewable_key_pulls_the_quotes_before_it_expires(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex.creds["expiresAt"] = int(time.time() * 1000) + 5 * 60_000
+    ex.link_error = pa.PerpsAPIError("Perps request refused (HTTP 403)", status=403)
+    _run(pm.run_tick(cfg))
+    assert len(ex.linked) == 1
+    assert ex.resting() == []
+    st = pm.status(cfg)
+    assert "key" in st["haltReason"] and st["trading"] is False
+    assert "403" in st["link"]["renewError"]
+    _run(pm.run_tick(cfg))
+    assert len(ex.linked) == 1
+
+
+
+def test_a_markout_kill_cancels_the_market_and_stops_quoting(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    pm._markets[6].markouts.extend([-20.0] * 20)
+    _run(pm.run_tick(cfg))
+    assert ex.resting() == [] and _tracked() == []
+    m = pm.status(cfg)["markets"][0]
+    assert m["state"] == "killed" and "rest of the UTC day" in m["note"]
+    n = len(ex.created)
+    feed["mid"] += 26
+    _run(pm.run_fast(cfg, {6}))
+    _run(pm.run_tick(cfg))
+    assert len(ex.created) == n and ex.resting() == []
+
+
+def test_a_markout_kill_keeps_retrying_a_cancel_that_failed(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    pm._markets[6].markouts.extend([-20.0] * 20)
+    ex.cancel_error = _NETWORK
+    _run(pm.run_tick(cfg))
+    assert len(ex.resting()) == 2 and ex.calls[-1] == "cancel"
+    ex.cancel_error = None
+    _shift_clock(monkeypatch, 5)
+    _run(pm.run_tick(cfg))
+    assert ex.resting() == [] and ex.calls[-1] == "cancel"
+
+
+def test_flatten_cancels_our_quotes_then_closes_reduce_only(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    quotes = ex.resting_ids()
+    ex._position = -0.002
+    n = len(ex.calls)
+    res = _run(pm.flatten_all())
+    assert res["ok"] is True and ex.calls[n:] == ["cancel", "create"]
+    assert not set(quotes) & set(ex.resting_ids())
+    close = ex.created[-1]
+    assert close[1] is True and close[4] == "ioc" and close[6] is True
+    assert float(close[3]) == pytest.approx(0.002)
+
+
+def test_flatten_refuses_when_the_account_cannot_be_read(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch, position=0.01)
+
+    async def _down(c):
+        raise _NETWORK
+    monkeypatch.setattr(pa, "portfolio", _down)
+    res = _run(pm.flatten_all())
+    assert res["ok"] is False and ex.created == []
+
+
+def test_an_unreadable_portfolio_is_not_a_flat_account(perps_db, monkeypatch):
+    real_portfolio = pa.portfolio
+    ex = FakeExchange(monkeypatch, position=0.01)
+    monkeypatch.setattr(pa, "portfolio", real_portfolio)
+
+    async def _get(path, params=None, *, creds=None):
+        return None
+    monkeypatch.setattr(pa, "_get", _get)
+    res = _run(pm.flatten_all())
+    assert res["ok"] is False and "no open positions" not in res["message"]
+    _live_feed(monkeypatch)
+    _run(pm.run_tick(_enabled_cfg()))
+    assert not [r for r in ex.created if r[1]]
+
+
+def test_an_unreadable_open_orders_list_is_an_error(monkeypatch):
+    async def _get(path, params=None, *, creds=None):
+        return None
+    monkeypatch.setattr(pa, "_get", _get)
+    with pytest.raises(pa.PerpsAPIError):
+        _run(pa.open_orders({}))
+
+
+def test_flatten_says_so_when_a_position_could_not_be_closed(perps_db, monkeypatch):
+    ex = FakeExchange(monkeypatch, position=0.01)
+
+    async def _no_book(iid, depth=100):
+        raise _NETWORK
+    monkeypatch.setattr(pa, "book", _no_book)
+    res = _run(pm.flatten_all())
+    assert res["ok"] is False and "no open positions" not in res["message"]
+    assert "BTC-USD" in res["message"]
+
+
+def test_flatten_says_so_when_our_quotes_could_not_be_cancelled(perps_db, monkeypatch):
+    ex, feed, cfg = _quoting(monkeypatch)
+    ex._position = 0.002
+    ex.cancel_error = _NETWORK
+    res = _run(pm.flatten_all())
+    assert res["ok"] is False and "quote" in res["message"]
+    assert [r for r in ex.created if r[6]]
+
+
+def test_autocancel_rejected_in_a_200_body_raises(monkeypatch):
+    async def _signed(method, path, op, creds):
+        return {"status": "err", "error": "auto_cancel_daily_limit_reached"}
+    monkeypatch.setattr(pa, "_signed", _signed)
+    with pytest.raises(pa.PerpsAPIError) as e:
+        _run(pa.auto_cancel({}, int(time.time() * 1000) + 60_000))
+    assert e.value.error == "auto_cancel_daily_limit_reached"
+
+
+def test_every_request_counts_toward_the_per_second_budget(monkeypatch):
+    def _handler(request):
+        return httpx.Response(200, json=[])
+    client = httpx.AsyncClient(base_url=pa.BASE_URL, transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(pa, "_get_client", lambda: client)
+    base = pa.recent_requests()
+    _run(pa.tickers())
+    _run(pa.tickers())
+    assert pa.recent_requests() == base + 2

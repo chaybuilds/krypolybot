@@ -1,3 +1,40 @@
+"""Live trading engine.
+
+Bug fixes vs the original `polymarket_trader/trader.py`:
+
+  1. **Resolution via direct API.** The old engine relied on the
+     scanner's market table to mark positions resolved. If a market
+     settled and aged out of the scanner's open-markets sync, the
+     position would sit in `filled` forever and (incorrectly) count
+     toward MAX_OPEN_POSITIONS. We now call
+     `polymarket_api.fetch_market(ticker)` for any unresolved position
+     whose tracker row is missing/stale, and additionally walk
+     `get_settled_positions()` once per resolution cycle as a backstop
+     for markets that rotated out before we noticed.
+
+  2. **Position reconcile on startup.** When the trader starts (or
+     restarts after a crash), `reconcile_positions_with_polymarket()`
+     pulls the current Polymarket position list and:
+       - marks any local "open" positions Polymarket doesn't acknowledge
+         as `gone` (settled/expired/canceled while we were down)
+       - imports any Polymarket positions we don't have a local row for
+         (rare — manual UI trades), so they don't break our exposure
+         math the next cycle.
+
+  3. **Daily P&L stop-loss / take-profit.** New gates that pause new
+     entries (without flatting) when today's realized P&L crosses a
+     threshold. Configurable via `stop_loss_on_day` and
+     `take_profit_on_day`.
+
+  4. **Per-env separation.** `bot_positions.network` is now part of
+     the dedup keys and counters, so flipping between demo and prod
+     doesn't cross-contaminate the "is this signal already traded?"
+     check.
+
+  5. **Convergence trade source.** A new `signal_source='convergence'`
+     pseudo-signal is emitted by the runner and routed through the
+     same execution path.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +45,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import backtest
 import clob_ws
@@ -16,7 +53,8 @@ import db
 import instance_lock
 import rules as rules_engine
 from polymarket_api import (
-    PolymarketAPIError, cancel_order, cancel_orders, fetch_market, fetch_markets_map,
+    OrderStatusUnknownError, PolymarketAPIError, cancel_order, cancel_orders,
+    fetch_market, fetch_markets_map,
     get_activity, get_balance,
     get_fills_for_order, get_market_meta, get_order, get_quote, get_positions,
     place_limit_order,
@@ -30,13 +68,35 @@ _balance_cache: dict[str, dict] = {}
 
 
 def last_balance_read_ok(env: str | None = None) -> bool:
+    """True when the most recent balance read for env actually SUCCEEDED.
+    Lets sizing distinguish a genuine $0 account (real zero — skip entries,
+    tell the user to deposit) from a failed read served from cache (unknown —
+    fall back to the pinned bankroll). Both look like cents==0 on a cold
+    start, which previously made real-zero accounts size against phantom
+    start_bankroll money: ~28 rejected 'not enough balance' orders/hour of
+    error spam until funds arrived."""
     cached = _balance_cache.get(env or get_env())
     return bool(cached and cached.get("ok"))
 _balance_fail_log_at: dict[str, float] = {}
 _BALANCE_FAIL_LOG_EVERY = 300.0
 
+_PORTFOLIO_STALE_SEC = 300.0
+
+
+def portfolio_stale(env: str | None = None) -> bool:
+    """True while /value keeps failing: the latest read of it failed and the
+    last good one is over _PORTFOLIO_STALE_SEC old, or there never was one.
+    False when nothing is known to be wrong (including before any read)."""
+    cached = _balance_cache.get(env or get_env())
+    if not cached or cached.get("port_last_ok", True):
+        return False
+    ok_at = cached.get("port_ok_at")
+    return ok_at is None or (time.monotonic() - ok_at) >= _PORTFOLIO_STALE_SEC
+
 
 async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
+    """Returns (cash_cents, portfolio_cents) for the ACTIVE env, reading
+    from a per-env cache where we can."""
     env = get_env()
     interval = float(cfg.get("balance_poll_interval", 60))
     loop = asyncio.get_event_loop()
@@ -44,6 +104,7 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
     cached = _balance_cache.get(env)
     if not force and cached and (now - cached["at"]) < interval:
         return cached["cents"], cached["portfolio_cents"]
+    port_ok_at = cached.get("port_ok_at") if cached else None
     try:
         data = await get_balance()
         cents = int(data.get("balance", 0))
@@ -52,12 +113,23 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
             port = cached["portfolio_cents"] if cached else 0
         else:
             port = int(port_raw)
-        _balance_cache[env] = {"cents": cents, "portfolio_cents": port, "at": now, "ok": True}
+            port_ok_at = time.monotonic()
+        _balance_cache[env] = {"cents": cents, "portfolio_cents": port, "at": now, "ok": True,
+                               "port_ok_at": port_ok_at, "port_last_ok": port_raw is not None}
+        if port_raw is None and portfolio_stale(env):
+            wt = time.time()
+            if wt - _balance_fail_log_at.get(env, 0.0) >= _BALANCE_FAIL_LOG_EVERY:
+                _balance_fail_log_at[env] = wt
+                logger.warning(
+                    "portfolio value (/value) unreadable for over "
+                    f"{_PORTFOLIO_STALE_SEC / 60:.0f} min: the balance total is "
+                    "not recorded and the daily stop won't flatten until it recovers")
         return cents, port
     except Exception as e:
         prev_cents = cached["cents"] if cached else 0
         prev_port = cached["portfolio_cents"] if cached else 0
-        _balance_cache[env] = {"cents": prev_cents, "portfolio_cents": prev_port, "at": now, "ok": False}
+        _balance_cache[env] = {"cents": prev_cents, "portfolio_cents": prev_port, "at": now, "ok": False,
+                               "port_ok_at": port_ok_at, "port_last_ok": False}
         wt = time.time()
         if wt - _balance_fail_log_at.get(env, 0.0) >= _BALANCE_FAIL_LOG_EVERY:
             _balance_fail_log_at[env] = wt
@@ -65,7 +137,11 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
         return prev_cents, prev_port
 
 
+
 def _edge_fraction(edge_pts: float, cfg: dict) -> float:
+    """0..1 size ramp: 0 at/under `sizing_base_edge`, 1 at/over `sizing_max_edge`,
+    linear between. Drives both % -of-balance and fixed-contract sizing — the bot
+    bets nearer Min on weak signals and nearer Max on high-conviction ones."""
     lo_e = float(cfg["sizing_base_edge"])
     hi_e = float(cfg["sizing_max_edge"])
     if edge_pts <= lo_e:
@@ -76,6 +152,8 @@ def _edge_fraction(edge_pts: float, cfg: dict) -> float:
 
 
 def _compute_position_usd(balance_usd: float, edge_pts: float, cfg: dict) -> float:
+    """% -of-balance ('percent' mode) sizing: a bankroll fraction ramped from
+    `min_size_fraction` to `max_size_fraction` by edge, capped by the $ hard cap."""
     lo_f = float(cfg["min_size_fraction"])
     hi_f = float(cfg["max_size_fraction"])
     frac = lo_f + _edge_fraction(edge_pts, cfg) * (hi_f - lo_f)
@@ -85,6 +163,10 @@ def _compute_position_usd(balance_usd: float, edge_pts: float, cfg: dict) -> flo
 def _compute_target_usd(
     balance_usd: float, edge_pts: float, limit_cents: int, cfg: dict
 ) -> float:
+    """Mode-aware target $ for a position. 'contracts' mode ramps a share count
+    from `min_contracts` to `max_contracts` by edge (priced at the order price);
+    'percent' mode uses the bankroll fraction. Both are capped by the $ hard cap
+    (the per-trade safety ceiling that applies regardless of mode)."""
     if (cfg.get("sizing_mode") or "percent").lower() == "contracts":
         min_c = max(1, int(cfg.get("min_contracts", 5) or 5))
         max_c = max(min_c, int(cfg.get("max_contracts", min_c) or min_c))
@@ -104,6 +186,9 @@ _WS_WARM_FETCH_MAX = 8
 
 
 def ws_quote_cents(ticker: str, direction: str) -> Optional[dict]:
+    """{'bid_cents','ask_cents'} from the live feed for a market we have
+    already warmed, or None. Sync and allocation-cheap — a caller replaces
+    `await get_quote(...)` with `ws_quote_cents(...) or await get_quote(...)`."""
     if _WS_QUOTES_OFF:
         return None
     try:
@@ -119,6 +204,13 @@ def ws_quote_cents(ticker: str, direction: str) -> Optional[dict]:
 
 
 async def warm_books(pairs, *, limit: int = 120) -> int:
+    """Subscribe the live feed to the outcome tokens of the (ticker, direction)
+    markets an engine is about to act on, so the book is already there when the
+    order path asks. Returns the number of tokens observed.
+
+    Bounded on both axes: at most `limit` markets per pass and
+    `_WS_WARM_FETCH_MAX` NEW meta fetches (already-resolved markets are free
+    dict hits). Never raises — warming is best-effort by construction."""
     if _WS_QUOTES_OFF:
         return 0
     tokens: list[str] = []
@@ -152,10 +244,21 @@ async def warm_books(pairs, *, limit: int = 120) -> int:
     return len(tokens)
 
 
+
 async def _compute_limit_price_cents(
     ticker: str, direction: str, signal_price_cents: int, cfg: dict,
     book: Optional[dict] = None,
 ) -> int:
+    """Pick a limit price (in cents = USDC×100) for the (yes/no) outcome
+    token. `limit_cross` crosses the spread at the token's best ask;
+    `limit_mid` rests at the bid/ask midpoint; `market` pays up to 99c.
+
+    Pass `book` to receive the quote this used ({'ask_cents', 'bid_cents'}).
+    The caller needs the best ASK to know whether the price it just chose
+    RESTS (maker, no fee under takerOnly fee-v2) or crosses — `limit_mid` is
+    a shipped order style whose orders always rest, and every one of them was
+    charged a taker fee because nothing outside this function saw the ask.
+    Left untouched when no quote was read (market style, or a failed fetch)."""
     direction = direction.lower()
     style = cfg.get("order_style", "limit_cross")
     if style == "market":
@@ -182,12 +285,17 @@ async def _compute_limit_price_cents(
 
 
 def _is_maker_limit(limit_cents: int, best_ask_cents) -> int:
+    """1 when a buy limit of `limit_cents` RESTS against a best ask of
+    `best_ask_cents` (maker → no fee under takerOnly fee-v2), else 0.
+    An unknown ask is treated as a cross: charge the fee rather than
+    flatter the ledger."""
     try:
         if best_ask_cents is None:
             return 0
         return 1 if int(limit_cents) < int(best_ask_cents) else 0
     except (TypeError, ValueError):
         return 0
+
 
 
 def _signal_cost_cents(signal: dict, source: str) -> tuple[str, int]:
@@ -233,6 +341,9 @@ def _signal_rule_values(signal: dict, source: str) -> dict:
 
 
 def _days_until_close(close_time: str) -> Optional[float]:
+    """Days from now until a market's close/resolution time (ISO8601). Returns None
+    when the time is missing or unparseable, which callers treat as 'unknown' and
+    do NOT gate on."""
     if not close_time:
         return None
     from datetime import datetime, timezone
@@ -248,6 +359,8 @@ def _days_until_close(close_time: str) -> Optional[float]:
 
 
 def _enrich_close_time(conn, sig: dict) -> None:
+    """Attach the market's close_time to a signal for the resolution-horizon gate.
+    Whale/momentum signal rows don't carry it; the markets table does."""
     if sig.get("close_time"):
         return
     m = db.get_market(conn, sig.get("ticker") or "")
@@ -324,7 +437,21 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
+
 def _today_pnl_balance_delta(env: str) -> float | None:
+    """Today's P&L = current total balance − total balance at the
+    first snapshot of today (UTC). This is the SAME number the
+    dashboard's "Today P&L" tile shows, so the daily stop-loss /
+    take-profit gates can never disagree with what the user sees.
+
+    Returns None if there's no baseline yet (very first tick of the
+    day) — caller should treat that as "unknown" and not gate.
+
+    The previous implementation summed `pnl_usd` from `bot_positions`,
+    which inherited any per-trade attribution bug and would falsely
+    trigger the stop-loss when old/imported rows had garbage P&L
+    (e.g. seeing −$4210 when actual session loss was −$5).
+    """
     with db.get_db() as conn:
         first_today = db.first_snapshot_of_today(conn, env)
         if not first_today:
@@ -369,6 +496,14 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
 
 
 def _lifetime_loss_tripped_main(cfg: dict, env: str) -> tuple[bool, str]:
+    """Durable cumulative realized-loss breaker for the MAIN (whale/momentum)
+    engine, mirroring crypto15m/copy. The daily stop re-arms every UTC
+    midnight, so a net-negative engine could bleed the daily cap forever
+    with no ceiling — this was the one engine without a lifetime stop. Uses
+    the wipe-surviving banked counter (db.lifetime_realized_pnl), scoped to
+    whale/momentum rows only (external/copy rows are other engines' P&L).
+    Trips at the absolute-$ override (if > 0) or the configured fraction of
+    the starting bankroll. Returns (tripped, human reason)."""
     limit_usd = float(cfg.get("lifetime_loss_limit_usd") or 0.0)
     try:
         limit_pct = max(0.0, min(1.0, float(cfg.get("lifetime_loss_limit_pct", 0.0) or 0.0)))
@@ -397,7 +532,16 @@ def _lifetime_loss_tripped_main(cfg: dict, env: str) -> tuple[bool, str]:
 
 
 async def _maybe_flatten_on_daily_stop(cfg: dict, env: str) -> None:
-    if not cfg.get("flatten_on_daily_stop") or not cfg.get("enable_trading"):
+    """When the daily STOP-LOSS (not the take-profit) has tripped and the user
+    turned on `flatten_on_daily_stop`, market-sell every open position once to
+    hard-cap the day's loss. Without this the daily stop only halts NEW entries
+    while open positions keep running, so realized loss can blow past the limit
+    the user set. No-op when: the toggle is off, trading is paused, it's a
+    take-profit halt, or nothing is open (so it can't re-flatten every tick)."""
+    from config import engine_on
+    if not cfg.get("flatten_on_daily_stop") or not engine_on(cfg, "enable_trading"):
+        return
+    if portfolio_stale(env):
         return
     pnl = _today_pnl_balance_delta(env)
     if pnl is None:
@@ -429,6 +573,8 @@ _DAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun":
 
 
 def _is_blocked_by_trading_hours(cfg: dict) -> tuple[bool, str]:
+    """If trading_hours_enabled is True, only allow trading inside the
+    configured weekly window. Outside it, scan_for_trades short-circuits."""
     if not cfg.get("trading_hours_enabled"):
         return False, ""
     from datetime import datetime, timedelta, timezone
@@ -459,9 +605,54 @@ def _is_blocked_by_trading_hours(cfg: dict) -> tuple[bool, str]:
     return False, ""
 
 
+
+def entry_cap_block(
+    cfg: dict, *,
+    open_count: Callable[[], int],
+    today_count: Callable[[], int],
+    event_count: Callable[[], int],
+    market_side_open: Callable[[], bool],
+) -> Optional[str]:
+    """The concurrency caps every main-engine entry must clear, in the order
+    the engine checks them: max open, daily new, per event, one per
+    market/side. Returns the skip reason, or None when the entry may go ahead.
+
+    The counts are passed as callables so the live path keeps its lazy DB
+    queries (the daily count is never read with "unlimited daily" on), and
+    the backtest replay (replay.replay_main) can pass counts from its own
+    simulated book. One gate for both, so the replay cannot trade what the
+    engine would refuse."""
+    n_open = open_count()
+    if n_open >= cfg["max_open_positions"]:
+        return f"MAX_OPEN_POSITIONS ({n_open}/{cfg['max_open_positions']} open)"
+    if not cfg.get("unlimited_daily_new_positions"):
+        n_today = today_count()
+        daily_cap = int(cfg["max_daily_new_positions"])
+        if n_today >= daily_cap:
+            return (
+                f"MAX_DAILY_NEW_POSITIONS ({n_today}/{daily_cap} today). "
+                f"Toggle 'Unlimited daily new positions' in Settings → "
+                f"Concurrency to disable this cap."
+            )
+    per_event_cap = int(cfg.get("max_positions_per_event", 1) or 1)
+    if event_count() >= per_event_cap:
+        return f"event already at its max ({per_event_cap}) position(s)"
+    if market_side_open():
+        return "market/side already open"
+    return None
+
+
 async def execute_signal(
     signal: dict, source: str, cfg: dict, balance_usd: float
 ) -> dict | None:
+    """Place an order for a single signal. Returns the inserted bot_positions
+    row dict on success (or dry-run), or None on skip/error.
+
+    Serialised against the copy / crypto15m / script engines by `order_gate`:
+    this whole function IS the check+place critical section — it reads the
+    open-count, daily, per-event and exposure caps from the DB at the top and
+    inserts the position row at the bottom, so another engine placing in
+    between is exactly the race the gate exists to stop."""
     async with order_gate("main"):
         return await _execute_signal_locked(signal, source, cfg, balance_usd)
 
@@ -474,35 +665,17 @@ async def _execute_signal_locked(
     env = get_env()
 
     with db.get_db() as conn:
-        open_count = db.count_open_bot_positions(conn, env)
-        if open_count >= cfg["max_open_positions"]:
-            logger.info(
-                f"[skip] {signal['ticker']}: MAX_OPEN_POSITIONS "
-                f"({open_count}/{cfg['max_open_positions']} open)"
-            )
-            return None
-        if not cfg.get("unlimited_daily_new_positions"):
-            today_count = db.count_new_positions_today(conn, env)
-            daily_cap = int(cfg["max_daily_new_positions"])
-            if today_count >= daily_cap:
-                logger.info(
-                    f"[skip] {signal['ticker']}: MAX_DAILY_NEW_POSITIONS "
-                    f"({today_count}/{daily_cap} today). "
-                    f"Toggle 'Unlimited daily new positions' in Settings → "
-                    f"Concurrency to disable this cap."
-                )
-                return None
-        per_event_cap = int(cfg.get("max_positions_per_event", 1) or 1)
-        if db.count_positions_in_event(
-            conn, signal.get("event_ticker") or "", env
-        ) >= per_event_cap:
-            logger.info(
-                f"[skip] {signal['ticker']}: event already at its "
-                f"max ({per_event_cap}) position(s)"
-            )
-            return None
-        if db.exists_position_in_market(conn, signal["ticker"], direction, env):
-            logger.info(f"[skip] {signal['ticker']}: market/side already open")
+        blocked = entry_cap_block(
+            cfg,
+            open_count=lambda: db.count_open_bot_positions(conn, env),
+            today_count=lambda: db.count_new_positions_today(conn, env),
+            event_count=lambda: db.count_positions_in_event(
+                conn, signal.get("event_ticker") or "", env),
+            market_side_open=lambda: db.exists_position_in_market(
+                conn, signal["ticker"], direction, env),
+        )
+        if blocked:
+            logger.info(f"[skip] {signal['ticker']}: {blocked}")
             return None
         exposure = db.current_total_exposure_usd(conn, env)
         filled_exposure = db.current_filled_exposure_usd(conn, env)
@@ -601,7 +774,8 @@ async def _execute_signal_locked(
         "entry_maker": _is_maker_limit(limit_cents, submit_book.get("ask_cents")),
     }
 
-    if not cfg.get("enable_trading"):
+    from config import engine_on
+    if not engine_on(cfg, "enable_trading"):
         return None
 
     try:
@@ -613,6 +787,9 @@ async def _execute_signal_locked(
             price_cents=limit_cents,
             client_order_id=client_order_id,
         )
+    except OrderStatusUnknownError as e:
+        logger.warning(f"[ORDER-UNKNOWN] {signal['ticker']}: {e}")
+        resp = e.response
     except PolymarketAPIError as e:
         row["status"] = "error"
         row["error"] = f"HTTP {e.status}: {str(e.body)[:200]}"
@@ -652,6 +829,14 @@ ORDER_LOCK_TIMEOUT_SEC = 30.0
 
 @contextlib.asynccontextmanager
 async def order_gate(engine: str = ""):
+    """Serialise one engine's cap-check + order placement against the others.
+
+    Yields True when it actually holds the lock, False when it gave up waiting.
+
+    Fail-OPEN: a timeout waiting for the lock logs and runs the body anyway.
+    Serialising entries is a safety improvement, not a precondition for
+    trading, and a lock that could block placement forever would be worse than
+    the race it fixes."""
     global ORDER_LOCK
     lock = ORDER_LOCK
     try:
@@ -673,11 +858,20 @@ async def order_gate(engine: str = ""):
     finally:
         try:
             lock.release()
-        except RuntimeError:
+        except RuntimeError:      # pragma: no cover - released twice
             pass
 
 
 def shared_headroom_usd(cfg: dict, env: str, balance_usd: float) -> float:
+    """Dollars this wallet may still commit under the caps EVERY engine shares
+    (`max_total_exposure_fraction` + `min_cash_reserve_fraction`), read fresh
+    from the DB.
+
+    Same arithmetic as `execute_signal` / `copy_trader._entry_pass` /
+    `crypto15m_trader.run_tick` compute for themselves — the point is that this
+    one reads exposure at the moment of placement (inside `order_gate`), so an
+    order another engine inserted a millisecond ago is already counted. Callers
+    that snapshot their budget once per tick use it as a final re-check."""
     with db.get_db() as conn:
         exposure = db.current_total_exposure_usd(conn, env)
         filled_exposure = db.current_filled_exposure_usd(conn, env)
@@ -695,11 +889,17 @@ def shared_headroom_usd(cfg: dict, env: str, balance_usd: float) -> float:
 
 
 def headroom_blocks(cfg: dict, env: str, balance_usd: float, cost_usd: float) -> str:
+    """"" if `cost_usd` still fits the wallet-wide caps, else the reason it
+    doesn't. Call it INSIDE `order_gate`, immediately before placing.
+
+    Skipped when `balance_usd <= 0`: every engine treats a zero/unknown balance
+    as "don't clamp" (a failed read must not look like an empty wallet), and
+    this guard must not be the one place that changes that."""
     if balance_usd <= 0 or cost_usd <= 0:
         return ""
     try:
         headroom = shared_headroom_usd(cfg, env, balance_usd)
-    except Exception as e:
+    except Exception as e:      # pragma: no cover - DB hiccup: fail open
         logger.debug(f"[order-gate] headroom re-check failed: {e}")
         return ""
     if cost_usd <= headroom + 1e-9:
@@ -710,7 +910,14 @@ def headroom_blocks(cfg: dict, env: str, balance_usd: float, cost_usd: float) ->
     )
 
 
+
 def can_open_new_entries(env: str) -> tuple[bool, str]:
+    """Wallet mutual exclusion shared by ALL real-money ENTRY paths (main scan,
+    crypto15m, copy). Claims the wallet by trading address; returns (False, reason)
+    when a live sibling instance holds it, so a second backend on the same key
+    backs off opening. Within one process all engines share instance_lock's holder
+    id, so they never self-contend. Fail-OPEN (True) on any error so a lock glitch
+    never blocks trading. Gate ENTRIES only — never the manage/exit paths."""
     try:
         addr = trading_address(env)
     except Exception:
@@ -727,6 +934,14 @@ def can_open_new_entries(env: str) -> tuple[bool, str]:
 
 
 async def scan_for_trades(cfg: dict) -> list[dict]:
+    """Single trading scan. Returns list of newly inserted/updated rows.
+
+    Every silent-skip path now emits an INFO log the first time per
+    minute it fires. Without this, the in-app log gives the user no
+    explanation why the bot is sitting idle even though new signals
+    are coming in — which was the bug behind "set max trades to 300
+    but bot still won't place a trade".
+    """
     global _last_scan_skip_log
     now_ts = time.time()
 
@@ -742,6 +957,10 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
 
     if not cfg.get("enable_trading"):
         _skip_log("enable_trading=false (main-bot trading off in Settings)")
+        return []
+    from config import account_live
+    if not account_live(cfg):
+        _skip_log("account is in Paper (engines send nothing until it is Live)")
         return []
 
     env = get_env()
@@ -877,6 +1096,12 @@ _last_scan_skip_log: dict[str, float] = {}
 
 
 def cap_dict_size(d: dict, cap: int = 2000) -> None:
+    """FIFO-evict the oldest entries once `d` outgrows `cap` (dicts are
+    insertion-ordered). A 24/7
+    process must not let these module-level throttle/dedupe maps grow
+    unbounded. Worst case an evicted key re-logs or re-retries once —
+    harmless next to unbounded growth. Shared by the copy and crypto15m
+    engines for their own throttle maps."""
     if len(d) > cap:
         for _k in list(d.keys())[: len(d) - cap]:
             d.pop(_k, None)
@@ -888,6 +1113,7 @@ _last_filter_log: dict[tuple[int, str], float] = {}
 _last_skip_import_log: dict[tuple[str, str], float] = {}
 
 
+
 def _f(v) -> float:
     try:
         return float(v)
@@ -896,16 +1122,27 @@ def _f(v) -> float:
 
 
 def _parse_polymarket_order(order: dict) -> dict:
+    """Parse a CLOB OpenOrder (`GET /data/order/{id}`) into the bot's common
+    fill shape. Polymarket order fields: `original_size`, `size_matched`,
+    `price` (0..1), `status` (ORDER_STATUS_LIVE|MATCHED|CANCELED|…).
+
+    A fully-matched order usually drops off the open-order endpoint (404),
+    in which case the caller falls back to the position-aggregate rescue —
+    same two-tier strategy the engine has always used.
+    """
     filled = int(round(_f(order.get("size_matched"))))
     place_count = int(round(_f(order.get("original_size"))))
     price = _f(order.get("price"))
     cost_cents = int(round(filled * price * 100))
     raw_status = (order.get("status") or "").lower()
-    if "match" in raw_status:
-        status = "executed"
-    elif "cancel" in raw_status or "invalid" in raw_status:
+    st = raw_status.removeprefix("order_status_")
+    if st in ("unmatched", "killed"):
         status = "canceled"
-    elif "live" in raw_status:
+    elif st == "matched":
+        status = "executed"
+    elif st in ("canceled", "cancelled", "invalid") or st.startswith(("canceled_", "cancelled_")):
+        status = "canceled"
+    elif st == "live":
         status = "resting"
     else:
         status = raw_status or "resting"
@@ -921,7 +1158,24 @@ def _parse_polymarket_order(order: dict) -> dict:
     }
 
 
+def _fills_after(created_at) -> Optional[int]:
+    """Unix seconds to start an order's fill walk (`get_fills_for_order`'s
+    `after`): an hour before its row was written. The row is written after
+    the order is sent, so a fill can land before it, and the venue's clock is
+    not ours; the slack only costs a slightly longer walk. None when the
+    timestamp can't be read (the walk is then not narrowed by time)."""
+    try:
+        t = datetime.strptime(str(created_at)[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return int(t.replace(tzinfo=timezone.utc).timestamp()) - 3600
+
+
 def _parse_polymarket_fill(f: dict, default_side: str = "") -> dict:
+    """Parse one CLOB trade (from `polymarket_api.get_fills_for_order`) into
+    {count, side, price_cents}. The fill carries the bought token's price
+    directly (`price_cents`); price_cents is None if it can't be resolved to
+    a sane 1..99c value (caller skips those)."""
     count = int(round(_f(f.get("count_fp") if f.get("count") is None else f.get("count"))))
     side = str(f.get("side") or default_side).lower()
     cents = f.get("price_cents")
@@ -985,6 +1239,23 @@ _POLL_FAILURE_THRESHOLD = 6
 
 
 async def poll_open_orders(cfg: dict) -> list[dict]:
+    """Reconcile pending orders with Polymarket. Returns list of updated rows.
+
+    Two-tier strategy:
+      1. Per-order via `/portfolio/orders/{id}` (preferred — gives us
+         exact filled_contracts and cost_cents for THIS order).
+      2. Position-aggregate via `/portfolio/positions` (rescue path —
+         used only when the order endpoint can't tell us what
+         happened, e.g. transient 404, missing order id, etc.). The
+         aggregate is safe to attribute to a single local row only
+         when there is exactly one unresolved local row claiming this
+         ticker+direction; otherwise we leave the row alone.
+
+    We **never** mark a row `gone` on a single failed poll — that was
+    the bug that left the user with 16 positions on Polymarket but only 2
+    visible in the dashboard. A row only retires after
+    `_POLL_FAILURE_THRESHOLD` consecutive failures.
+    """
     with db.get_db() as conn:
         pending = db.get_pending_bot_positions(conn)
     if not pending:
@@ -1026,6 +1297,20 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
         _poll_failures.pop(pid, None)
 
     def _try_rescue_from_position_aggregate(pos: dict, conn) -> dict | None:
+        """If exactly one of OUR unresolved local rows claims this
+        ticker+side, attribute the live position aggregate to it.
+        Returns the updated row or None.
+
+        `conn` is the pass-wide connection (see the loop below) — this helper
+        used to open two of its own per call, on top of the caller's.
+
+        We skip the DB write entirely when nothing material changed
+        since the last poll — without that guard, every 30-second poll
+        cycle re-touches every "filled" pending row, which fires a
+        a `position:update` event on the renderer
+        even though absolutely nothing happened. That's the duplicate
+        spam the user reported.
+        """
         live_p = pos_by_key.get((pos["ticker"], pos["direction"]))
         if not live_p:
             return None
@@ -1274,7 +1559,17 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
     return updated
 
 
+
 def _market_yes_payout(market: dict | None) -> Optional[float]:
+    """Return the YES-side $/contract payout if the market is definitively
+    settled, else None. Looks at `result` ("yes"/"no") then a settlement value.
+
+    Both `settlement_value_dollars` (from fetch_market) and `settlement_value`
+    (the markets-table cache, which db.upsert_market writes FROM
+    settlement_value_dollars) are DOLLARS in [0, 1] — NOT cents. The old `/100`
+    "legacy cents" conversion would mis-settle a winner (1.0) as a loss (0.01)
+    on any row that has settlement_value without a `result`.
+    """
     if not market:
         return None
     result = (market.get("result") or "").lower()
@@ -1306,6 +1601,8 @@ _RESOLVE_SLOW_RETRY_SEC = 6 * 3600
 
 
 def _row_age_sec(created_at) -> float:
+    """Age of a SQLite `datetime('now')` timestamp (UTC) in seconds; 0.0 when
+    unparseable so a malformed row keeps the old every-cycle behavior."""
     try:
         dt = datetime.fromisoformat(str(created_at)).replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds()
@@ -1313,14 +1610,35 @@ def _row_age_sec(created_at) -> float:
         return 0.0
 
 
-def _fee_coeff_for(pos: dict) -> Optional[float]:
-    cat = (pos.get("category") or "").strip().lower()
-    if cat in backtest.CATEGORY_TAKER_FEE:
-        return None
-    return backtest.CATEGORY_TAKER_FEE["other"]
+def _fee_coeff_for(pos: dict) -> float:
+    """Fee-v2 rate for a bot_positions row: its category on the schedule
+    (backtest.taker_fee_rate, which maps the bot's own climate/entertainment/
+    world ids), else the shared 'other' (0.05) fallback.
+
+    bot_positions never holds a 15m window — that engine has its own table and
+    its own fee code — so an unknown category on THIS table is a general
+    Polymarket market. Copy entries in particular carried a blank category,
+    and the old crypto (0.07) fallback charged every copied sports / politics
+    position the highest rate on the schedule."""
+    return backtest.taker_fee_rate(pos.get("category"))
 
 
 def _position_fee_usd(pos: dict) -> float:
+    """Taker fee attributable to a bot_positions row's ENTRY fill.
+
+    2026-08-18 fee audit: V2 orders carry no venue-reported fee
+    (fees_paid_dollars is always 0), so every main-engine / copy / script
+    market position was booked GROSS while the crypto15m engine, the
+    backtester and the script shadow ledger were all fee-net. Synthesize the
+    fee-v2 amount (rate × p·(1−p) × contracts, category-rated) at the entry
+    price whenever the venue reported nothing. Rows stamped entry_maker=1
+    (a resting limit that filled as a maker under takerOnly fee-v2) pay 0;
+    legacy rows (NULL) are assumed taker — the main engine always crosses.
+
+    The full venue fee, never net of the taker-rebate tier: Polymarket pays
+    the rebate back separately (daily, in pUSD), and the crypto engine's
+    realised fee (crypto15m_trader._order_fee_usd) never netted it, so with
+    a tier set the two engines booked the same fill differently."""
     if pos.get("entry_maker"):
         return 0.0
     reported = float(pos.get("fees_usd") or 0.0)
@@ -1335,22 +1653,50 @@ def _position_fee_usd(pos: dict) -> float:
     if not (0.0 < price < 1.0):
         return 0.0
     return round(
-        backtest.polymarket_fee_per_contract(
-            price, _fee_coeff_for(pos),
-            category=pos.get("category") or "") * filled, 6)
+        backtest.venue_fee_per_contract(price, _fee_coeff_for(pos)) * filled, 6)
 
 
 def _sell_fee_usd(pos: dict, sold: int, price_cents: float | None) -> float:
+    """Taker fee for a crossing SELL of `sold` contracts at `price_cents`
+    (category-rated fee-v2, the full venue fee like _position_fee_usd).
+    Settlement/redemption is free — only use this for exits that actually
+    cross the book."""
     if not sold or not price_cents:
         return 0.0
     p = max(0.0, min(1.0, float(price_cents) / 100.0))
     return round(
-        backtest.polymarket_fee_per_contract(
-            p, _fee_coeff_for(pos),
-            category=pos.get("category") or "") * int(sold), 6)
+        backtest.venue_fee_per_contract(p, _fee_coeff_for(pos)) * int(sold), 6)
 
 
 async def mark_resolved_positions(cfg: dict) -> list[dict]:
+    """Resolve filled positions whose markets have settled.
+
+    Each local position row is resolved **independently** based on:
+      - its own `filled_contracts` and `cost_usd` (what we actually paid)
+      - the binary outcome of the market (`result` from the public
+        `/markets/{ticker}` endpoint)
+
+    P&L formula (per row):
+        settlement_usd = filled * our_payout    # our_payout ∈ {0, 1} for binary
+        pnl_usd        = settlement_usd - cost_usd
+
+    Why per-row instead of grouping by ticker?
+
+    Polymarket's `/portfolio/positions?settlement_status=settled` reports the
+    *cumulative lifetime* `realized_pnl_dollars` for a (ticker, env)
+    pair. Two pitfalls when we tried to use it:
+
+      1. It includes P&L from old historical trades on the same ticker —
+         attributing that to today's local rows was wrong.
+      2. With multiple local rows on the same ticker, prorating by cost
+         smeared the lifetime aggregate evenly when it should have been
+         per-row based on each fill's relationship to settlement.
+
+    The market's settlement value is shared between demo and prod (same
+    underlying event), so we can use the public endpoint regardless of
+    `network`. No-fill rows (canceled/expired/gone with filled=0)
+    always resolve at $0 with NULL outcome (didn't actually trade).
+    """
     with db.get_db() as conn:
         unresolved = db.get_unresolved_bot_positions(conn)
     if not unresolved:
@@ -1483,11 +1829,23 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
     return updated
 
 
+
 async def reconcile_fills_from_polymarket() -> dict:
+    """For every local position with a `order_id`, pull its
+    authoritative fill list from Polymarket and rewrite `filled_contracts`,
+    `cost_usd`, `avg_fill_price_cents`. Then reset+rerun the resolver.
+
+    This is the recovery action for any position rows that ended up with
+    inflated filled/cost numbers from older buggy poll paths. After this
+    runs, `pnl_usd` is computed from authoritative per-order fills and
+    the market's binary settlement, with no aggregation across rows.
+
+    Returns {fills_reconciled, pnl_cleared, pnl_recomputed}.
+    """
     env = get_env()
     with db.get_db() as conn:
         rows = conn.execute(
-            """SELECT id, order_id, ticker, direction, status
+            """SELECT id, order_id, ticker, direction, status, created_at
                FROM bot_positions
                WHERE network=? AND order_id IS NOT NULL
                  AND status NOT IN ('dry_run','submitted')""",
@@ -1499,7 +1857,8 @@ async def reconcile_fills_from_polymarket() -> dict:
     for pos in targets:
         kid = pos["order_id"]
         try:
-            fills = await get_fills_for_order(kid)
+            fills = await get_fills_for_order(
+                kid, market=pos["ticker"], after=_fills_after(pos.get("created_at")))
         except Exception as e:
             logger.debug(f"fills fetch failed for {kid}: {e}")
             continue
@@ -1562,6 +1921,9 @@ async def reconcile_fills_from_polymarket() -> dict:
                WHERE network=?
                  AND status IN ('filled','partial','expired','canceled','gone','error')
                  AND resolved=1
+                 -- Never re-resolve positions SOLD before settlement (flatten /
+                 -- external-exit / copy-exit): they hold the true realized-sale
+                 -- pnl; re-resolving would re-book them at binary settlement value.
                  AND COALESCE(closed_early,0)=0""",
             (env,),
         ).rowcount
@@ -1574,6 +1936,11 @@ async def reconcile_fills_from_polymarket() -> dict:
 
 
 async def audit_pnl(limit: int = 200) -> dict:
+    """Recompute pnl for every resolved position from its stored
+    filled/cost and the market's current settlement, and return a
+    breakdown of any rows where the stored value disagrees with the
+    fresh recompute. Useful for diagnosing where realized P&L is off.
+    """
     env = get_env()
     with db.get_db() as conn:
         rows = conn.execute(
@@ -1629,6 +1996,10 @@ async def audit_pnl(limit: int = 200) -> dict:
 
 
 async def recompute_pnl_from_polymarket() -> dict:
+    """Lighter version of `reconcile_fills_from_polymarket`: only resets
+    pnl/outcome and reruns the resolver. Useful when you trust the
+    locally-stored filled/cost but want fresh settlement attribution.
+    """
     env = get_env()
     with db.get_db() as conn:
         cleared = conn.execute(
@@ -1639,6 +2010,9 @@ async def recompute_pnl_from_polymarket() -> dict:
                WHERE network=?
                  AND status IN ('filled','partial','expired','canceled','gone','error')
                  AND resolved=1
+                 -- Never re-resolve positions SOLD before settlement (flatten /
+                 -- external-exit / copy-exit): they hold the true realized-sale
+                 -- pnl; re-resolving would re-book them at binary settlement value.
                  AND COALESCE(closed_early,0)=0""",
             (env,),
         ).rowcount
@@ -1646,7 +2020,32 @@ async def recompute_pnl_from_polymarket() -> dict:
     return {"cleared": int(cleared or 0), "recomputed": len(rows)}
 
 
+
 async def reconcile_positions_with_polymarket() -> tuple[dict, list[dict]]:
+    """Fix our local view of the world to match what Polymarket shows.
+
+    Source of truth: `/portfolio/positions`. For each Polymarket position
+    with non-zero qty, we look for ANY local row matching
+    (ticker, direction, env) — including rows previously marked `gone`
+    or `canceled` by older buggy poll code:
+
+      - Found, unresolved, active status (submitted/partial/filled):
+        → just sync `filled_contracts` / `cost_usd`.
+      - Found, unresolved, terminal status (gone/canceled/expired/error):
+        → **resurrect** as `filled` (status=filled, error=null). This is
+        the fix for "dashboard says 2 open but Polymarket shows 16".
+      - Found, but already resolved: this is a brand-new round on the
+        same ticker → import as a new `external` row.
+      - No matching row at all: → import as new `external` row.
+
+    Local rows that aren't in Polymarket's live list are left alone — let
+    `mark_resolved_positions` decide if the market settled. Aggressive
+    orphan-marking was the regression that hid live positions.
+
+    Returns (summary, changed_rows). `changed_rows` is the list of
+    positions the caller should emit `position:update`/`position:new`
+    events for so the renderer's React state stays in sync.
+    """
     summary = {
         "closed_orphans": 0,
         "imported_unknowns": 0,
@@ -1663,6 +2062,10 @@ async def reconcile_positions_with_polymarket() -> tuple[dict, list[dict]]:
         return summary, changed
 
     def _signed_qty(p: dict) -> float:
+        """Quantity (signed: + YES, − NO) — try every field Polymarket has
+        used over time. The original codebase relied on `position_fp`
+        but recent responses sometimes only populate `position`. We
+        accept either."""
         for k in ("position_fp", "position"):
             v = p.get(k)
             if v in (None, "", 0):
@@ -1676,6 +2079,8 @@ async def reconcile_positions_with_polymarket() -> tuple[dict, list[dict]]:
         return 0.0
 
     def _cost_cents(p: dict) -> float:
+        """Cost basis in cents — `market_exposure` is cents (int),
+        `market_exposure_dollars` is a USD string. Try both."""
         v = p.get("market_exposure")
         if v not in (None, "", 0):
             try:
@@ -1691,6 +2096,10 @@ async def reconcile_positions_with_polymarket() -> tuple[dict, list[dict]]:
         return 0.0
 
     def _cur_price_cents(p: dict) -> Optional[float]:
+        """Live price of the HELD outcome in cents (0..100), from the Data
+        API `curPrice`. Stored as the position's mark so the UI can show
+        unrealized P&L. Returns None for an absent/0/out-of-range price so we
+        never overwrite a good mark with a junk value."""
         try:
             f = float(p.get("cur_price"))
         except (TypeError, ValueError):
@@ -1927,7 +2336,11 @@ async def reconcile_positions_with_polymarket() -> tuple[dict, list[dict]]:
     return summary, changed
 
 
+
 def _created_epoch(ts) -> float:
+    """SQLite UTC timestamp string → epoch seconds; 0.0 if unparseable (so the
+    caller's time filter degrades to 'include everything' rather than dropping
+    valid events)."""
     if not ts:
         return 0.0
     s = str(ts).replace("T", " ").split(".")[0].replace("Z", "").strip()
@@ -1940,10 +2353,21 @@ def _created_epoch(ts) -> float:
 
 
 def _exit_proceeds(pos: dict, activity: list[dict]) -> Optional[dict]:
+    """Cash the wallet realized exiting `pos`, from /activity. Matches the
+    position's market (conditionId) and outcome (yes→index 0, no→index 1),
+    counting only events at/after entry. Returns {proceeds, kind} or None when
+    there's no SELL/REDEEM evidence (caller then leaves the row open).
+
+    `proceeds` is NET of the exit's taker fee: a SELL row's usdcSize is the
+    cash that landed, the venue having already withheld rate·p·(1−p) per
+    share (a maker sell has nothing withheld). Callers must not charge
+    `_sell_fee_usd` on top. When there were SELLs the result also carries
+    `sell_gross` (Σ size·price) and `sell_fee` (what the venue withheld)."""
     ticker = pos.get("ticker")
     want_index = 0 if pos.get("direction") == "yes" else 1
     since = _created_epoch(pos.get("created_at")) - 3600.0
     sell_usdc = 0.0
+    sell_gross = 0.0
     redeem_usdc = 0.0
     redeemed_ours = False
     for ev in activity:
@@ -1969,6 +2393,11 @@ def _exit_proceeds(pos: dict, activity: list[dict]) -> Optional[dict]:
             usdc = 0.0
         if etype == "TRADE" and (ev.get("side") or "").upper() == "SELL":
             sell_usdc += usdc
+            try:
+                gross = float(ev.get("size") or 0.0) * float(ev.get("price") or 0.0)
+            except (TypeError, ValueError):
+                gross = 0.0
+            sell_gross += gross if gross > 0 else usdc
         elif etype == "REDEEM":
             redeem_usdc += usdc
             if idx == want_index:
@@ -1978,14 +2407,29 @@ def _exit_proceeds(pos: dict, activity: list[dict]) -> Optional[dict]:
         if redeemed_ours:
             return {"proceeds": 0.0, "kind": "redeemed"}
         return None
-    return {"proceeds": total, "kind": "redeemed" if redeem_usdc >= sell_usdc else "sold"}
-
-
-def _exit_was_sell(info) -> bool:
-    return str((info or {}).get("kind") or "").lower() in ("sold", "sell")
+    out = {"proceeds": total, "kind": "redeemed" if redeem_usdc >= sell_usdc else "sold"}
+    if sell_usdc > 0:
+        out["sell_gross"] = round(sell_gross, 6)
+        out["sell_fee"] = round(max(0.0, sell_gross - sell_usdc), 6)
+    return out
 
 
 async def detect_external_exits(cfg: dict) -> list[dict]:
+    """Resolve local OPEN positions the user exited DIRECTLY on Polymarket.
+
+    `reconcile_positions_with_polymarket` only UPDATES positions still held in
+    the wallet — it never closes one that has LEFT the wallet. So a position you
+    SELL on Polymarket itself (or that settles and redeems) just vanishes from
+    /positions and would show 'open' in the app forever. This sweep finds
+    unresolved filled rows no longer held on-chain and books them from the
+    wallet's /activity history: a SELL is a discretionary close at its real
+    proceeds, a REDEEM is a settlement payout. Returns the rows it closed.
+
+    SAFETY: requires a healthy positions response (≥1 non-zero holding) before
+    closing anything — a transient empty/garbled response must not mass-resolve
+    every open position. Skips markets with multiple local rows or crypto15m
+    ownership (can't attribute one wallet exit to one row), and leaves a gone
+    position OPEN when there's no SELL/REDEEM evidence (never guesses)."""
     env = get_env()
     try:
         live = await get_positions()
@@ -2048,15 +2492,13 @@ async def detect_external_exits(cfg: dict) -> list[dict]:
             continue
         cost = float(pos.get("cost_usd") or 0.0)
         proceeds = round(info["proceeds"], 4)
-        filled = int(pos.get("filled_contracts") or 0)
         fee = _position_fee_usd(pos)
-        if filled > 0 and _exit_was_sell(info):
-            fee += _sell_fee_usd(pos, filled, proceeds / filled * 100.0)
         pnl = round(proceeds - cost - fee, 4)
         correct = 1 if pnl > 0.05 else (0 if pnl < -0.05 else None)
         with db.get_db() as conn:
             fields = dict(resolved=1, outcome_correct=correct,
                           settlement_usd=proceeds, pnl_usd=pnl)
+            fee += float(info.get("sell_fee") or 0.0)
             if fee > 0 and not float(pos.get("fees_usd") or 0.0):
                 fields["fees_usd"] = round(fee, 6)
             db.update_bot_position(conn, pos["id"], **fields)
@@ -2079,7 +2521,32 @@ async def detect_external_exits(cfg: dict) -> list[dict]:
     return changed
 
 
+
 async def cancel_all_resting_orders(reason: str = "cancel-all") -> int:
+    """Cancel every app-tracked *resting* main-engine order for the active
+    wallet + network and mark each canceled in the DB. Returns the count
+    successfully canceled.
+
+    Scope is deliberately narrow and conservative:
+      - Only `bot_positions` rows with status in ('submitted','partial') and
+        resolved=0 — i.e. orders WE placed that could still be live on the
+        book. Filled/settled/gone rows are never touched, so we never cancel
+        something that already matched.
+      - crypto15m ENTRY orders are also swept: taker mode uses marketable FAK
+        that never rests, but maker-style entries rest as GTC and could fill
+        unmanaged after shutdown. Resting crypto15m EXIT asks (sell-into-
+        strength) are deliberately left alone — one filling while the app is
+        down closes the position at our own price, and the chain reconcile /
+        external-exit sweep books it on the next boot.
+      - A 404 (order already off the book — filled or previously canceled)
+        leaves the DB row untouched: the reconcile that follows a lifecycle
+        cancel will classify it (e.g. import a real fill) instead of us
+        mislabeling a filled order as canceled.
+
+    Used at lifecycle boundaries (clean shutdown, startup stale-order sweep)
+    so an unclean exit can't leave GTC orders resting on Polymarket that fill
+    later unmanaged, and also backs the user-facing "cancel all" RPC.
+    """
     with db.get_db() as conn:
         rows = conn.execute(
             """SELECT id, order_id FROM bot_positions
@@ -2123,10 +2590,14 @@ async def cancel_all_resting_orders(reason: str = "cancel-all") -> int:
 
 
 async def cancel_all_open() -> int:
+    """User-triggered 'cancel all resting orders' RPC (thin wrapper)."""
     return await cancel_all_resting_orders("user cancel-all")
 
 
 async def _confirm_sell(oid: str | None, qty: int, px: int) -> tuple[int, float]:
+    """(sold_qty, avg_price_cents) for a sell order. A fully-matched order 404s
+    (drops off the open-order endpoint), so a post-placement 404 is a full fill
+    at the cross price — same reasoning as the crypto escalation fix."""
     if not oid:
         return 0, 0.0
     for _ in range(4):
@@ -2149,6 +2620,11 @@ async def _confirm_sell(oid: str | None, qty: int, px: int) -> tuple[int, float]
 
 
 async def flatten_open_positions(cfg: dict) -> dict:
+    """Hard exit: cancel resting orders AND market-sell every open filled
+    position, booking realized P&L from the sale. The main engine is otherwise
+    buy-and-hold-to-settlement, so this is the manual 'cut everything now'
+    button — and the only way to actually act on a daily stop-loss.
+    Returns {canceled, sold, proceedsUsd}."""
     env = get_env()
     canceled = await cancel_all_open()
     with db.get_db() as conn:
@@ -2170,6 +2646,14 @@ async def flatten_open_positions(cfg: dict) -> dict:
 
 
 async def take_profit_sweep(cfg: dict) -> list[dict]:
+    """Per-position take-profit: SELL any open position whose live best BID is now
+    worth >= take_profit_pct ABOVE its cost, instead of holding to settlement. The
+    win-side complement of the daily-aggregate take_profit_on_day (which only
+    halts NEW entries — it never sells an existing winner). Percent auto-scales to
+    entry price: a near-$1 favorite can't reach the target so it naturally holds;
+    a mid-priced entry cashes out on a modest move. Returns the rows it closed
+    (for position:update emits). No-op when take_profit_pct <= 0, so it adds no
+    book load when off."""
     try:
         pct = float(cfg.get("take_profit_pct", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -2212,6 +2696,20 @@ async def take_profit_sweep(cfg: dict) -> list[dict]:
 
 
 async def _liquidate_position(pos: dict, cfg: dict, *, reason: str) -> tuple[int, float]:
+    """Cross the book to SELL a filled position and book the row on the result.
+    Shared by the manual flatten and the take-profit sweep — both exit the same
+    way; only the trigger and the `reason` (written to exit_reason and the event
+    log) differ. Returns (contracts_sold, proceeds_usd).
+
+    A single cross only takes top-of-book depth, so a large position in a thin
+    book PARTIALLY fills. Retry the remainder (cancelling each resting remainder
+    first) until fully out or the book runs dry — instead of booking the whole row
+    closed on a partial fill, which used to orphan the unsold shares on-chain and
+    mis-book pnl (proceeds for the sold slice vs the FULL cost basis => phantom
+    loss). Cross DOWN to the current bid each attempt (1c floor = dump if there's
+    no bid). A full exit resolves the row with true proceeds vs full cost basis; a
+    partial exit shrinks the row to what's still held so exposure stays correct
+    and the remainder rides to the next sweep or to settlement."""
     ticker, direction = pos["ticker"], pos["direction"]
     qty = int(pos["filled_contracts"] or 0)
     cost = float(pos["cost_usd"] or 0.0)

@@ -1,3 +1,10 @@
+"""`db.get_db()` reuses one connection per worker thread.
+
+Every one of these asserts a property the 148 `with db.get_db() as conn:` call
+sites already relied on and must keep: commit on a clean exit, rollback on any
+exception, an isolated connection per thread, and a fresh connection whenever
+`db_path()` moves. The reuse itself is the only new behaviour.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import db
+import db  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +27,7 @@ def _fresh_db(tmp_path, monkeypatch):
     db.init_db()
     yield dbfile
     db.close_thread_connection()
+
 
 
 def test_two_calls_on_one_thread_share_the_connection():
@@ -83,6 +91,7 @@ def test_close_thread_connection_then_get_db_reopens():
     db.close_thread_connection()
 
 
+
 def _rows(name="reuse_probe"):
     with db.get_db() as conn:
         return conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
@@ -111,6 +120,10 @@ def test_rollback_on_exception(probe):
 
 
 def test_rollback_on_base_exception(probe):
+    """CancelledError is a BaseException and this DB is driven from asyncio.
+    A cached connection is never closed, so an aborted block that left its
+    writes in an open transaction would have them committed by the NEXT block
+    on this thread — the one bug reuse could plausibly introduce."""
     with pytest.raises(asyncio.CancelledError):
         with db.get_db() as conn:
             conn.execute("INSERT INTO reuse_probe VALUES (1)")
@@ -132,6 +145,15 @@ def test_an_aborted_block_leaves_no_open_transaction(probe):
 
 
 def test_nested_blocks_get_independent_connections(probe):
+    """A helper that opens its own block while its caller holds one must keep
+    today's semantics: a separate connection, committing and rolling back on
+    its own boundary. (The tree has no such nesting — the discipline scan pins
+    that at zero — but `is_trading_idle(conn=None)` is one call away from it.)
+
+    The inner block writing while the OUTER one holds a write transaction is
+    an ordinary SQLite lock conflict and behaves exactly as it does today, so
+    the nesting checked here is read-inside-write, which is what would occur.
+    """
     with db.get_db() as outer:
         outer.execute("INSERT INTO reuse_probe VALUES (1)")
         with db.get_db() as inner:
@@ -151,7 +173,12 @@ def _all():
         return conn.execute("SELECT x FROM reuse_probe ORDER BY x").fetchall()
 
 
+
 def test_the_event_loop_thread_never_shares_a_connection():
+    """Two blocks that hold a transaction open across an `await` still exist
+    (tests/test_db_connection_discipline.py pins them). Until they are gone, a
+    thread with a running loop must get a private connection every time, or one
+    coroutine's block exit would commit another's half-written rows."""
     async def main():
         with db.get_db() as a:
             first = a
@@ -161,6 +188,10 @@ def test_the_event_loop_thread_never_shares_a_connection():
 
 
 def test_starting_a_loop_drops_a_connection_cached_before_it():
+    """init_db() runs on the main thread at startup and caches a connection;
+    that same thread then becomes the event-loop thread. Nothing would ever
+    hand the connection back, and the open handle would block the corrupt-file
+    quarantine's rename/unlink on Windows."""
     with db.get_db() as conn:
         assert conn is getattr(db._local, "conn")
     asyncio.run(_touch())
@@ -184,6 +215,7 @@ def test_loop_thread_still_commits_and_rolls_back(probe):
             pass
     asyncio.run(main())
     assert [r[0] for r in _all()] == [5]
+
 
 
 def test_vacuum_succeeds_after_this_thread_has_used_its_connection(probe):
@@ -212,6 +244,8 @@ def test_run_maintenance_survives_a_cached_connection(probe):
 
 
 def test_worker_thread_reuses_across_calls_and_still_isolates():
+    """The whole point of the change: a `run_in_executor` worker pays the
+    ~2 ms connect once, not once per call site."""
     result: dict = {}
 
     def work():

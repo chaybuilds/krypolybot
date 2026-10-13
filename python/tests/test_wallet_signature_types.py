@@ -1,3 +1,12 @@
+"""Wallet signature-type support: POLY_PROXY (1) / GNOSIS_SAFE (2) signing +
+on-chain type detection.
+
+Regression for the 2026-07-07 field bug: new Polymarket Gmail (Magic/email)
+accounts are POLY_PROXY (type 1) minimal-proxy wallets, but the installer
+hardcoded every deposit wallet to POLY_1271 (type 3) and only implemented
+signing for types 0 and 3 — so every order was rejected ("signer ≠ api key")
+even with a correct key + deposit address.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +29,7 @@ def _wire_sign(monkeypatch, sig_type, funder):
     monkeypatch.setattr(auth, "get_funder", lambda env=None: funder)
     monkeypatch.setattr(auth, "_load_account", lambda: _FakeAcct())
     monkeypatch.setattr(auth, "_eip712_sign", lambda typed: "0xsig")
+
 
 
 def test_poly_proxy_order_puts_eoa_in_signer_and_proxy_in_maker(monkeypatch):
@@ -215,6 +225,7 @@ def test_detect_empty_1967_slot_does_not_crash(monkeypatch):
     assert _run() is None
 
 
+
 def _wire_authz(monkeypatch, *, funder, signer, rpc):
     monkeypatch.setattr(api.auth, "get_funder", lambda env=None: funder)
     monkeypatch.setattr(api.auth, "get_address", lambda env=None: signer)
@@ -289,7 +300,9 @@ def test_authz_no_funder_abstains(monkeypatch):
     assert out["ok"] is True and out["tested"] is False
 
 
+
 def _meta_at(monkeypatch, tmp_path, text=None):
+    """Point the sidecar at tmp_path; write `text` when given. Empty cache."""
     f = tmp_path / "wallet.mainnet.meta.json"
     if text is not None:
         f.write_text(text, encoding="utf-8")
@@ -345,6 +358,9 @@ def test_set_wallet_meta_refreshes_the_cache(monkeypatch, tmp_path):
 
 
 def test_session_key_signatures_carry_the_deposit_wallet_envelope():
+    """A session-key order signature is abi.encode(signer, 0, sig) + MAGIC —
+    the exact layout of the official SDK's
+    wrap_deposit_wallet_session_signer_signature."""
     from eth_abi import decode as abi_decode
     import polymarket_auth as auth
     signer = "0x" + "ab" * 20

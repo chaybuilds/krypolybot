@@ -1,3 +1,13 @@
+"""Market sync must not be dead time on the master trading loop.
+
+The universe refresh was the single longest thing `_scanner_and_trader_loop`
+awaited: ~10 Gamma pages walked strictly serially with an unconditional 0.2s
+sleep between them, then ~1,000 synchronous sqlite upserts on the event loop —
+all of it blocking every OTHER engine (stop-loss, settlement, reconcile, copy).
+
+These pin the three fixes: pipelined pages, upserts in a worker thread, and a
+single-flight background task for the recurring pass.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +30,7 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _slow_gamma(pages: int, per_page_sec: float, page_cap: int = 100):
+    """Gamma stand-in: `pages` full pages, each costing `per_page_sec`."""
     total = pages * page_cap
     calls: list[int] = []
 
@@ -44,6 +55,8 @@ def _slow_gamma(pages: int, per_page_sec: float, page_cap: int = 100):
 
 
 def test_five_pages_of_20ms_are_pipelined_not_walked(monkeypatch):
+    """5 pages x 20ms. Serial + the old unconditional 0.2s inter-page sleep was
+    5*20 + 4*200 = ~900ms. Pipelined at concurrency 4 it is two waves: ~40ms."""
     get, calls = _slow_gamma(pages=5, per_page_sec=0.020)
     monkeypatch.setattr(api, "_get", get)
 
@@ -66,6 +79,7 @@ def test_sync_markets_writes_every_page(monkeypatch, fresh_db):
 
 
 def test_upserts_run_off_the_event_loop(monkeypatch, fresh_db):
+    """The ~1,000 upserts must happen in a worker thread, not on the loop."""
     import threading
 
     get, _calls = _slow_gamma(pages=2, per_page_sec=0.0)
@@ -92,6 +106,7 @@ def test_upserts_run_off_the_event_loop(monkeypatch, fresh_db):
 
 
 def test_overlapping_sync_requests_run_one_sync(monkeypatch):
+    """Single-flight: a sync that overruns its interval must not stack up."""
     started = {"n": 0}
     release = None
 
@@ -124,6 +139,7 @@ def test_overlapping_sync_requests_run_one_sync(monkeypatch):
 
 
 def test_background_sync_failure_never_reaches_the_loop(monkeypatch):
+    """A wedged/failing Gamma must not take the trading loop down with it."""
     async def _boom(*, max_pages: int = 10) -> int:
         raise RuntimeError("gamma is down")
 
@@ -139,6 +155,8 @@ def test_background_sync_failure_never_reaches_the_loop(monkeypatch):
 
 
 def test_a_slow_market_sync_does_not_hold_the_master_loop(monkeypatch):
+    """The recurring sync is detached: a Gamma that takes seconds must not
+    stop the loop from reaching the blocks that manage open positions."""
     import contextlib
 
     sync_started = asyncio.Event()
@@ -163,6 +181,7 @@ def test_a_slow_market_sync_does_not_hold_the_master_loop(monkeypatch):
     monkeypatch.setattr(service, "emit_event", _emit)
     monkeypatch.setattr(service.scanner, "sync_markets", _glacial_sync)
     monkeypatch.setattr(service.scanner, "sync_events", _noop)
+    monkeypatch.setattr(service.crypto15m_record, "record_tick", _noop)
     monkeypatch.setattr(service.STATE, "auth_ok", False, raising=False)
     monkeypatch.setattr(service.STATE, "paused", False, raising=False)
     monkeypatch.setattr(service.STATE, "cfg", {

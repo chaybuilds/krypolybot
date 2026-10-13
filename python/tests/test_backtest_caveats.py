@@ -1,3 +1,14 @@
+"""The backtester must not blame the user's data for its own limits.
+
+Reported 2026-07-25: backtesting the sports script showed 0 trades / 0 windows
+with the caveat "No resolved 15m windows recorded in the last 30 days — let
+data accumulate first". The recorder was working fine (490 resolved windows;
+two other scripts scanned them and one took 243 trades). The real reason is
+that the script defines only decide_market(), and the recorded corpus is
+crypto Up/Down windows — so there is nothing for it to replay against.
+
+Blaming the data sends the user off to fix a recorder that isn't broken.
+"""
 from __future__ import annotations
 
 import pytest
@@ -14,6 +25,7 @@ SUPERVISE_SCRIPT = "def supervise(app):\n    return None\n"
 
 
 def _run(code, tmp_path, monkeypatch):
+    """Backtest against an EMPTY but perfectly healthy database."""
     import db
 
     dbfile = tmp_path / "bt.db"
@@ -41,6 +53,7 @@ def test_non_window_scripts_say_NOT_BACKTESTABLE(code, hook, tmp_path, monkeypat
 
 
 def test_the_not_backtestable_caveat_comes_first(tmp_path, monkeypatch):
+    """It explains the headline 0, so it must not be buried."""
     res = _run(MARKET_SCRIPT, tmp_path, monkeypatch)
     assert "NOT BACKTESTABLE" in (res.get("caveats") or [""])[0]
 
@@ -51,6 +64,8 @@ def test_it_points_at_shadow_mode_as_the_alternative(tmp_path, monkeypatch):
 
 
 def test_a_decide_script_on_an_empty_db_still_blames_the_data(tmp_path, monkeypatch):
+    """The original message is correct in its ONE valid case: a window script
+    with genuinely nothing recorded."""
     res = _run(WINDOW_SCRIPT, tmp_path, monkeypatch)
     text = _caveats(res)
     assert "No resolved 15m windows" in text, text

@@ -1,3 +1,27 @@
+"""Perps market board: every Polymarket Perps market with what a maker needs
+to choose where to quote — the liquidity-rewards pool, how much competing size
+already rests near mid (scored the way the program scores it), what a quote of
+the configured size would earn, volume, funding and index deviation.
+
+Read-only and public-data only: it never needs credentials or places orders.
+The engine (perps_maker) uses `pick_markets` for its auto modes and the Perps
+tab renders `snapshot()`.
+
+Load is bounded: one `tickers` call per refresh covers all ~90 markets; order
+books are refreshed for a rotating handful per refresh (plus whatever the
+engine is quoting, which it feeds in via `note_book`), and 7-day volume from
+daily candles is refreshed for a few markets per refresh.
+
+THE REWARD MODEL (docs.polymarket.com/perps/liquidity-rewards):
+  pool per market = $75,000/day ÷ active markets
+  raw_score = maker_score^0.35 × liquidity^0.65 × uptime
+  liquidity  = harmonic mean of bid/ask scores, each Σ min(size_in_tier, $100k)
+               × tier weight (≤5 bps 1.0, ≤10 0.25, ≤20 0.1)
+The estimate treats everyone else's resting depth as ONE competitor with the
+same maker score and uptime as us. It is a ranking signal, not a promise: the
+real split also depends on every maker's 7-day maker share and uptime, and an
+account earns nothing until its maker share reaches 1%.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +58,9 @@ def tier_weight(dist_bps: float) -> float:
 
 
 def side_score(levels: list[tuple[float, float]], mid: float, *, cap: bool = True) -> float:
+    """Reward score of one side: notional per tier times weight. The $100k
+    per-tier cap is per ACCOUNT, so it applies to our own quotes but not to
+    the aggregate of everyone else's (`cap=False`)."""
     tiers = [0.0, 0.0, 0.0]
     for px, qty in levels:
         if mid <= 0 or px <= 0 or qty <= 0:
@@ -52,6 +79,7 @@ def harmonic(a: float, b: float) -> float:
 
 
 def book_depth(bids: list, asks: list, own: Optional[list[tuple[bool, float, float]]] = None) -> dict:
+    """Best prices, mid and the COMPETING (own orders removed) reward score."""
     b = [(float(p), float(q)) for p, q in bids]
     a = [(float(p), float(q)) for p, q in asks]
     if not b or not a:
@@ -78,6 +106,8 @@ def _subtract(levels: list[tuple[float, float]], mine: list[tuple[float, float]]
 
 
 def quote_score(size_usd: float, quote_bps: float, levels: int, step_bps: float) -> float:
+    """Our own per-side score for a symmetric quote ladder (both sides equal,
+    so the harmonic mean is the side score)."""
     tiers = [0.0, 0.0, 0.0]
     for k in range(max(1, levels)):
         d = quote_bps + k * step_bps
@@ -108,6 +138,8 @@ async def _refresh_book(iid: int) -> None:
 
 def note_book(iid: int, bids: list, asks: list,
               own: Optional[list[tuple[bool, float, float]]] = None) -> dict:
+    """Record a fresh book for `iid` (the engine calls this with its own
+    resting orders so they aren't counted as competition)."""
     d = book_depth(bids, asks, own)
     d["at"] = time.time()
     _books[iid] = d
@@ -138,6 +170,8 @@ def _f(v: Any) -> Optional[float]:
 
 
 async def snapshot(cfg: dict, *, priority: tuple[int, ...] = (), force: bool = False) -> dict:
+    """The whole board. Cached for a few seconds; `priority` markets get their
+    books refreshed first."""
     now = time.time()
     if not force and _snap["data"] is not None and now - _snap["at"] < _SNAPSHOT_TTL:
         return _snap["data"]
@@ -170,6 +204,8 @@ async def snapshot(cfg: dict, *, priority: tuple[int, ...] = (), force: bool = F
 
 
 def build(cfg: dict, inst: list[dict], by_tick: dict[int, dict]) -> dict:
+    """Assemble the board from cached books/volumes (pure apart from reading
+    the module caches — tests seed them directly)."""
     active = [i for i in inst if not i.get("close_only")]
     pool = DAILY_REWARD_POOL_USD / max(1, len(active))
     size = float(cfg.get("perps_size_usd") or 100.0)
@@ -237,6 +273,7 @@ def build(cfg: dict, inst: list[dict], by_tick: dict[int, dict]) -> dict:
 
 
 def pick_markets(board: dict, cfg: dict) -> list[dict]:
+    """The markets the engine should quote, per `perps_select_mode`."""
     rows = [r for r in board.get("markets") or [] if not r.get("closeOnly")]
     size = float(cfg.get("perps_size_usd") or 100.0)
     rows = [r for r in rows if (r.get("minNotional") or 10.0) <= size]

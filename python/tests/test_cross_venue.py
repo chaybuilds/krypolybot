@@ -1,3 +1,12 @@
+"""Cross-venue matching, pinned.
+
+This is the one place in the terminal that asserts something no provider told
+us: that two markets ask the same question. A wrong pairing produces a large,
+confident, entirely fictional arbitrage — the exact kind of number somebody
+acts on. Every test here guards a specific way that goes wrong.
+
+Pure scoring only; no network.
+"""
 from __future__ import annotations
 
 import pytest
@@ -19,7 +28,12 @@ def _score(pm_title, kx_text, pm_close=None, kx_close=None):
     return cv.score_pair(_pm(pm_title, pm_close), _kx(kx_text, kx_close))[0]
 
 
+
 def test_opposite_direction_is_disqualified_outright():
+    """Caught on a live run: "Fed INCREASE rates by 25bps" matched Kalshi's
+    "CUT 25bps" at a 0.63 score and printed a 33c spread between two mutually
+    exclusive markets. A word list of antonym pairs had increase/decrease but
+    not increase/cut, which is why the rule is polarity, not pairs."""
     assert _score(
         "Will the Fed increase interest rates by 25 bps after the September meeting?",
         "Will the Federal Reserve Cut rates by 25bps at the September meeting Cut 25bps",
@@ -57,7 +71,14 @@ def test_polarity_reads_a_single_direction():
     assert t.polarity("Who will be the next Pope") is None
 
 
+
 def test_different_thresholds_do_not_match():
+    """"Bitcoin above $110,000" and "Bitcoin above $120,000" differ by nothing
+    a token comparison can see, and pairing them would invent a huge spread.
+
+    Note both titles also contain "30" (the day). Scoring on whether the two
+    SHARE a number let that date carry the match — the rule has to be about
+    what each side names that the other CONTRADICTS."""
     s = _score("Will Bitcoin be above $110,000 on August 30?",
                "Bitcoin above 120000 on August 30")
     assert s < cv.POSSIBLE, f"different thresholds scored {s}"
@@ -88,6 +109,10 @@ def test_numbers_normalise_across_formatting():
 
 
 def test_a_price_that_looks_like_a_year_is_still_a_price():
+    """The years filter used to drop every integer in 1900..2100, so the
+    threshold in "ETH above $2,000" vanished, both sides named no figure at
+    all, nothing contradicted, and a $100 gap paired at strong confidence with
+    a fictional spread printed under it."""
     assert cv._numbers("Will ETH be above $2,000 on Sept 30?") == {"2000", "30"}
     assert cv._numbers("ETH above 2000 points") == {"2000"}
     assert cv._numbers("ETH above $2000") == {"2000"}
@@ -112,13 +137,20 @@ def test_bare_years_are_still_dropped(text):
 
 
 def test_two_different_years_in_the_text_are_not_a_figure_mismatch():
+    """Checked deliberately: the module's ONLY date-mismatch signal is
+    closeTime, so a year written in the title is context on both sides and
+    contradicts nothing. What separates "by 2026" from "by 2027" here is the
+    token overlap and, on a real pair, the settlement dates."""
     a, b = "Fed decision by 2026", "Fed decision by 2027"
     assert cv._numbers(a) == cv._numbers(b) == set()
     assert _score(a, b) < cv.STRONG
     assert _score(a, b, "2026-12-31T00:00:00Z", "2027-12-31T00:00:00Z") < cv.POSSIBLE
 
 
+
 def test_far_apart_settlement_dates_are_penalised():
+    """A live run matched the Sep 2026 Fed question to Kalshi's Sep 2027 one:
+    same words, different year, and the spread would have been noise."""
     near = _score("Fed decision at the September meeting",
                   "Fed decision in September",
                   "2026-09-16T00:00:00Z", "2026-09-17T00:00:00Z")
@@ -136,6 +168,7 @@ def test_a_missing_date_is_recorded_against_the_match():
     assert any("settlement date" in a for a in against)
 
 
+
 def test_only_two_confidence_tiers_are_ever_shown():
     assert cv._confidence(0.9) == "strong"
     assert cv._confidence(cv.STRONG) == "strong"
@@ -143,6 +176,8 @@ def test_only_two_confidence_tiers_are_ever_shown():
 
 
 def test_unrelated_markets_score_below_the_floor():
+    """A live run paired "Pittsburgh Pirates vs San Diego Padres" with
+    "Christian Walker's Next Team" on the strength of "san"+"diego"."""
     s = _score("Pittsburgh Pirates vs. San Diego Padres",
                "Christian Walker's Next Team San Diego")
     assert s < cv.POSSIBLE, f"unrelated markets scored {s}"
@@ -151,6 +186,7 @@ def test_unrelated_markets_score_below_the_floor():
 def test_an_empty_title_never_matches():
     assert _score("", "Fed decision in September") == 0.0
     assert _score("Fed decision in September", "") == 0.0
+
 
 
 def test_kalshi_dollar_strings_become_cents():
@@ -173,6 +209,10 @@ def test_kalshi_legacy_cent_fields_still_read():
 
 
 def test_a_one_cent_quote_survives():
+    """`yes_bid: 1` is 1¢. Reading it as $1.00 made it 100¢, which the
+    empty-book scrub then dropped — so a real, tradeable long-shot market
+    reported as having no quote at all. The unit is in the field name; there
+    was never anything to infer."""
     row = kalshi.market_row({
         "ticker": "KXTEST-1", "title": "Test?",
         "yes_bid": 1, "yes_ask": 2, "status": "active",
@@ -196,6 +236,8 @@ def test_a_candle_reads_its_unit_from_the_written_value():
 
 
 def test_kalshi_empty_book_is_not_a_quote():
+    """Same rule as Polymarket: neither 0c nor 100c is a price anyone could
+    trade, so an empty side is unknown rather than an extreme quote."""
     row = kalshi.market_row({
         "ticker": "KXTEST-1", "title": "Test?",
         "yes_bid_dollars": "0.0000", "yes_ask_dollars": "1.0000",
@@ -238,6 +280,7 @@ def test_kalshi_candles_skip_a_period_with_nothing_at_all():
     assert kalshi.normalize_candles([{"end_period_ts": 10}]) == []
 
 
+
 def test_bucketing_snaps_both_venues_onto_one_grid():
     pts = cv._bucket([{"t": 3661, "p": 50.0}, {"t": 3700, "p": 52.0}], 3600)
     assert pts == {3600: 52.0}
@@ -246,6 +289,7 @@ def test_bucketing_snaps_both_venues_onto_one_grid():
 def test_bucketing_drops_a_null_rather_than_carrying_it_forward():
     pts = cv._bucket([{"t": 0, "p": 50.0}, {"t": 3600, "p": None}], 3600)
     assert pts == {0: 50.0}, "a null price became a data point"
+
 
 
 def test_eastern_time_is_read_without_a_timezone_database():
@@ -272,6 +316,9 @@ def test_the_us_daylight_saving_rule(iso, day):
     ("KXUCL-27", None),
 ])
 def test_kalshi_stamps_its_own_date_into_the_event_ticker(ticker, day):
+    """Preferred over every timestamp on the row: BOTH venues pad a game's
+    close time by days so a postponed fixture can still settle, and comparing
+    two padded dates is what buried every sports pairing."""
     assert cv.kalshi_ticker_date(ticker) == day
 
 
@@ -280,6 +327,7 @@ def test_a_date_written_out_in_the_question_is_read():
                         year_hint="2026-09-03T16:00:00Z") == "2026-09-03"
     assert cv.text_date("by December 31, 2026") == "2026-12-31"
     assert cv.text_date("no date here", year_hint="2026") is None
+
 
 
 @pytest.mark.parametrize("text,want", [
@@ -303,11 +351,16 @@ def test_thresholds_are_read_from_the_wording(text, want):
 
 
 def test_a_multiplier_letter_must_not_eat_the_next_word():
+    """"$45,000 by December 31" read the "b" of "by" as billions, asked about
+    a threshold of forty-five trillion, and matched nothing — silently, which
+    is the worst way for a matcher to fail."""
     assert cv.parse_threshold(
         "Will Bitcoin dip to $45,000 by December 31, 2026?") == ("below", 45000.0)
 
 
 def test_the_same_level_written_two_ways_is_one_level():
+    """Kalshi's "greater" strike sits one tick under the number it prints:
+    floor_strike 75999.99 under the label "$76,000 or above"."""
     assert cv.compare_thresholds(("above", 76000.0), ("above", 75999.99)) == "same"
 
 
@@ -330,6 +383,7 @@ def test_a_band_matches_only_the_identical_band():
                                  ("above", 88.0)) is None
 
 
+
 @pytest.mark.parametrize("text,leg", [
     ("Will there be no change in Fed interest rates after the September 2026 "
      "meeting?", "H0"),
@@ -346,6 +400,9 @@ def test_a_band_matches_only_the_identical_band():
     ("Will Bitcoin be above $76,000?", None),
 ])
 def test_fed_legs_are_read_from_the_question(text, leg):
+    """Polymarket writes "50+ bps" and Kalshi writes "Hike >25bps". They are
+    the same contract — the Fed moves in 25bp steps — but no threshold rule
+    can say so, because 50 and 25 are different numbers."""
     assert cv.fed_leg(text) == leg
 
 
@@ -355,6 +412,8 @@ def test_the_kalshi_fed_leg_comes_off_its_ticker():
 
 
 def test_opposite_fed_legs_never_structurally_match():
+    """The pinned failure: "increase 25bps" paired with "Cut 25bps" and
+    printed a 33c spread between two mutually exclusive markets."""
     pm = _pm("Will the Fed increase interest rates by 25 bps after the "
              "September 2026 meeting?", "2026-09-16T00:00:00Z")
     kx = {"conditionId": "KXFEDDECISION-26SEP-C25",
@@ -371,6 +430,7 @@ def test_the_same_fed_leg_in_a_different_year_does_not_match():
           "subtitle": "Hike 25bps", "eventTicker": "KXFEDDECISION-27SEP",
           "closeTime": "2027-09-16T00:00:00Z"}
     assert cv.structural_match(pm, kx) is None
+
 
 
 def _kx_threshold(ticker, event, subtitle, match_text, close=None):
@@ -401,6 +461,9 @@ def test_the_next_days_strike_is_a_different_question():
 
 
 def test_the_no_side_is_matched_but_never_silently():
+    """Kalshi lists plenty of levels from the other direction. Comparing
+    against its NO price is correct; doing it without saying so would flip the
+    sign of the spread with nothing on screen to explain it."""
     pm = _pm("Will the price of Bitcoin be above $76,000 on September 3?",
              "2026-09-03T16:00:00Z")
     kx = _kx_threshold(
@@ -412,6 +475,8 @@ def test_the_no_side_is_matched_but_never_silently():
 
 
 def test_a_deadline_may_be_written_from_either_side_of_midnight():
+    """"by December 31, 2026" and a Kalshi strike date of January 1, 2027 are
+    one cut-off, not two questions a day apart. The "by" is what says so."""
     pm = _pm("Will Bitcoin dip to $45,000 by December 31, 2026?",
              "2027-01-01T05:00:00Z")
     kx = _kx_threshold(
@@ -429,6 +494,7 @@ def test_the_same_threshold_on_a_different_subject_does_not_match():
         "KXETHD-26SEP0317-T75999.99", "KXETHD-26SEP0317", "$76,000 or above",
         "Ethereum price on Sep 3, 2026 $76,000 or above")
     assert cv.structural_match(pm, kx) is None
+
 
 
 @pytest.mark.parametrize("slug,league,date,kind,line", [
@@ -469,6 +535,9 @@ def test_a_league_we_do_not_map_is_simply_not_a_fixture():
      "RC Celta de Vigo over 1.5"),
 ])
 def test_the_polymarket_yes_claim_is_made_explicit(title, slug, claim):
+    """Polymarket never labels its YES: the title is two team names and the
+    reader is expected to know YES means the first one. Saying it out loud is
+    what makes the Kalshi leg safe to pick."""
     pm = {"title": title, "slug": slug, "eventSlug": slug}
     fx = cv.parse_fixture(pm)
     assert fx is not None
@@ -492,6 +561,8 @@ def test_a_leg_is_only_picked_when_it_beats_the_runner_up():
 
 
 def test_a_tie_between_two_legs_is_answered_with_nothing():
+    """Half of a fixture pairing is not half right. Comparing "Mets win" to
+    "Rays win" gives two real prices, a large spread and an inverted claim."""
     legs = [_leg("A-X", "Real Madrid"), _leg("A-Y", "Barcelona")]
     assert cv.pick_leg("Getafe", legs) is None
 
@@ -505,6 +576,10 @@ def test_a_figure_decides_between_legs_that_read_identically():
 
 
 def test_a_leg_must_beat_its_own_siblings_before_it_is_shown():
+    """Caught on the live fixture: a question about Getafe scored Barcelona,
+    Real Madrid and Atletico identically, the Getafe leg happened to be
+    unquoted, and the panel would have shown Barcelona's price under a
+    question about Getafe."""
     def cand(ticker, score):
         return {"market": {"conditionId": ticker,
                            "eventTicker": "KXLALIGA-27"}, "score": score}
@@ -518,6 +593,7 @@ def test_a_leg_must_beat_its_own_siblings_before_it_is_shown():
 def test_a_lone_market_has_no_siblings_to_beat():
     cand = {"market": {"conditionId": "X-1", "eventTicker": "X"}, "score": 0.4}
     assert cv._beats_its_siblings(cand, [cand])
+
 
 
 def test_aliases_translate_the_question_into_kalshi_vocabulary():
@@ -569,13 +645,18 @@ def test_every_retrieval_route_finds_its_series(pm, want):
 
 
 def test_a_table_entry_that_does_not_exist_costs_nothing():
+    """Every ticker a table proposes is checked against the live series index
+    before it costs a request, so a stale entry is inert rather than a wasted
+    round trip against a 404."""
     rows, inv = _fake_index()
     pm = {"title": "Will Arsenal win the Premier League?", "slug": "x"}
     got = [s["ticker"] for s in cv._candidate_series(pm, rows, inv)]
     assert "KXEPL" not in got
 
 
+
 def _no_side_compare(monkeypatch):
+    """A `compare()` run whose match is against the Kalshi NO side."""
     import asyncio
 
     pm = {
@@ -619,6 +700,9 @@ def _no_side_compare(monkeypatch):
 
 
 def test_a_no_side_match_inverts_every_number_it_shows(monkeypatch):
+    """Kalshi's NO price is 100 minus its YES price, and so is the whole
+    history line. Showing the YES numbers under a NO-side claim would put a
+    confident, inverted spread on screen."""
     out = _no_side_compare(monkeypatch)
     k = out["kalshi"]
     assert k["side"] == "no"
@@ -680,7 +764,11 @@ def test_a_yes_side_match_is_left_exactly_as_it_was(monkeypatch):
     assert out["spreadCents"] == 4.0
 
 
+
 def test_a_market_row_takes_the_subject_from_its_event():
+    """A Kalshi market row on its own says "Tampa Bay wins" and nothing else —
+    no opponent, no date, no sport. Everything a question could be matched on
+    lives on the EVENT."""
     row = kalshi.market_row(
         {"ticker": "KXMLBGAME-26SEP021840NYMTB-TB", "title": "Tampa Bay wins",
          "yes_sub_title": "Tampa Bay", "status": "active",
@@ -732,6 +820,14 @@ def test_the_row_shape_is_unchanged_when_there_is_no_event():
      "Exact Score: CD Limache 1 - 0 CD Nublense?"),
 ])
 def test_a_fixture_market_we_cannot_name_is_refused(slug, title):
+    """Found on a holdout run, and it is the reason the family table is an
+    allow-list rather than a default. Falling through to the game winner paired
+    "Draw at halftime?" with Kalshi's FULL-TIME "Tie is the result", and
+    "Neither team to score first?" with "Deportes Limache wins" — four
+    different questions, each with a real spread under it.
+
+    Kalshi does list first-half and first-goal families. Until we have checked
+    how it words those legs, the honest answer is no panel."""
     assert cv.parse_fixture({"slug": slug, "eventSlug": slug, "title": title}) is None
 
 
@@ -740,6 +836,7 @@ def test_a_moneyline_leg_is_still_recognised(tail):
     slug = f"chi1-cdl-cdu-2026-08-01{tail}"
     fx = cv.parse_fixture({"slug": slug, "eventSlug": slug})
     assert fx and fx["kind"] == "winner"
+
 
 
 def test_gammas_listing_date_is_never_read_as_a_settlement_date():
@@ -769,6 +866,7 @@ def test_the_fed_question_still_matches_with_a_raw_row_attached():
           "subtitle": "Hike 25bps", "eventTicker": "KXFEDDECISION-26SEP"}
     v = cv.structural_match(pm, kx)
     assert v and v["side"] == "yes" and v["score"] >= cv.STRONG
+
 
 
 @pytest.mark.parametrize("slug,asset,minutes,end", [
@@ -816,6 +914,10 @@ def test_a_window_that_ends_with_kalshis_window_is_the_same_question():
 
 
 def test_a_five_minute_window_ending_at_the_same_instant_is_not_a_match():
+    """The sharpest near miss on either venue. Polymarket's 12:10-12:15 window
+    ENDS exactly when Kalshi's 12:00-12:15 window ends, and on a quiet fifteen
+    minutes the two prices look alike — so an end-only join would pair them and
+    print a spread between two different questions."""
     up = cv.parse_updown({"slug": "btc-updown-5m-1788408600"})
     assert up["endTs"] == 1788408900
     kx = _kx_window("KXBTC15M-26SEP030015-15", "KXBTC15M",
@@ -851,6 +953,9 @@ def test_a_timed_window_is_routed_to_its_kalshi_series():
 
 
 def test_structural_matching_owns_the_timed_family_outright():
+    """A near-miss window is the failure mode with the sharpest teeth here,
+    because the prices genuinely do look alike. So the text scorer never gets
+    a vote: an up/down market matches on the window or not at all."""
     pm = {"title": "Bitcoin Up or Down - September 3, 12:10AM-12:15AM ET",
           "slug": "btc-updown-5m-1788408600", "closeTime": "2026-09-03T04:15:00Z"}
     kx = _kx_window("KXBTC15M-26SEP030015-15", "KXBTC15M",

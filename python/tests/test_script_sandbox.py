@@ -1,3 +1,20 @@
+"""Compile / run / contain user strategy scripts.
+
+There is no language sandbox any more — scripts are full Python (see the
+module docstring in script_sandbox for why, and script_audit for what
+replaced it). So this file pins the two things the module still promises:
+
+  1. VALIDATION is about runnability, not permission. Imports, classes and
+     the standard library are ordinary code now; what still fails is code
+     that cannot load or that defines no hook the engine calls.
+  2. CONTAINMENT still holds. The traced path (used by the backtest, which
+     makes thousands of calls and cannot afford a thread each) kills a
+     runaway hook, and cannot be talked out of it by a script that catches
+     exceptions.
+
+The live engine's containment is a thread timeout, not a tracer; that half
+is pinned in test_script_engine.py.
+"""
 from __future__ import annotations
 
 import pytest
@@ -9,6 +26,7 @@ SIMPLE = (
     "def decide(ctx):\n"
     "    return {'side': 'up', 'price': 'ask'}\n"
 )
+
 
 
 def test_ordinary_strategy_script_validates():
@@ -59,6 +77,7 @@ def test_oversized_script_is_rejected():
 def test_async_hooks_are_rejected_because_the_engine_calls_them_sync():
     errors = ss.validate("async def decide(ctx):\n    return None\n")
     assert errors and "async def" in errors[0]
+
 
 
 def test_compiled_script_exposes_only_defined_hooks():
@@ -141,6 +160,7 @@ def test_code_hash_changes_with_the_code():
     assert ss.code_hash(SIMPLE) != ss.code_hash(SIMPLE + "\n# tweak\n")
 
 
+
 def test_busy_loop_is_killed_by_the_budget():
     mod = ss.CompiledScript(
         "b1", "def decide(ctx):\n    while True:\n        pass\n", traced=True)
@@ -186,6 +206,7 @@ def test_script_failures_covers_both_failure_kinds():
     assert ss.ScriptError in ss.SCRIPT_FAILURES
     assert ss.ScriptBudgetExceeded in ss.SCRIPT_FAILURES
     assert not issubclass(ss.ScriptBudgetExceeded, Exception)
+
 
 
 def test_parse_header_reads_name_and_description():

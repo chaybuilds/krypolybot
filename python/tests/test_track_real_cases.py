@@ -1,3 +1,20 @@
+"""The Track screen, pinned against the cases that were actually wrong.
+
+Every fixture in this file is shaped from a REAL wallet read (Polymarket Data
+API `positions` + CLOB `/data/trades`) taken while diagnosing five complaints
+about this page: no cost basis, "it says I lost most trades", everything badged
+redeemable, wrong P&L, and every row labelled "placed elsewhere". The wallet
+address is not here — only the public market ids, outcome labels and the
+arithmetic, which is what the bugs lived in.
+
+The one thing every test below is really guarding: OUTCOME IDENTITY IS AN
+INDEX, NOT A WORD. Polymarket's outcome 0 is spelled "Yes" on a binary market,
+"Up" on a crypto one, "Over" on a total, and a team or player name on a sports
+one. The old code asked ``outcome == "yes"`` and filed everything else under
+'no', so 823 of this wallet's 1,502 fills sat on the opposite key from the
+position they paid for — and a position whose buys and sells land on different
+keys has no cost basis at all.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -39,30 +56,45 @@ _SPORTS = {
 
 
 def test_an_up_market_fill_is_outcome_zero_even_though_it_is_not_spelled_yes():
+    """The exact bug. A "Bitcoin Up or Down" buy of the UP side is outcome 0 —
+    the same slot "Yes" occupies on a binary market — and the position it pays
+    for is keyed 'yes' off `outcomeIndex`. Reading the word instead put it on
+    'no', and the market silently lost its cost basis."""
     assert tt._side_from_token(_UPDOWN["yesTokenId"], "Up", _UPDOWN) == "yes"
     assert tt._side_from_token(_UPDOWN["noTokenId"], "Down", _UPDOWN) == "no"
 
 
 def test_a_named_outcome_maps_through_the_markets_own_outcome_list():
+    """A sports market's outcomes are two team names. Neither is "yes", so the
+    old rule filed BOTH sides of the same market under 'no' — buys of the
+    Braves and buys of the Giants netting against each other on one key."""
     assert tt._side_from_token("111", "Atlanta Braves", _SPORTS) == "yes"
     assert tt._side_from_token("222", "San Francisco Giants", _SPORTS) == "no"
     assert tt._side_from_token("", "San Francisco Giants", _SPORTS) == "no"
 
 
 def test_the_token_id_beats_a_label_that_disagrees_with_it():
+    """The token id IS the outcome. If the label and the token ever disagree,
+    the token wins — a mislabelled row must not move money onto the wrong key."""
     assert tt._side_from_token(_UPDOWN["noTokenId"], "Up", _UPDOWN) == "no"
 
 
 def test_a_fill_we_cannot_place_is_unknown_rather_than_guessed():
+    """No token match, no outcome list, no known word. Filing it under a guess
+    would put buys and sells on different keys and destroy a cost basis, so the
+    honest answer is None — and the caller leaves it out and says so."""
     assert tt._side_from_token("", "Karolina Muchova", None) is None
     assert tt._side_from_token("999", "", {"outcomes": ["Up", "Down"]}) is None
 
 
 def test_the_known_vocabulary_still_works_with_no_market_metadata():
+    """A degraded fallback for when the market lookup failed, covering the
+    outcome words Polymarket actually ships. Index 0 words map to 'yes'."""
     for word in ("Yes", "UP", "Over"):
         assert tt._side_from_token("", word, None) == "yes"
     for word in ("No", "down", "Under"):
         assert tt._side_from_token("", word, None) == "no"
+
 
 
 def _reconcile(monkeypatch, trades, summaries):
@@ -101,6 +133,12 @@ def test_an_up_down_fill_imports_onto_the_side_the_position_lives_on(
 
 
 def test_a_mis_filed_fill_is_repaired_by_the_next_reconcile(monkeypatch, fresh_db):
+    """The walk has no cursor — it re-reads the venue's WHOLE history every
+    pass. That is what makes repair possible, and an INSERT OR IGNORE threw it
+    away: 823 fills stayed on the wrong outcome forever because the row already
+    existed. Every column of a fill is DERIVED from the venue's trade record,
+    so re-deriving them is correcting our reading of Polymarket's ledger, not
+    overwriting the user's data."""
     with db.get_db() as conn:
         conn.execute(
             """INSERT INTO terminal_fills
@@ -178,6 +216,9 @@ def test_a_taker_fill_still_reads_the_top_level(monkeypatch, fresh_db):
 
 def test_a_wrong_leg_fill_already_in_the_ledger_is_re_derived(
         monkeypatch, fresh_db):
+    """The repair path for the money, not just the outcome. This is the row
+    that made one real position show 20 UP + 10 DOWN against a venue that said
+    30 UP at an average of 30c."""
     with db.get_db() as conn:
         conn.execute(
             """INSERT INTO terminal_fills
@@ -194,6 +235,8 @@ def test_a_wrong_leg_fill_already_in_the_ledger_is_re_derived(
 
 def test_an_ambiguous_maker_match_is_left_out_rather_than_picked(
         monkeypatch, fresh_db):
+    """Two maker legs, neither carrying an address we recognise. Choosing one
+    would be a coin flip written into the cost basis."""
     monkeypatch.setattr(tt.auth, "trading_address",
                         lambda: (_ for _ in ()).throw(RuntimeError("no key")))
     ambiguous = dict(_MAKER_TRADE, maker_orders=[
@@ -218,6 +261,7 @@ def test_an_unplaceable_fill_is_left_out_and_counted_out_loud(
     assert r["unmapped"] == 1
     assert _fills() == []
     assert "guess" in (r["note"] or "")
+
 
 
 def _seed(rows):
@@ -253,6 +297,7 @@ def _portfolio(monkeypatch, positions, summaries):
 
 def _pos(cid, *, idx, size, avg, current=0.0, redeemable=True, outcome="Up",
          title="M", cur_price=0.0):
+    """One Data API position, in the shape `get_positions` hands us."""
     return {
         "ticker": cid, "title": title,
         "position_fp": size if idx == 0 else -size,
@@ -277,6 +322,11 @@ def _sum(cid, *, outcomes, resolved, title="M"):
 
 def test_an_engine_placed_fill_still_gives_the_position_a_cost_basis(
         monkeypatch, fresh_db):
+    """origin='external' is what every fill on this wallet was stamped, because
+    the engines do not write terminal_orders rows. Letting origin decide whether
+    a position HAS a basis meant a wallet that had spent $634 showed a cost of
+    nothing. Origin picks which track record a trade counts toward; it never
+    decides whether the money was spent."""
     _seed([{"cid": BTC_UP, "side": "yes", "action": "buy", "size": 33.3333,
             "price": 3.0, "origin": "external"}])
     r = _portfolio(
@@ -292,6 +342,9 @@ def test_an_engine_placed_fill_still_gives_the_position_a_cost_basis(
 
 def test_a_position_our_ledger_cannot_reach_uses_the_venues_own_average(
         monkeypatch, fresh_db):
+    """History older than anything we ever imported. The venue keeps its own
+    average for THIS wallet, so showing "—" for a position we can see the cost
+    of is a worse answer than showing theirs and saying whose it is."""
     r = _portfolio(
         monkeypatch,
         [_pos(BTC_UP, idx=0, size=33.3333, avg=0.0299)],
@@ -319,6 +372,7 @@ def test_with_no_basis_anywhere_it_stays_unknown_and_out_of_the_totals(
     assert r["totalCostUsd"] is None
 
 
+
 @pytest.mark.parametrize("outcomes,label", [
     (["Yes", "No"], "Yes"),
     (["Up", "Down"], "Up"),
@@ -327,6 +381,10 @@ def test_with_no_basis_anywhere_it_stays_unknown_and_out_of_the_totals(
 ])
 def test_holding_the_winning_outcome_reads_as_a_win_in_every_vocabulary(
         monkeypatch, fresh_db, outcomes, label):
+    """`resolvedOutcome` and `side` are BOTH index-derived, so this comparison
+    means the same thing on a Yes/No, an Up/Down, a total and a named-team
+    market. It is also the reason the settled badge can say "settled won"
+    without the label text ever entering the arithmetic."""
     r = _portfolio(
         monkeypatch,
         [_pos(BTC_UP, idx=0, size=10, avg=0.40, current=10.0, outcome=label,
@@ -356,6 +414,8 @@ def test_holding_the_losing_outcome_reads_as_a_loss_not_as_missing_data(
 
 def test_an_unread_outcome_stays_unknown_rather_than_becoming_a_loss(
         monkeypatch, fresh_db):
+    """`resolvedOutcome == side` is false for BOTH a loss and an outcome we
+    could not read, and only one of those is a claim we are entitled to make."""
     r = _portfolio(
         monkeypatch,
         [_pos(BTC_UP, idx=0, size=10, avg=0.4, current=4.0, cur_price=0.4)],
@@ -366,8 +426,13 @@ def test_an_unread_outcome_stays_unknown_rather_than_becoming_a_loss(
     assert p["markCents"] == 40.0, "still a mark, not a settlement"
 
 
+
 def test_a_worthless_resolved_position_is_not_advertised_as_redeemable(
         monkeypatch, fresh_db):
+    """Straight from the wallet that reported this: 105 expired losers, every
+    single one flagged `redeemable: true` by Polymarket with `currentValue: 0`,
+    and the page told the user all 105 were "ready to redeem — claim them to
+    turn them back into cash". Total claimable: $0.00."""
     r = _portfolio(
         monkeypatch,
         [_pos(BTC_UP, idx=0, size=33.3333, avg=0.0299, current=0.0,
@@ -394,6 +459,8 @@ def test_a_won_unredeemed_position_really_is_redeemable(monkeypatch, fresh_db):
 
 def test_a_redeemable_flag_with_no_readable_value_is_unknown_not_a_claim(
         monkeypatch, fresh_db):
+    """We cannot see what it is worth, so we say neither "claim this" nor "this
+    is worthless" — the badge stays off and the row carries the reason."""
     p = _pos(BTC_UP, idx=0, size=10, avg=0.4, redeemable=True)
     p["cur_price"] = None
     p["_raw"]["currentValue"] = None
@@ -408,7 +475,12 @@ def test_a_redeemable_flag_with_no_readable_value_is_unknown_not_a_claim(
     assert any(u["field"] == "redeemable" for u in row["unknowns"])
 
 
+
 def test_our_settled_pnl_agrees_with_the_venues_cash_pnl(monkeypatch, fresh_db):
+    """The five real positions this bug was diagnosed on, one from each outcome
+    vocabulary. On the live wallet the same arithmetic put our settled P&L at
+    -$633.79 against Polymarket's -$633.96 across 105 positions — the gap is
+    entry fees, which their `avgPrice` excludes and our ledger price does too."""
     rows = [
         (BTC_UP, 0, 33.3333, 0.0299, "Up", ["Up", "Down"]),
         (DOGE_DOWN, 1, 29.9987, 0.16, "Down", ["Up", "Down"]),
@@ -441,7 +513,12 @@ def test_every_position_carries_the_venues_own_pnl_for_comparison(
     assert p["settledPnlUsd"] == pytest.approx(p["venueCashPnlUsd"], abs=0.01)
 
 
+
 def test_a_position_no_longer_claims_an_origin(monkeypatch, fresh_db):
+    """Every fill on this wallet was stamped 'external' — the engines write no
+    terminal_orders rows — so the Positions and Fill-ledger tables labelled all
+    1,502 of the user's own trades "Placed elsewhere". The column is gone; the
+    DB column stays, because who placed an order is still worth recording."""
     _seed([{"cid": BTC_UP, "side": "yes", "action": "buy", "size": 10,
             "price": 40.0, "origin": "external"}])
     r = _portfolio(
@@ -453,6 +530,8 @@ def test_a_position_no_longer_claims_an_origin(monkeypatch, fresh_db):
 
 
 def test_the_fill_ledger_counts_every_origin_towards_the_basis(fresh_db):
+    """One market, bought by the crypto engine and by hand. Average cost is
+    across BOTH, because both spent the same balance."""
     _seed([
         {"cid": BTC_UP, "side": "yes", "action": "buy", "size": 10,
          "price": 40.0, "origin": "external"},

@@ -14,3 +14,4 @@ export const KRYPT_YOUTUBE_GUIDE = 'https://youtu.be/O0fl_G6eSrw';
 export const REFERRAL_BLURB =
   'Sign up with our link, deposit $20, and place your first trade — Polymarket ' +
   'offers new users up to $50 in trading credits (its current offer; terms set by Polymarket).';
+

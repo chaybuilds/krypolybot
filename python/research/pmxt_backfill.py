@@ -1,3 +1,23 @@
+"""PMXT r2v2 archive -> BTC 15m top-of-book backfill + momentum OOS validation.
+
+Fills our #1 data gap: months of REAL CLOB books for the exact windows the
+live BTC momentum probe trades, from the public PMXT archive
+(https://r2v2.pmxt.dev/polymarket_orderbook_YYYY-MM-DDTHH.parquet, CC-BY 4.0).
+Every price_change event is stamped with best_bid/best_ask, and files are
+sorted by (market, asset_id, timestamp), so a market-filtered remote DuckDB
+query prunes row groups and returns a 5s top-of-book grid cheaply.
+
+Known gotchas (verified 2026-07-16): `market` is BLOB — compare via
+market::VARCHAR; Gamma serves these expired windows ONLY with closed=true;
+fee_rate_bps in the archive is 0/unreliable — fee model stays 0.07*P*(1-P).
+
+Subcommands:
+  backfill --start 2026-04-29 --end 2026-06-14   # meta + ticks into sqlite
+  simulate                                        # momentum gate + honest fills
+
+Everything lands in research/data/pmxt_btc15m.db (window meta, 5s ticks,
+per-hour progress for resume). Read-only against the app's own data.
+"""
 from __future__ import annotations
 
 import argparse
@@ -32,7 +52,7 @@ def db() -> sqlite3.Connection:
         open_epoch INTEGER PRIMARY KEY, cid TEXT, up_token TEXT, down_token TEXT,
         up_won INTEGER, slug TEXT, missing INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS ticks (
-        open_epoch INTEGER, ts INTEGER, side TEXT,
+        open_epoch INTEGER, ts INTEGER, side TEXT,  -- 'up'/'down'
         best_bid REAL, best_ask REAL,
         PRIMARY KEY (open_epoch, ts, side));
     CREATE TABLE IF NOT EXISTS hours_done (hour TEXT PRIMARY KEY, status TEXT);

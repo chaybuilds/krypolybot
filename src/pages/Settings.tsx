@@ -1,14 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
-import { RefreshCw, RotateCcw } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { ArrowRight, Compass, PlayCircle, RefreshCw, RotateCcw, Sparkles } from 'lucide-react';
 import type { TraderConfig } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
-import type { AiProvider, AiStatus, TerminalHealth } from '@shared/market';
+import type { TerminalHealth } from '@shared/market';
+import type { PageId } from '../App';
 import { Card, Page, Section, Switch } from '../components/common';
-import { CommitInput, Val } from '../components/terminal/TerminalBits';
+import { Val } from '../components/terminal/TerminalBits';
+import { AccountModePanel } from '../components/AccountModePanel';
+import { AiSettings } from '../components/AiSettings';
+import { GlassSegmented } from '../components/glass/GlassSegmented';
+import { useGuide } from '../components/tour/useTour';
+import {
+  glassQualityState, setGlassQuality, subscribe as subscribeGlass,
+  type GlassQuality, type GlassQualityState,
+} from '../components/glass/glassQuality';
 import { cls } from '../utils/format';
 
-export function SettingsPage() {
+export function SettingsPage({ onNav }: { onNav?: (p: PageId) => void } = {}) {
   const { config, refresh, state, backend } = useApp();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
@@ -33,8 +42,15 @@ export function SettingsPage() {
   return (
     <Page
       title="Settings"
-      subtitle="App-level preferences: startup behavior, notifications, and data. Each trading engine has its own page and its own on/off switch — Main Engine (whales + momentum), Crypto, Copy Trading, and Scripts."
+      subtitle="App-level preferences: Paper | Live, the AI provider, startup behavior, notifications, and data. Each trading engine has its own page and its own on/off switch — Main Engine (whales + momentum), Crypto, Copy Trading, Perps and Scripts."
     >
+      <Section
+        title="Account"
+        description="Paper | Live for the whole app. Paper is the default and needs no wallet; Live is a deliberate checklist."
+      >
+        <AccountModePanel onNav={onNav} />
+      </Section>
+
       <Section
         title="Backend"
         description="The Python process every engine runs inside. Restarting it stops and restarts ALL of them — it is not scoped to any single engine, which is why it lives here rather than on an engine page."
@@ -55,6 +71,17 @@ export function SettingsPage() {
             </div>
           </div>
         </Card>
+      </Section>
+
+      <Section
+        title="Appearance"
+        description="How the glass renders. Live bends and frosts the page behind it; Frost keeps the look without the bending, for slower machines. Auto uses Live and steps down by itself if this machine can't hold its frame rate."
+      >
+        <GlassQualityCard />
+      </Section>
+
+      <Section title="Getting started">
+        <GettingStartedCard />
       </Section>
 
       <Section title="App preferences">
@@ -93,42 +120,37 @@ export function SettingsPage() {
             checked={config.terminalNotifications !== false}
             onChange={(v) => void update('terminalNotifications', v)}
           />
-          <div className="my-4 border-t border-krypt-border" />
-          <Switch
-            label="Paper trading — simulate orders instead of placing them"
-            description="Fills are walked out of the REAL order book at the price you would actually have got, with the real fees. Nothing reaches the exchange and no wallet is needed. Paper figures live on Track -> Paper and are never mixed into your real P&L."
-            checked={!!config.terminalPaperMode}
-            onChange={(v) => void update('terminalPaperMode', v)}
-          />
-          {config.terminalPaperMode && (
-            <>
-              <div className="mt-3 rounded-lg border border-krypt-pink/30 bg-krypt-pink/5 p-3 text-xs text-krypt-pink">
-                Paper mode is on. The order ticket is labelled PAPER, and the
-                backend refuses a live order outright while this is set — so a
-                stale screen cannot spend real money behind your back.
-              </div>
-              <label className="mt-3 block max-w-xs">
-                <span className="text-[11px] text-krypt-dim">Starting bankroll (USD)</span>
-                <CommitInput
-                  type="number" min={1}
-                  value={config.terminalPaperBankrollUsd ?? 1000}
-                  onCommit={(raw) => {
-                    const n = Number(raw);
-                    if (Number.isFinite(n) && n >= 1) void update('terminalPaperBankrollUsd', n);
-                  }}
-                  className="mt-0.5 w-full rounded-lg border border-krypt-border bg-krypt-surface px-2 py-1.5 font-mono text-sm text-white focus:border-krypt-purple/50 focus:outline-none"
-                />
-                <span className="mt-1 block text-[11px] text-krypt-dim">
-                  Changing this re-bases the return figure; it does not alter
-                  any simulated fill you have already taken.
-                </span>
-              </label>
-            </>
-          )}
+          <p className="mt-3 text-[11px] text-krypt-dim">
+            Paper or real money for the ticket follows the account mode at the top of this page:
+            in Paper the ticket is labelled PAPER and the backend refuses a live order outright,
+            so a stale screen cannot spend real money behind your back.
+          </p>
         </Card>
       </Section>
 
-      <AiAnalysisSettings config={config} update={update} />
+      <AiSettings config={config} update={update} />
+
+      <Section
+        title="Autopilot"
+        description="Runs one of your agents on a schedule with the AI provider above."
+      >
+        <Card>
+          <div className="flex flex-wrap items-center gap-3">
+            <Sparkles className="h-4 w-4 text-krypt-purple" />
+            <div className="min-w-0 flex-1 text-xs text-krypt-muted">
+              Autopilot is {config.autopilotEnabled
+                ? <span className="text-white">on</span>
+                : 'off'}. It lives with your agents — its schedule, budget, mission and runs are on
+              the AI Agents page, next to the rails and approvals that bind it.
+            </div>
+            {onNav && (
+              <button type="button" className="krypt-btn-default text-xs" onClick={() => onNav('agents')} data-testid="settings-open-autopilot">
+                Open AI Agents <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </Card>
+      </Section>
 
       <DataPrivacy
         offline={!!config.terminalOfflineMode}
@@ -137,187 +159,6 @@ export function SettingsPage() {
 
       <DangerZone busy={busy} setBusy={setBusy} />
     </Page>
-  );
-}
-
-function AiAnalysisSettings({
-  config, update,
-}: {
-  config: TraderConfig;
-  update: <K extends keyof TraderConfig>(k: K, v: TraderConfig[K]) => Promise<void>;
-}) {
-  const toast = useToast();
-  const [status, setStatus] = useState<AiStatus | null>(null);
-  const [draft, setDraft] = useState('');
-  const [models, setModels] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-
-  const provider: AiProvider = config.aiProvider ?? 'anthropic';
-  const modelKey = provider === 'anthropic' ? 'aiAnthropicModel' : 'aiOpenaiModel';
-  const model = (config[modelKey] as string | undefined) ?? '';
-
-  const load = () => { void window.krypt.ai.status().then(setStatus).catch(() => {}); };
-  useEffect(load, []);
-  useEffect(() => { setModels([]); setDraft(''); }, [provider]);
-
-  const saveKey = async () => {
-    setBusy(true);
-    try {
-      const r = await window.krypt.ai.setKey(provider, draft.trim());
-      if (!r.ok) { toast.error(r.message); return; }
-      toast.success(r.message);
-      setDraft('');
-      setModels(r.models ?? []);
-      load();
-    } finally { setBusy(false); }
-  };
-
-  const loadModels = async () => {
-    setBusy(true);
-    try {
-      const r = await window.krypt.ai.listModels(provider);
-      if (!r.ok) { toast.error(r.message ?? 'Could not load models.'); return; }
-      setModels(r.models);
-      toast.success(`${r.models.length} models available.`);
-    } finally { setBusy(false); }
-  };
-
-  const stored = status?.keys?.[provider];
-
-  return (
-    <Section
-      title="AI analysis"
-      description="Have a language model read a market's resolution rules on the Market page — what it turns on, the traps in the wording, and what it does not know. Off by default, on demand only, and billed to your own provider account."
-    >
-      <Card>
-        <Switch
-          label="Enable AI analysis"
-          description="Adds a 'Read this market' button to every market page. Nothing runs on a timer — each click is one request you pay your provider for."
-          checked={!!config.aiEnabled}
-          onChange={(v) => void update('aiEnabled', v)}
-        />
-
-        <div className="my-4 border-t border-krypt-border" />
-
-        <div className="rounded-lg border border-krypt-border bg-krypt-surface2/40 p-3 text-xs text-krypt-muted">
-          <div className="mb-1 font-medium text-white">What leaves this machine</div>
-          The market&rsquo;s question, its published rules text, the current
-          quote, volume and close time — public data anyone can read on
-          Polymarket. <strong className="text-white">Never your wallet, your
-          positions, your cost basis or your orders.</strong> Both provider
-          hosts appear in Data &amp; privacy below with live call counts, and
-          the offline switch there stops them like every other host.
-        </div>
-
-        <div className="mt-3 rounded-lg border border-krypt-border bg-krypt-surface2/40 p-3 text-xs text-krypt-muted">
-          <div className="mb-1 font-medium text-white">What it will not tell you</div>
-          A probability, a fair value, or an edge in cents. The model is never
-          asked for one and the response format gives it nowhere to put one. It
-          returns a direction — looks cheap / rich / about right / no view —
-          with the reasoning behind it. A number from a language model has no
-          calibration behind it and would read as authority it has not earned.
-        </div>
-
-        <div className="mt-4 grid gap-3 md:grid-cols-2">
-          <label className="block">
-            <span className="text-[11px] text-krypt-dim">Provider</span>
-            <select
-              value={provider}
-              onChange={(e) => void update('aiProvider', e.target.value as AiProvider)}
-              className="mt-0.5 w-full rounded-lg border border-krypt-border bg-krypt-surface px-2 py-1.5 text-sm text-white focus:border-krypt-purple/50 focus:outline-none"
-            >
-              <option value="anthropic">Anthropic (Claude)</option>
-              <option value="openai">OpenAI</option>
-            </select>
-          </label>
-
-          <label className="block">
-            <span className="text-[11px] text-krypt-dim">Model</span>
-            <div className="mt-0.5 flex gap-2">
-              {models.length > 0 ? (
-                <select
-                  value={model}
-                  onChange={(e) => void update(modelKey, e.target.value)}
-                  className="min-w-0 flex-1 rounded-lg border border-krypt-border bg-krypt-surface px-2 py-1.5 font-mono text-xs text-white focus:border-krypt-purple/50 focus:outline-none"
-                >
-                  <option value="">(pick one)</option>
-                  {models.map((m) => <option key={m} value={m}>{m}</option>)}
-                </select>
-              ) : (
-                <CommitInput
-                  value={model}
-                  onCommit={(raw) => void update(modelKey, raw)}
-                  placeholder={provider === 'anthropic' ? 'claude-opus-5' : 'load models to pick'}
-                  className="min-w-0 flex-1 rounded-lg border border-krypt-border bg-krypt-surface px-2 py-1.5 font-mono text-xs text-white focus:border-krypt-purple/50 focus:outline-none"
-                />
-              )}
-              <button
-                onClick={() => void loadModels()}
-                disabled={busy || !stored?.present}
-                title={stored?.present ? undefined : 'Add an API key first.'}
-                className="krypt-btn-default shrink-0 text-xs disabled:opacity-50"
-              >
-                Load
-              </button>
-            </div>
-            <span className="mt-1 block text-[11px] text-krypt-dim">
-              Read from {provider} with your own key, so the list is what that
-              key can actually reach.
-            </span>
-          </label>
-        </div>
-
-        <div className="mt-4">
-          <span className="text-[11px] text-krypt-dim">
-            {provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} API key
-          </span>
-          <div className="mt-0.5 flex flex-wrap gap-2">
-            <input
-              type="password"
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              placeholder={stored?.present ? `stored: ${stored.masked}` : 'sk-…'}
-              className="min-w-0 flex-1 rounded-lg border border-krypt-border bg-krypt-surface px-2 py-1.5 font-mono text-xs text-white focus:border-krypt-purple/50 focus:outline-none"
-            />
-            <button
-              onClick={() => void saveKey()}
-              disabled={busy || !draft.trim()}
-              className="krypt-btn-primary shrink-0 text-xs disabled:opacity-50"
-            >
-              Verify &amp; save
-            </button>
-            {stored?.present && (
-              <button
-                onClick={async () => {
-                  await window.krypt.ai.setKey(provider, '');
-                  toast.info('Key cleared.');
-                  setModels([]);
-                  load();
-                }}
-                disabled={busy}
-                className="krypt-btn-default shrink-0 text-xs disabled:opacity-50"
-              >
-                Clear
-              </button>
-            )}
-          </div>
-          <span className="mt-1 block text-[11px] text-krypt-dim">
-            Stored encrypted, the same way your wallet key is — never in
-            settings.json, and never read back to this screen. Checked against
-            the provider before it is saved, so a typo fails here.
-          </span>
-        </div>
-
-        <div className="my-4 border-t border-krypt-border" />
-
-        <Switch
-          label="Let it search the web"
-          description="Grounds the reading in current sources instead of a training cutoff, which matters most on event markets. Costs extra per search and adds a few seconds. With this off, the panel says plainly that anything recent is outside what the model can see."
-          checked={!!config.aiWebSearch}
-          onChange={(v) => void update('aiWebSearch', v)}
-        />
-      </Card>
-    </Section>
   );
 }
 
@@ -583,4 +424,56 @@ function DangerZone({
       )}
     </>
   );
-}
+}
+
+
+export function GettingStartedCard() {
+  const { replayOnboarding, startTour } = useGuide();
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="min-w-[220px] flex-1">
+          <div className="text-sm font-medium text-white">Setup and tour</div>
+          <div className="text-xs text-krypt-muted">
+            See the first-run setup again, or the tour of every page. Replaying changes nothing
+            unless you act in a step.
+          </div>
+        </div>
+        <button type="button" onClick={startTour} className="krypt-btn-default" data-testid="settings-tour">
+          <Compass className="h-4 w-4" /> Take the tour
+        </button>
+        <button type="button" onClick={replayOnboarding} className="krypt-btn-default" data-testid="settings-replay-onboarding">
+          <PlayCircle className="h-4 w-4" /> Replay onboarding
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function GlassQualityCard() {
+  const [st, setSt] = useState<GlassQualityState>(glassQualityState);
+  useEffect(() => subscribeGlass(() => setSt(glassQualityState())), []);
+  const now = st.reducedTransparency
+    ? 'Frost — your system asks apps to reduce transparency.'
+    : st.quality === 'auto' && st.autoDemoted
+      ? 'Frost — Auto stepped down because this machine could not hold its frame rate with Live glass. Pick Auto again to re-measure.'
+      : st.live ? 'Live glass.' : 'Frost.';
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center gap-4">
+        <GlassSegmented<GlassQuality>
+          value={st.quality}
+          onChange={(q) => setGlassQuality(q)}
+          options={[
+            { value: 'auto', label: 'Auto', title: 'Live, stepping down to Frost only if this machine needs it' },
+            { value: 'live', label: 'Live', title: 'Always the full liquid glass' },
+            { value: 'frost', label: 'Frost', title: 'No refraction: the lightest on the GPU' },
+          ]}
+        />
+        <div className="text-[11px] text-krypt-muted">
+          Now: <span className={st.live ? 'text-sky-300' : 'text-krypt-warn'}>{now}</span>
+        </div>
+      </div>
+    </Card>
+  );
+}

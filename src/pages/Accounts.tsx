@@ -19,7 +19,7 @@ export function AccountsPage() {
       ]);
       setAccounts(list);
       setCurrent(cur);
-    } catch {}
+    } catch { }
   };
 
   useEffect(() => { void reload(); }, []);

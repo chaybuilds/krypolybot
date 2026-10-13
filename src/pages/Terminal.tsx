@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp, useLogs } from '../state/AppStateProvider';
+import { todayPnlOf } from '../utils/balance';
 import type {
   Crypto15mSnapshot, Crypto15mStatus, Crypto15mAsset,
   BotPosition, PnlPoint,
@@ -92,7 +93,7 @@ export function TerminalPage() {
   const gaugeValRef = useRef(gaugeInfo); gaugeValRef.current = gaugeInfo;
 
   const sessionPnl = account?.sessionPnlUsd ?? account?.realizedPnlUsd ?? 0;
-  const todayPnl = account?.todayPnlUsd ?? null;
+  const todayPnl = todayPnlOf(account);
   const allPnl = account?.alltimePnlUsd ?? null;
   const winRate = account?.winRate;
 

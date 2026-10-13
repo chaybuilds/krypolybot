@@ -2,9 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { TitleBar } from './components/TitleBar';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
+import { GlassBackdrop } from './components/glass/GlassBackdrop';
 import { AppStateProvider, useApp } from './state/AppStateProvider';
-import { ToastProvider } from './state/ToastProvider';
-import { OnboardingModal } from './pages/Onboarding';
+import { ToastProvider, useToast } from './state/ToastProvider';
+import { GuideHost } from './components/tour/GuideHost';
+import { PageGuard, usePersistedPage } from './components/PageGuard';
+import { autoOnboarding } from '@shared/onboarding';
+import { agentCallEvent, agentEvent, publishActivity } from './state/activity';
+import { agentOrderMessage, agentOrderToast } from '@shared/agentOrderNotice';
+import { useWindowVisibility } from './state/visibility';
+import { startAmbientClock } from './state/ambient';
+import { kickGlassWatchdog, startGlassWatchdog } from './components/glass/glassQuality';
 import { DashboardPage } from './pages/Dashboard';
 import { MainEnginePage } from './pages/MainEngine';
 import { SettingsPage } from './pages/Settings';
@@ -40,8 +48,9 @@ export type PageId =
   | 'discover' | 'market' | 'track' | 'remote' | 'agents';
 
 export const SIMPLE_PAGES: readonly PageId[] = [
+  'agents', 'visualizer',
   'dashboard', 'strategies', 'positions', 'api', 'settings',
-  'discover', 'market', 'track', 'remote', 'agents', 'guide',
+  'discover', 'market', 'track', 'remote', 'guide',
 ];
 
 export default function App() {
@@ -55,49 +64,73 @@ export default function App() {
 }
 
 function Shell() {
-  const [page, setPage] = useState<PageId>('dashboard');
+  const [page, setPage, onPageCrash] = usePersistedPage();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const { state } = useApp();
+  const toast = useToast();
+  useWindowVisibility();
+  useEffect(() => {
+    startAmbientClock();
+    startGlassWatchdog();
+    const onDemote = (): void => toast.info(
+      'Glass effects switched to Frost to keep the app smooth on this machine. '
+      + 'Change it in Settings → Appearance.');
+    window.addEventListener('krypt:glass-demoted', onDemote);
+    return () => window.removeEventListener('krypt:glass-demoted', onDemote);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => { kickGlassWatchdog(); }, [page]);
 
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   useTerminalHotkeys({ onPalette: openPalette, onNav: setPage });
 
-  const showOnboarding = state ? !state.acceptedDisclaimer : false;
-
   useEffect(() => {
-    if (!state) return;
-    if (!state.acceptedDisclaimer) return;
-  }, [state]);
+    const offOrder = window.krypt.mcp?.onOrder?.((d) => {
+      const message = agentOrderMessage(d);
+      publishActivity(() => agentEvent(message ? { ...d, message } : d));
+      const t = agentOrderToast(d);
+      if (t) toast.push(t.text, t.tone, t.ms);
+    });
+    const offCalls = window.krypt.mcp?.onToolCall?.((d) => publishActivity(() => agentCallEvent(d)));
+    return () => { offOrder?.(); offCalls?.(); };
+  }, [toast]);
 
   const uiMode = state?.uiMode ?? 'advanced';
   const prevMode = useRef(uiMode);
   useEffect(() => {
     if (uiMode === 'simple' && prevMode.current === 'advanced'
         && !SIMPLE_PAGES.includes(page)) {
-      setPage('dashboard');
+      setPage('agents');
     }
     prevMode.current = uiMode;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- transition-only
   }, [uiMode]);
 
+  const auto = autoOnboarding(state);
+
   return (
-    <div className="flex h-full w-full flex-col bg-krypt-radial bg-krypt-void">
-      <TitleBar />
-      <div className="flex h-[calc(100%-2.25rem)] w-full">
-        <Sidebar page={page} setPage={setPage} />
-        <main className="relative flex flex-1 flex-col overflow-hidden">
-          <TopBar />
-          <div className="flex-1 overflow-hidden bg-krypt-radial-r">
-            <PageRouter page={page} setPage={setPage} />
-          </div>
-        </main>
+    <GuideHost needsOnboarding={auto === 'first'} needsUpdateOnboarding={auto === 'update'} setPage={setPage}>
+      <div className="flex h-full w-full flex-col">
+        <GlassBackdrop />
+        <TitleBar />
+        <div className="relative flex h-[calc(100%-2.25rem)] w-full">
+          <Sidebar page={page} setPage={setPage} />
+          <main className="relative flex flex-1 flex-col overflow-hidden">
+            <TopBar onNav={setPage} />
+            <div className="flex-1 overflow-hidden">
+              <PageGuard page={page} setPage={setPage} onCrash={onPageCrash}>
+                <PageRouter page={page} setPage={setPage} />
+              </PageGuard>
+            </div>
+          </main>
+        </div>
+        <CommandPalette
+          open={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          onNav={setPage}
+        />
       </div>
-      {showOnboarding && <OnboardingModal onDone={() => setPage('api')} />}
-      <CommandPalette
-        open={paletteOpen}
-        onClose={() => setPaletteOpen(false)}
-        onNav={setPage}
-      />
-    </div>
+    </GuideHost>
   );
 }
 
@@ -109,7 +142,7 @@ function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => v
     case 'signals': return <SignalsPage />;
     case 'history': return <HistoryPage />;
     case 'profiles': return <ProfilesPage />;
-    case 'settings': return <SettingsPage />;
+    case 'settings': return <SettingsPage onNav={setPage} />;
     case 'api': return <ApiKeysPage />;
     case 'logs': return <LogsPage />;
     case 'guide': return <GuidePage />;
@@ -127,7 +160,7 @@ function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => v
     case 'market': return <MarketPage onNav={setPage} />;
     case 'track': return <TrackPage onNav={setPage} />;
     case 'remote': return <RemotePage />;
-    case 'agents': return <AiAgentsPage />;
-    default: return <DashboardPage onNav={setPage} />;
+    case 'agents': return <AiAgentsPage onNav={setPage} />;
+    default: return <AiAgentsPage onNav={setPage} />;
   }
 }

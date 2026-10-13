@@ -1,3 +1,10 @@
+"""Cross-process wallet mutual-exclusion lock (instance_lock).
+
+Two accounts importing the SAME wallet key would otherwise trade one on-chain
+wallet concurrently. The lock lets the first backend claim the wallet by address;
+a live sibling on the same address is told to back off until the holder exits
+(or its heartbeat goes stale).
+"""
 from __future__ import annotations
 
 import instance_lock as il

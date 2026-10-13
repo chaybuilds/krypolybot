@@ -1,3 +1,12 @@
+"""Whale + momentum scanners.
+
+Both scanners share market sync, trade insertion, and category
+resolution. Each scan cycle inserts new alerts/whales into the DB and
+returns counts so the runner can surface them on the UI.
+
+The scoring functions are direct ports of the originals (calibrated on
+22k+ resolved Polymarket whale trades and 5k+ momentum clusters).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +43,33 @@ def _to_float(v) -> float:
         return 0.0
 
 
+def _trade_time(ts) -> str | None:
+    """A trade's own time as a `created_at` value ('YYYY-MM-DD HH:MM:SS' UTC,
+    the column's own format), or None to let the row default to now.
+
+    Rows built from the trade tape carry the time the trade happened, not the
+    time we saw it: the REST page can be minutes old, and a row stamped "now"
+    reads as fresh to the signal age gate and on the Signals page. Epoch
+    milliseconds are accepted; a missing, zero or future time is not a time.
+
+    The age gate compares against THIS machine's clock, so the server's trade
+    time is moved onto it with the offset measured at sign-in: a PC clock
+    running minutes fast would otherwise age every whale, the socket's ~1s-old
+    ones included, past the gate."""
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if t > 1e11:
+        t /= 1000.0
+    if t <= 0:
+        return None
+    t -= polymarket_api.auth.get_time_offset()
+    if t > datetime.now(timezone.utc).timestamp() + 60:
+        return None
+    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _parse_days_to_close(close_time: str) -> float | None:
     if not close_time:
         return None
@@ -49,8 +85,10 @@ def _parse_days_to_close(close_time: str) -> float | None:
     return None
 
 
+
 async def _resolve_category(ticker: str, title: str = "", event_slug: str = "") -> str:
     return categorize_by_keywords(title, slug=event_slug)
+
 
 
 def compute_whale_score(
@@ -63,6 +101,7 @@ def compute_whale_score(
     days_to_close: float | None = None,
     category: str = "",
 ) -> float:
+    """Empirically-derived edge over market-implied probability."""
     implied = max(5, min(price * 100, 95))
     edge = 0.0
     if taker_side == "yes":
@@ -165,7 +204,19 @@ def compute_momentum_confidence(
     return max(5, min(round(implied + edge, 1), 97.0))
 
 
+
 def _write_markets_blocking(raw: list, now_iso: str) -> int:
+    """Filter + upsert the market universe. Runs in a WORKER THREAD.
+
+    ~1,000 synchronous `upsert_market` calls in one write transaction is tens
+    of milliseconds of blocking sqlite work, and on the event loop that is dead
+    time for every other engine in the master loop. sqlite3 connections are
+    per-thread here (`db.get_db()` connects on entry with the default
+    `check_same_thread=True`), so the connection is opened INSIDE this function
+    — i.e. on the thread that uses it — and closed before it returns. The whole
+    universe still lands in ONE transaction, so a reader never sees a half-
+    written market table.
+    """
     count = 0
     with db.get_db() as conn:
         for m in raw:
@@ -236,7 +287,16 @@ async def sync_events() -> int:
     return count
 
 
+
 def whale_candidate(t: dict, cfg: dict) -> dict | None:
+    """Is ONE normalised trade a whale? Returns the enriched candidate or None.
+
+    The size/entry/micro-market gate for BOTH sources: the 120s REST poll and
+    the activity-websocket push run the same trade dict through this, so the
+    socket can never admit a trade the poll would have rejected (or vice
+    versa). Cheap and synchronous — the socket handler calls it inline on every
+    frame before it spends a task on one.
+    """
     if not isinstance(t, dict):
         return None
     min_usd = float(cfg.get("min_whale_usd", 2500))
@@ -265,7 +325,22 @@ def whale_candidate(t: dict, cfg: dict) -> dict | None:
 
 
 async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
-    raw = await polymarket_api.fetch_recent_trades(limit=1000)
+    """Scan recent trades for whale-sized takers and insert new whales.
+
+    Returns (count, new_rows) where `new_rows` are the freshly-inserted
+    DB rows (used for live-pushing them up to the UI).
+
+    This is the RECONCILIATION BACKSTOP for the activity-websocket push (see
+    `process_whale_trades`): same cadence as ever, and the socket's inserts are
+    invisible to it beyond `whale_trade_exists` returning True for a trade it
+    already wrote.
+
+    It asks for whale-sized trades only. An unfiltered page is the last ~30-50
+    seconds of all trading, so a 120s poll saw a sliver of each interval and
+    missed most whales the socket did not catch.
+    """
+    raw = await polymarket_api.fetch_recent_trades(
+        limit=1000, min_size=float(cfg.get("min_whale_usd", 2500)))
     if not raw:
         return 0, []
     return await process_whale_trades(cfg, raw)
@@ -274,6 +349,14 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
 async def process_whale_trades(
     cfg: dict, raw: list[dict]
 ) -> tuple[int, list[dict]]:
+    """Score + insert whales from a batch of ALREADY-NORMALISED trades.
+
+    The one place a whale row is ever written. The REST poll passes its 1,000
+    trades; the activity websocket passes a batch of one, ~1s after execution
+    instead of up to 120s later. Identical scoring, identical row, and the
+    `trade_id` dedupe (`whale_trade_exists` + the UNIQUE index) makes whichever
+    source arrives second a no-op.
+    """
     candidates: list[dict] = []
     for t in raw or []:
         c = whale_candidate(t, cfg)
@@ -395,6 +478,7 @@ async def process_whale_trades(
                 "market_volume": mkt_vol,
                 "open_interest": oi,
                 "confidence": confidence,
+                "created_at": _trade_time(entry["raw"].get("timestamp")),
             }
             wid = db.insert_whale_trade(conn, data)
             if wid:
@@ -405,6 +489,7 @@ async def process_whale_trades(
                     new_rows.append(dict(row))
 
     return len(new_rows), new_rows
+
 
 
 async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
@@ -458,8 +543,8 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 continue
 
             vol_24h = _to_float(market.get("volume_24h", 0))
-            cur_price = _to_float(market.get("yes_bid", 0)) or _to_float(
-                market.get("last_price", 0)
+            cur_price = _to_float(market.get("last_price", 0)) or _to_float(
+                market.get("yes_bid", 0)
             )
             oi = _to_float(market.get("open_interest", 0))
             close_time = market.get("close_time", "")
@@ -468,7 +553,7 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
             prev = prev_snaps.get(ticker)
             prev_vol = _to_float(prev.get("volume_24h", 0)) if prev else 0
             prev_price = (
-                _to_float(prev.get("yes_bid", 0) or prev.get("last_price", 0))
+                _to_float(prev.get("last_price", 0) or prev.get("yes_bid", 0))
                 if prev
                 else 0
             )
@@ -479,6 +564,8 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
             price_change = (cur_price - prev_price) if prev_price > 0 else 0
 
             ticker_trades = trades_by_ticker.get(ticker, [])
+            cluster_at = _trade_time(max(
+                (_to_float(t.get("timestamp")) for t in ticker_trades), default=0))
             yes_trades = [t for t in ticker_trades if t.get("taker_side") == "yes"]
             no_trades = [t for t in ticker_trades if t.get("taker_side") == "no"]
             yes_count = len(yes_trades)
@@ -577,6 +664,7 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                     "price": cur_price,
                     "price_change": price_change * 100,
                     "confidence": confidence,
+                    "created_at": cluster_at if stype == "trade_cluster" else None,
                 }
                 alert_id = db.insert_alert(conn, alert_data)
                 row = conn.execute(
@@ -588,7 +676,9 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
     return len(new_alerts), new_alerts
 
 
+
 async def resolve_alerts_from_markets() -> int:
+    """Mark resolved alerts based on market settlement values."""
     with db.get_db() as conn:
         unresolved = db.get_unresolved_alerts(conn, days=30)
     if not unresolved:

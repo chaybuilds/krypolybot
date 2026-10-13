@@ -1,3 +1,10 @@
+"""Settlement sniper (model direction mode) — the terminal-spot model, its
+fee-net edge math, the should_enter gates (incl. final-minute), the Wilson
+calibration guard, and the replay harness that backtests it all.
+
+The model is interval-agnostic by construction: every test that exercises
+time uses minutes-left values from the 5m, 15m, AND hourly regimes.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +19,7 @@ import replay
 import rtds_ws
 import spot_ws
 from config import merge_with_defaults
+
 
 
 def test_model_up_prob_sides_and_bounds():
@@ -60,6 +68,7 @@ def test_sigma1m_needs_history_and_measures_vol():
     assert flat == pytest.approx(0.0)
     wiggly = indicators.sigma1m([100.0 + (i % 2) for i in range(40)])
     assert wiggly and wiggly > 0.001
+
 
 
 def _model_cfg(**over) -> dict:
@@ -137,6 +146,7 @@ def test_perfect_record_never_pauses_and_can_resume():
     assert c15t._wilson_lb(36, 40) < c15t._CAL_PAUSE_LB
 
 
+
 def test_window_open_rejected_when_first_seen_late():
     crypto15m._window_open.clear()
     start = 1_790_000_000
@@ -178,6 +188,7 @@ def test_sample_at_tolerance_and_miss():
     assert c.sample_at("ETH", 1_000_000) is None
 
 
+
 def test_divergence_guard_blocks_too_good_midwindow_edge():
     a = _asset(modelProb=0.999, upAsk=0.50, downAsk=0.52, edgeNetCents=48.0,
                minsLeft=3.0)
@@ -199,6 +210,7 @@ def test_divergence_guard_blocks_paired_too():
     a = _asset(modelProb=0.95, upAsk=0.50, downAsk=0.48)
     ok, why = c15t.should_enter(a, _paired_cfg(), has_open=False, open_count=0)
     assert not ok and "disagrees" in why
+
 
 
 def test_paired_tilt_ladder():
@@ -256,6 +268,18 @@ def test_paired_entry_blocked_in_final_minute_and_without_both_asks():
     a2 = _asset(modelProb=0.60, upAsk=0.50, downAsk=None)
     ok2, why2 = c15t.should_enter(a2, _paired_cfg(), has_open=False, open_count=0)
     assert not ok2 and "BOTH sides" in why2
+
+
+def test_paired_refuses_the_strikes_model_mode_refuses():
+    a = _asset(modelProb=0.60, upAsk=0.50, downAsk=0.48)
+    for src in ("spot", "binance-spot-proxy"):
+        ok, why = c15t.should_enter({**a, "strikeSource": src}, _paired_cfg(),
+                                    has_open=False, open_count=0)
+        assert not ok and "approximate" in why, src
+    for src in crypto15m.STRIKE_SOURCES_OK:
+        ok, why = c15t.should_enter({**a, "strikeSource": src}, _paired_cfg(),
+                                    has_open=False, open_count=0)
+        assert ok, (src, why)
 
 
 def test_strength_exit_eligibility():
@@ -339,6 +363,7 @@ def test_non_model_modes_still_blocked_from_final_minute_entries():
     assert not ok
 
 
+
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
     dbfile = tmp_path / "model-test.db"
@@ -348,6 +373,8 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _seed_windows(n_wins: int, n_losses: int) -> None:
+    """Seed resolved windows where the model was sniper-confident UP; wins
+    settle up, losses settle down."""
     with db.get_db() as conn:
         for i in range(n_wins + n_losses):
             tk = f"W{i}"
@@ -403,6 +430,21 @@ def test_model_entry_blocked_when_calibration_paused(fresh_db):
     c15t._CAL_CACHE.update({"at": 0.0, "ok": True})
 
 
+def test_paired_entry_blocked_when_calibration_paused(fresh_db):
+    c15t._CAL_CACHE.update({"at": 0.0, "ok": True})
+    _seed_windows(n_wins=25, n_losses=15)
+    a = _asset(modelProb=0.60, upAsk=0.50, downAsk=0.48)
+    try:
+        ok, why = c15t.should_enter(a, _paired_cfg(crypto15mModelAutopause=True),
+                                    has_open=False, open_count=0)
+        assert not ok and "calibration degraded" in why
+        ok2, why2 = c15t.should_enter(a, _paired_cfg(), has_open=False, open_count=0)
+        assert ok2, why2
+    finally:
+        c15t._CAL_CACHE.update({"at": 0.0, "ok": True})
+
+
+
 def test_spot_ws_parses_ticker_and_serves_fresh():
     c = spot_ws._Client()
     c.connected = True
@@ -443,6 +485,7 @@ def test_spot_ws_sampler_one_print_per_second_and_window_partial():
     assert count == 2 and total == pytest.approx(201.0)
     total2, count2 = c.window_partial("BTC", now - 120, now=now + 2)
     assert count2 == 0
+
 
 
 def _rtds_update(symbol: str, value, ts_ms: int = 1_783_117_568_000) -> dict:
@@ -517,9 +560,14 @@ def test_overlay_prefers_rtds_then_coinbase_then_rest(monkeypatch):
     crypto15m._spot_cache.update(at=0.0, spots={}, source="")
 
 
+
 def _seed_replay_window(ticker: str, up_won: int, *, model_prob=0.99,
                         edge=5.0, yes_ask=0.90, mins_left=4.0,
                         spot_source="coinbase-ws", up_ask=None) -> None:
+    """Seed one resolved window with a single tick. `up_ask` mirrors the
+    recorder's REAL-book-only column; it defaults to yes_ask (live book was
+    up) — pass up_ask=... explicitly (or None via sentinel below) to model a
+    Gamma-fallback tick with no executable up quote."""
     if up_ask is None:
         up_ask = yes_ask
     elif up_ask == "gamma":
@@ -593,6 +641,10 @@ def test_replay_one_trade_per_window(fresh_db):
 
 
 def test_replay_refuses_phantom_gamma_book(fresh_db):
+    """A tick whose yes_ask is the Gamma-fallback mid (CLOB WS cold: no
+    up_ask, no ws_ask) must NOT fill — live can't trade a phantom quote.
+    This is the 2026-07 paired/sniper backtest bug: Gamma sits 20-67c off
+    the real book near close, so phantom fills flattered every strategy."""
     cfg = _model_cfg()
     _seed_replay_window("RW6", up_won=1, up_ask="gamma")
     res = replay.replay(cfg, env="mainnet", since_days=60)
@@ -642,6 +694,7 @@ def test_fm_gap_cap_configurable_off():
         has_open=False, open_count=0,
     )
     assert ok, why
+
 
 
 def _pb(channel, symbol, value, ts_ms, *, snapshot=False, source=None):

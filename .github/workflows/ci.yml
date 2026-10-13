@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release-*']
   pull_request:
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -29,6 +30,9 @@ jobs:
 
       - name: Renderer unit tests
         run: npm run test:unit
+
+      - name: Vitest
+        run: npm test
 
       - name: Vite build
         run: npm run build

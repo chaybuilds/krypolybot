@@ -10,6 +10,7 @@ MIN_MINS_LEFT = 1.5
 CASH_BUFFER = 0.25
 
 
+
 def on_start(state):
     state.setdefault("attempts", 0)
     state.setdefault("filled", 0)

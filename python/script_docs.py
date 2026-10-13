@@ -1,3 +1,9 @@
+"""The AI context pack: everything an external AI (ChatGPT/Claude/Gemini/…)
+needs to write a valid Krypt strategy script, rendered as one copy-paste
+prompt. Generated python-side so the field vocabulary, rails, and the user's
+actual data inventory can never drift from what the engine/backtester really
+do — the doc is rendered FROM those modules, not maintained by hand.
+"""
 from __future__ import annotations
 
 import db as dbmod
@@ -136,10 +142,11 @@ decide / decide_market / manage / decide_signal / supervise):
         #   hoursToClose — hours until settlement (None if unknown). Gate on
         #     this: many markets priced 90-99c are long-dated futures, so
         #     "hold to settlement" can mean months of locked capital.
-        #   spreadCents  — None unless the row carries a real two-sided book,
-        #     which the market list usually does NOT. The real spread is
-        #     enforced at submit by the "Max spread" rail at the top of this
-        #     page (script_market_max_spread_cents, default 2c, 0 = off).
+        #   spreadCents  — the spread at the last market sync (a few minutes
+        #     old at most); None when that book was one-sided or empty. The
+        #     live spread is enforced at submit by the "Max spread" rail at
+        #     the top of this page (script_market_max_spread_cents, default
+        #     2c, 0 = off).
         #   volume24h    — prefer over `volume` (lifetime) to find LIVE events.
         # NOTE: decide_market() is NOT simulated in backtests (the recorded
         # corpus only covers crypto windows) — use SHADOW mode to validate it.
@@ -437,6 +444,8 @@ PRESETS: list[dict] = [
 
 
 def _inventory(env: str) -> str:
+    """The user's actual recorded-data inventory, so the AI knows what a
+    backtest can even see."""
     lines: list[str] = []
     try:
         with dbmod.get_db() as conn:

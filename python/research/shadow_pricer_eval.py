@@ -1,3 +1,29 @@
+"""Phase 0 shadow-pricer evaluation (DEV-ONLY, never bundled).
+
+Answers one question on recorded data: does the existing Gaussian terminal-spot
+model (crypto15m.model_up_prob) carry a persistent, fee-surviving edge against the
+REAL CLOB book — or is the 15m/5m market efficiently priced?
+
+Reads recorded ticks read-only (no DB writes, no network, stdlib only). Joins
+crypto15m_ticks (per-~25s model_prob + real up_ask/no_ask across the whole
+window) to crypto15m_signals.up_won (settled outcome) on ticker.
+
+Three measurements, each labelled in/out-of-sample:
+  1. Calibration of the Gaussian model (Brier, log-loss, confidence->win table),
+     both per-tick and market-balanced (each market weighted equally, the way the
+     sibling Kalshi fair-value study did it).
+  2. Model-vs-book edge -> realized P&L: one entry per market at the FIRST tick
+     whose model edge (model prob vs the real ask, net of the crypto v2 taker
+     fee) clears a threshold, filled at that real ask, held to settlement. This
+     is the honest replay convention (real-book-only, no phantom Gamma fills; no
+     slippage/miss modelling -- a caveat, so live is a CEILING on this).
+  3. Walk-forward: markets sorted by close time into sequential folds, so a
+     positive edge in early folds can be checked for persistence in later ones.
+
+Usage:
+  python research/shadow_pricer_eval.py [--db PATH] [--interval 15m|5m|hourly|all]
+                                        [--folds N] [--late-mins M]
+"""
 from __future__ import annotations
 
 import argparse
@@ -102,7 +128,9 @@ def calibration(rows: list[dict]) -> dict:
     }
 
 
+
 def _side_edges(mp: float, up_ask, no_ask) -> dict:
+    """cents of fee-net model edge per side, with the entry cost (ask fraction)."""
     out = {}
     if up_ask and 0 < up_ask < 1:
         out["up"] = (mp * 100.0 - up_ask * 100.0 - fee_cents(up_ask), float(up_ask))
@@ -112,6 +140,8 @@ def _side_edges(mp: float, up_ask, no_ask) -> dict:
 
 
 def _first_qualifying_trade(ticks: list[dict], thresh: float, late_mins: float | None):
+    """FIRST tick (chronological) whose best side edge >= thresh -> one trade,
+    filled at that side's real ask, settled vs up_won. None if no tick qualifies."""
     for r in ticks:
         if late_mins is not None and (r["mins_left"] is None or float(r["mins_left"]) > late_mins):
             continue
@@ -176,6 +206,7 @@ def walkforward(rows: list[dict], thresh: float, folds: int, late_mins) -> list[
         res["window"] = f"{str(mkt_close[ordered[lo]])[:10]}..{str(mkt_close[ordered[hi-1]])[:10]}"
         out.append(res)
     return out
+
 
 
 def money(x: float) -> str:

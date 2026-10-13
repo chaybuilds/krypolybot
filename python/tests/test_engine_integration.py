@@ -1,3 +1,18 @@
+"""DB-backed integration tests for the trading engine.
+
+These exercise the three functions where the nastiest historical bugs
+lived (per trader.py's comments): order placement + the entry gates
+(`execute_signal`), the reconcile/poll state machine (`poll_open_orders`),
+and settlement P&L (`mark_resolved_positions`).
+
+Strategy:
+  - Real `db` module against a fresh temp SQLite file per test (so the
+    actual schema + queries are under test, not a mock of them).
+  - Every Polymarket network call is stubbed. trader.py imports these names
+    into its own module namespace (`from polymarket_api import place_limit_order`),
+    so the stubs are installed on the `trader` module, not on `polymarket_api`.
+  - The engine functions are async; we drive them with `asyncio.run`.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,8 +27,10 @@ from config import merge_with_defaults
 from polymarket_api import PolymarketAPIError
 
 
+
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
+    """Point db.get_db() at a brand-new SQLite file and create the schema."""
     dbfile = tmp_path / "krypt-test.db"
     monkeypatch.setattr(db, "db_path", lambda: dbfile)
     db.init_db()
@@ -22,13 +39,14 @@ def fresh_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def env_net(monkeypatch):
+    """Pin the engine's notion of the active Polymarket env to 'mainnet'."""
     monkeypatch.setattr(trader, "get_env", lambda: "mainnet")
     return "mainnet"
 
 
 @pytest.fixture
 def cfg():
-    c = merge_with_defaults({})
+    c = merge_with_defaults({"account_mode": "live"})
     c["network"] = "mainnet"
     return c
 
@@ -41,6 +59,11 @@ _ids = itertools.count(1)
 
 
 def seed_position(**over) -> int:
+    """Insert one bot_positions row with sane, unique defaults.
+
+    Pass `created_at_offset_sec` (negative for the past) to backdate the
+    row's created_at after insert.
+    """
     n = next(_ids)
     row = {
         "signal_source": over.get("signal_source", "whale"),
@@ -89,6 +112,7 @@ def fetch(pid: int) -> dict:
 
 async def _stub_no_quote(_ticker, _side=None):
     return {"bid_cents": None, "ask_cents": None}
+
 
 
 def test_execute_skips_when_max_open_positions_hit(fresh_db, env_net, cfg):
@@ -156,7 +180,8 @@ def test_execute_skips_duplicate_market_and_side(fresh_db, env_net, cfg):
     assert result is None
 
 
-def test_execute_skips_when_exposure_leaves_under_one_dollar(fresh_db, env_net, cfg):
+def test_execute_skips_when_exposure_leaves_under_one_dollar(fresh_db, env_net, cfg, monkeypatch):
+    monkeypatch.setattr(trader, "get_quote", _stub_no_quote)
     seed_position(status="filled", ticker="EXP-SEED", cost_usd=749.50)
     result = run_async(
         trader.execute_signal(
@@ -197,6 +222,7 @@ def test_resting_orders_do_not_inflate_exposure_cap(fresh_db, env_net, cfg, monk
     assert total_exposure <= 76.0, f"exposure ${total_exposure:.2f} exceeded 0.75*cash"
 
 
+
 def test_flatten_on_daily_stop_sells_when_enabled(fresh_db, env_net, cfg, monkeypatch):
     cfg["flatten_on_daily_stop"] = True
     cfg["enable_trading"] = True
@@ -217,7 +243,10 @@ def test_flatten_on_daily_stop_sells_when_enabled(fresh_db, env_net, cfg, monkey
     trader._day_risk_breach.clear()
 
 
+
 def _install_sell_stubs(monkeypatch, *, bid_cents):
+    """Stub the sell path so take_profit_sweep can flatten a row end-to-end:
+    a live bid, an order that places, and a full fill at that bid."""
     async def _quote(_ticker, _side=None):
         return {"bid_cents": bid_cents, "ask_cents": (bid_cents or 0) + 1}
 
@@ -331,6 +360,7 @@ def test_flatten_not_triggered_by_take_profit(fresh_db, env_net, cfg, monkeypatc
     assert called["n"] == 0
 
 
+
 def test_execute_real_order_records_order_id(fresh_db, env_net, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_quote", _stub_no_quote)
@@ -371,6 +401,22 @@ def test_execute_api_error_is_persisted_as_error_row(fresh_db, env_net, cfg, mon
     assert row["status"] == "error"
     assert "HTTP 400" in row["error"]
     assert row["order_id"] is None
+
+
+def test_execute_unknown_outcome_is_tracked_by_its_order_id(fresh_db, env_net, cfg, monkeypatch):
+    cfg["enable_trading"] = True
+    monkeypatch.setattr(trader, "get_quote", _stub_no_quote)
+    oid = "0x" + "ef" * 32
+
+    async def _place(**_kw):
+        raise polymarket_api.OrderStatusUnknownError(oid, TimeoutError("read timed out"))
+
+    monkeypatch.setattr(trader, "place_limit_order", _place)
+    row = run_async(
+        trader.execute_signal(whale_signal(id=203, ticker="LOST"), "whale", cfg, 1000.0)
+    )
+    assert row["status"] == "submitted"
+    assert row["order_id"] == oid
 
 
 def test_execute_bumps_to_market_minimum_when_affordable(fresh_db, env_net, cfg, monkeypatch):
@@ -437,6 +483,7 @@ def test_execute_skips_when_live_cross_exceeds_entry_cap(fresh_db, env_net, cfg,
     )
     assert row is None
     assert count_rows() == 0
+
 
 
 def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_net, cfg, monkeypatch):
@@ -517,6 +564,7 @@ def test_poll_auto_cancels_stale_resting_order(fresh_db, env_net, cfg, monkeypat
     assert fetch(pid)["status"] == "canceled"
 
 
+
 def _settled_market(result: str):
     async def _fetch(_ticker):
         return {"result": result, "status": "finalized"}
@@ -563,13 +611,14 @@ def test_resolve_no_fill_row_closes_at_zero_with_null_outcome(fresh_db, env_net,
 def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_net, cfg, monkeypatch):
     pid = seed_position(status="filled", ticker="CLAMP", direction="yes",
                         filled_contracts=10, cost_usd=6.0)
-    monkeypatch.setattr(trader, "fetch_market", _settled_market("yes"))
+    monkeypatch.setattr(polymarket_api, "fetch_market", _settled_market("yes"))
     monkeypatch.setattr(trader, "_market_yes_payout", lambda _m: 5.0)
 
     run_async(trader.mark_resolved_positions(cfg))
     row = fetch(pid)
     assert row["pnl_usd"] == pytest.approx(3.88)
     assert row["settlement_usd"] == pytest.approx(10.0)
+
 
 
 def _live_pos(ticker: str, qty: float = 10.0, cost_cents: int = 600,
@@ -662,6 +711,7 @@ def test_reconcile_skips_crypto15m_owned_position(fresh_db, env_net, monkeypatch
     assert n == 0
 
 
+
 def test_refresh_balance_caches_and_force_refreshes(monkeypatch):
     trader._balance_cache.clear()
     seq = iter([
@@ -736,6 +786,7 @@ def test_flatten_sells_open_positions_and_books_pnl(fresh_db, env_net, cfg, monk
     assert r["settlement_usd"] == pytest.approx(7.0)
 
 
+
 def test_cancel_all_resting_cancels_tracked_orders(fresh_db, env_net, cfg, monkeypatch):
     resting = seed_position(status="submitted", order_id="OID-A", target_contracts=5)
     partial = seed_position(status="partial", order_id="OID-B",
@@ -784,6 +835,7 @@ def test_cancel_all_resting_survives_api_error_without_losing_fill(
     assert fetch(b)["status"] == "canceled"
 
 
+
 def _quote_stub(bid, ask):
     async def _q(_ticker, _side=None):
         return {"bid_cents": bid, "ask_cents": ask}
@@ -830,6 +882,8 @@ def test_a_crossing_entry_is_still_booked_as_a_taker(fresh_db, env_net, cfg,
 
 def test_a_matched_response_overrides_a_maker_priced_order(fresh_db, env_net,
                                                            cfg, monkeypatch):
+    """The book can move between quote and submit. If the exchange says the
+    order MATCHED, it crossed — charge the fee whatever the quote implied."""
     cfg["enable_trading"] = True
     cfg["order_style"] = "limit_mid"
     monkeypatch.setattr(trader, "get_quote", _quote_stub(58, 64))
@@ -845,6 +899,8 @@ def test_a_matched_response_overrides_a_maker_priced_order(fresh_db, env_net,
 
 def test_an_unquotable_market_is_assumed_to_cross(fresh_db, env_net, cfg,
                                                   monkeypatch):
+    """No book -> the price is a blind fallback cross. Assume taker: over-book
+    the fee rather than flatter the ledger."""
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_quote", _stub_no_quote)
 
@@ -855,3 +911,20 @@ def test_an_unquotable_market_is_assumed_to_cross(fresh_db, env_net, cfg,
     row = run_async(trader.execute_signal(
         whale_signal(id=304, ticker="NOBOOK"), "whale", cfg, 1000.0))
     assert row["entry_maker"] == 0
+
+
+def test_a_paper_account_sends_nothing_from_the_main_engine(fresh_db, env_net, cfg, monkeypatch):
+    """Account mode gate: enable_trading stays ON as the user set it, the
+    account is Paper, and neither the scan nor execute sends an order."""
+    cfg["enable_trading"] = True
+    cfg["account_mode"] = "paper"
+    monkeypatch.setattr(trader, "get_quote", _stub_no_quote)
+    calls: list[dict] = []
+
+    async def _place(**kw):
+        calls.append(kw)
+        return {"order": {"order_id": "OID-1", "status": "resting"}}
+    monkeypatch.setattr(trader, "place_limit_order", _place)
+    assert run_async(trader.scan_for_trades(cfg)) == []
+    row = run_async(trader.execute_signal(whale_signal(id=901, ticker="P"), "whale", cfg, 1000.0))
+    assert row is None and calls == [] and cfg["enable_trading"] is True

@@ -1,3 +1,9 @@
+"""Tests for the market-WS trade-print recording path (2026-07-16).
+
+Covers parse_last_trade (shape verified live), the feed's event buffering +
+drain semantics (bounded, return-and-clear), the best_bid_ask dispatch, and
+the clob_trades DB round-trip that the recorder loop performs.
+"""
 from __future__ import annotations
 
 import pytest

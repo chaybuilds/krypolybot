@@ -1,6 +1,14 @@
+"""Golden tests for the whale + momentum scoring functions.
+
+These two functions are the heart of the scanner ("calibrated on 22k+
+resolved Polymarket whale trades"). They're pure, so we pin their output for
+a handful of hand-computed inputs. If a refactor shifts a score, these
+break loudly instead of silently changing what the bot trades.
+"""
 from __future__ import annotations
 
 import scanner
+
 
 
 def test_whale_score_basic_yes_favorite():
@@ -32,6 +40,7 @@ def test_whale_score_clamps_to_floor_5():
         dollar_value=100, price=0.05, taker_side="yes"
     )
     assert score == 5.0
+
 
 
 def test_momentum_confidence_trade_cluster_underdog():

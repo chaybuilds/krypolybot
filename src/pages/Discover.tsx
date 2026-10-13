@@ -124,7 +124,7 @@ export function DiscoverPage({ onNav }: { onNav: (p: 'market') => void }) {
           column: screener!, limit: SCREENER_LIMIT, filters: filtersRef.current,
         });
         if (alive) setScreenerRows(r);
-      } catch {}
+      } catch { }
       finally { busy = false; if (alive) setScreenerBusy(false); }
     }
     void tick();

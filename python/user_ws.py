@@ -1,3 +1,22 @@
+"""Authenticated CLOB user WebSocket — our own order and trade events, pushed.
+
+  url   wss://ws-subscriptions-clob.polymarket.com/ws/user
+  sub   {"auth": {apiKey, secret, passphrase}, "type": "user"}   (all markets)
+  ping  the text "PING" every 10s; the server answers "PONG"
+  events
+    order  {"event_type": "order", "id", "type": PLACEMENT|UPDATE|CANCELLATION,
+            "status", "original_size", "size_matched", "price", "asset_id", ...}
+    trade  {"event_type": "trade", "id", "taker_order_id", "status":
+            MATCHED|MINED|CONFIRMED|RETRYING|FAILED, "size", "price",
+            "maker_orders": [{"order_id", "owner", "matched_amount", ...}], ...}
+  (verified live 2026-10-05: subscribes, stays open, answers PONG)
+
+STRICT ACCELERATOR: this module never books a fill. The engines keep their
+REST order polls and wallet reconcile as the authority; what this adds is
+`wake` — set the instant one of our orders is matched, cancelled or fails —
+so the crypto engine runs its next tick now instead of up to a poll interval
+later. Down, cold or wrong, it costs nothing but that latency.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -41,6 +60,8 @@ class UserFeed:
         self._api_key = ""
 
     def handle(self, msg) -> bool:
+        """Apply one frame. True when it concerned one of OUR orders (and the
+        wake event was set)."""
         if isinstance(msg, list):
             hit = False
             for m in msg:

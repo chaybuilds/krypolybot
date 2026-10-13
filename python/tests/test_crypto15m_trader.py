@@ -1,3 +1,10 @@
+"""Tests for the 15-min crypto executor (crypto15m_trader.py).
+
+Pure decision helpers, plus a paper-mode lifecycle driven against a real
+temp SQLite with `crypto15m.snapshot` and `polymarket_api.fetch_market`
+stubbed (no network, no orders). Paper mode exercises the exact same
+decision path as live — only fills are simulated.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +18,7 @@ import db
 import polymarket_api
 import trader
 from config import merge_with_defaults
+
 
 
 @pytest.fixture
@@ -30,12 +38,22 @@ def env_net(monkeypatch):
 
 @pytest.fixture
 def cfg():
-    c = merge_with_defaults({})
+    c = merge_with_defaults({"account_mode": "live"})
     c["network"] = "mainnet"
     c["crypto15m_enabled"] = True
     c["crypto15m_order_size"] = 1
     c["crypto15m_entry_style"] = "taker"
     return c
+
+
+@pytest.fixture(autouse=True)
+def _no_gamma(monkeypatch):
+    """The resolution sweep looks every unsettled row's market up on Gamma.
+    These test tickers don't exist there, so the answer is "not found" either
+    way; give it without the round-trip. Tests that need a market stub it."""
+    async def _not_found(_ticker):
+        return None
+    monkeypatch.setattr(polymarket_api, "fetch_market", _not_found)
 
 
 def run_async(coro):
@@ -61,6 +79,7 @@ def _stub_snapshot(assets):
         return {"assets": assets, "constants": {}, "fetchedAt": "",
                 "spotOk": True, "spotSource": "stub"}
     return _snap
+
 
 
 def test_direction_for_favorite():
@@ -265,6 +284,20 @@ def test_directional_rules_gate_should_enter(cfg):
     assert ok_no is False and "directional" in why
 
 
+def test_turbine_import_maps_archetypes():
+    import turbine_import as ti
+    s = {"name": "T", "asset": "BTC", "archetype": "vwap_momentum",
+         "indicators": {"lookbackMin": 5, "changePct": 0.1}, "priceBand": [0.25, 0.75], "size": 3}
+    cfg = ti.import_strategy(s)
+    assert cfg["crypto15m_use_rules"] is True
+    assert cfg["crypto15m_assets"] == ["BTC"] and cfg["crypto15m_order_size"] == 3
+    fields = {c["field"] for c in cfg["crypto15m_rules"]}
+    assert {"priceVsVwapPct", "change5mPct", "upAsk"} <= fields
+    assert ti.import_strategy({"archetype": "panic_fade"}) is None
+    imp, _ = ti.import_all()
+    assert len(imp) >= 25
+
+
 def test_compute_entry_contracts_fixed(cfg):
     cfg["crypto15m_sizing_mode"] = "fixed"
     cfg["crypto15m_order_size"] = 3
@@ -297,6 +330,7 @@ def test_compute_entry_contracts_affordability_clamp(cfg):
         cfg, entry_limit_cents=80, balance_usd=1000, order_size=15) == 15
     assert ct.compute_entry_contracts(
         cfg, entry_limit_cents=99, balance_usd=0, order_size=15) == 15
+
 
 
 def _capture_orders(monkeypatch):
@@ -425,6 +459,7 @@ def test_status_reports_enabled_and_authed(fresh_db, env_net, cfg, monkeypatch):
     assert st["authed"] is False
 
 
+
 def test_failed_entry_resolves_immediately_and_blocks_retry(fresh_db, env_net, cfg, monkeypatch):
     cfg["crypto15m_live"] = True
 
@@ -448,6 +483,21 @@ def test_failed_entry_resolves_immediately_and_blocks_retry(fresh_db, env_net, c
     run_async(ct.run_tick(cfg, authed=True))
     with db.get_db() as conn:
         assert conn.execute("SELECT COUNT(*) FROM crypto15m_positions").fetchone()[0] == 2
+
+
+def test_entry_with_unknown_outcome_is_tracked_by_its_order_id(fresh_db, env_net, cfg, monkeypatch):
+    cfg["crypto15m_live"] = True
+    oid = "0x" + "ef" * 32
+
+    async def _lost(**kw):
+        raise polymarket_api.OrderStatusUnknownError(oid, TimeoutError("read timed out"))
+    monkeypatch.setattr(polymarket_api, "place_limit_order", _lost)
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
+
+    run_async(ct.run_tick(cfg, authed=True))
+    with db.get_db() as conn:
+        r = dict(conn.execute("SELECT * FROM crypto15m_positions").fetchone())
+    assert (r["status"], r["order_id"], r["resolved"]) == ("submitted", oid, 0)
 
 
 def test_exiting_position_settles_when_sell_never_fills(fresh_db, env_net, cfg, monkeypatch):
@@ -500,6 +550,7 @@ def test_legacy_stuck_error_row_is_swept(fresh_db, env_net, cfg, monkeypatch):
         r = dict(conn.execute("SELECT * FROM crypto15m_positions WHERE id=?", (pid,)).fetchone())
     assert r["resolved"] == 1
     assert r["status"] == "error"
+
 
 
 def test_maker_limit_cents_joins_the_bid():
@@ -610,7 +661,11 @@ def test_live_fast_escalate_before_cancel_lead(fresh_db, env_net, cfg, monkeypat
     assert r["cost_usd"] == pytest.approx(1.60)
 
 
-def test_live_escalate_404_books_as_filled_not_stranded(fresh_db, env_net, cfg, monkeypatch):
+def _escalation_case(monkeypatch, cfg, *, ticker, taker_place, taker_get, wallet_after):
+    """A maker that never filled, cancelled, then escalated to a taker cross at
+    88c. `taker_place` is the place response's order dict, `taker_get` what
+    get_order says about the taker (an Exception to raise, or a status), and
+    `wallet_after` how many contracts the wallet holds once the taker is in."""
     cfg["crypto15m_entry_style"] = "maker"
     cfg["crypto15m_live"] = True
     cfg["crypto15m_entry_threshold"] = 0.5
@@ -618,17 +673,18 @@ def test_live_escalate_404_books_as_filled_not_stranded(fresh_db, env_net, cfg, 
     cfg["crypto15m_maker_escalate"] = True
     cfg["crypto15m_entry_max"] = 0.95
     close = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _seed_c15(asset="BTC", ticker="KXBTC15M-404", status="submitted", dry_run=False,
+    _seed_c15(asset="BTC", ticker=ticker, status="submitted", dry_run=False,
               target_contracts=10, entry_limit_cents=80, close_time=close, order_id="maker-x")
-
-    state = {"canceled": False}
+    state = {"canceled": False, "placed": False}
 
     async def _get_order(oid):
         if oid == "maker-x":
             if state["canceled"]:
                 return _order(0, 0, 0.0, status="canceled")
             return _order(0, 10, 0.0, status="resting")
-        raise polymarket_api.PolymarketAPIError(404, "not found")
+        if isinstance(taker_get, Exception):
+            raise taker_get
+        return {"order": taker_get}
 
     async def _quote(_t, _s):
         return {"bid_cents": 86, "ask_cents": 88}
@@ -638,20 +694,64 @@ def test_live_escalate_404_books_as_filled_not_stranded(fresh_db, env_net, cfg, 
         return {"ok": True}
 
     async def _place(**kw):
-        return {"order": {"order_id": "taker-x", "status": "live"}}
+        state["placed"] = True
+        return {"order": taker_place}
+
+    async def _positions(limit=500, user=None, **kw):
+        n = wallet_after if state["placed"] else 0
+        return [{"ticker": ticker, "position_fp": float(n)}] if n else []
 
     monkeypatch.setattr(polymarket_api, "get_order", _get_order)
     monkeypatch.setattr(polymarket_api, "get_quote", _quote)
     monkeypatch.setattr(polymarket_api, "cancel_order", _cancel)
     monkeypatch.setattr(polymarket_api, "place_limit_order", _place)
+    monkeypatch.setattr(polymarket_api, "get_positions", _positions)
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([]))
-
     run_async(ct.run_tick(cfg, authed=True))
     with db.get_db() as conn:
-        r = dict(conn.execute("SELECT * FROM crypto15m_positions WHERE asset='BTC'").fetchone())
+        return dict(conn.execute("SELECT * FROM crypto15m_positions WHERE ticker=?", (ticker,)).fetchone())
+
+
+def test_live_escalate_404_books_what_the_wallet_holds(fresh_db, env_net, cfg, monkeypatch):
+    r = _escalation_case(monkeypatch, cfg, ticker="KXBTC15M-404",
+                         taker_place={"order_id": "taker-x", "status": "live"},
+                         taker_get=polymarket_api.PolymarketAPIError(404, "not found"), wallet_after=10)
     assert r["status"] == "filled" and r["resolved"] == 0
     assert r["filled_contracts"] == 10
     assert r["cost_usd"] == pytest.approx(8.80)
+
+
+def test_escalate_404_with_nothing_in_the_wallet_is_no_fill(fresh_db, env_net, cfg, monkeypatch):
+    r = _escalation_case(monkeypatch, cfg, ticker="KXBTC15M-404N",
+                         taker_place={"order_id": "taker-x", "status": "live"},
+                         taker_get=polymarket_api.PolymarketAPIError(404, "not found"), wallet_after=0)
+    assert r["filled_contracts"] == 0
+    assert r["status"] == "canceled"
+
+
+def test_escalate_unmatched_fak_is_no_fill(fresh_db, env_net, cfg, monkeypatch):
+    r = _escalation_case(monkeypatch, cfg, ticker="KXBTC15M-UNM",
+                         taker_place={"order_id": "", "status": "unmatched"},
+                         taker_get=polymarket_api.PolymarketAPIError(404, "not found"), wallet_after=0)
+    assert r["filled_contracts"] == 0
+    assert r["status"] == "canceled"
+
+
+def test_escalate_partial_fak_books_only_the_part(fresh_db, env_net, cfg, monkeypatch):
+    r = _escalation_case(monkeypatch, cfg, ticker="KXBTC15M-PART",
+                         taker_place={"order_id": "", "status": "matched"},
+                         taker_get=polymarket_api.PolymarketAPIError(404, "not found"), wallet_after=4)
+    assert r["status"] == "filled"
+    assert r["filled_contracts"] == 4
+    assert r["cost_usd"] == pytest.approx(3.52)
+
+
+def test_order_parsers_do_not_read_unmatched_as_a_fill():
+    import volume_farm
+    assert trader._parse_polymarket_order({"status": "unmatched", "size_matched": "0", "original_size": "5"})["status"] == "canceled"
+    assert trader._parse_polymarket_order({"status": "ORDER_STATUS_MATCHED", "size_matched": "5", "original_size": "5"})["status"] == "executed"
+    assert volume_farm._parse_order({"status": "unmatched"})[2] == "canceled"
+    assert volume_farm._parse_order({"status": "matched", "size_matched": "3"})[2] == "filled"
 
 
 def test_maker_full_fill_404_does_not_double_buy(fresh_db, env_net, cfg, monkeypatch):
@@ -1091,6 +1191,9 @@ _c15_seq = 0
 
 
 def _seed_c15(**over) -> dict:
+    """Insert one crypto15m position row directly, return the fetched dict.
+    insert_crypto15m_position can't write the exit_* columns, so those are
+    applied via a follow-up update."""
     global _c15_seq
     _c15_seq += 1
     n = _c15_seq
@@ -1125,6 +1228,8 @@ def _seed_c15(**over) -> dict:
 
 
 def _order(filled, remaining, cost_dollars, status="resting") -> dict:
+    """Build a CLOB OpenOrder mock. `cost_dollars` is the cumulative fill
+    value; we back out the per-share price the parser multiplies by."""
     f = float(filled)
     price = (float(cost_dollars) / f) if f else 0.0
     clob_status = {"resting": "LIVE", "executed": "MATCHED"}.get(status, status)
@@ -1266,6 +1371,7 @@ def test_partial_stop_then_settlement_accounts_for_sold_portion(fresh_db, env_ne
     assert out["outcome_correct"] == 1
 
 
+
 def test_order_fee_maker_fills_pay_nothing():
     taker = ct._order_fee_usd({}, 10, 50.0)
     assert taker == pytest.approx(0.07 * 0.5 * 0.5 * 10)
@@ -1294,7 +1400,7 @@ def test_gtc_entry_fill_books_zero_fee(fresh_db, env_net, cfg, monkeypatch):
         async def _get(_kid):
             return _order(10, 0, 8.80)
 
-        async def _fills(_kid, fallback, filled):
+        async def _fills(_kid, fallback, filled, _pos=None):
             return 88.0, 8.80
         monkeypatch.setattr(polymarket_api, "get_order", _get)
         monkeypatch.setattr(ct, "_real_fill_cents", _fills)
@@ -1302,6 +1408,7 @@ def test_gtc_entry_fill_books_zero_fee(fresh_db, env_net, cfg, monkeypatch):
         out = run_async(ct._poll_entry(pos, cfg))
         assert out is not None and out["status"] == "filled"
         assert out["fees_usd"] == pytest.approx(want_fee), ot
+
 
 
 def test_hours_ok_default_is_always_on(cfg):
@@ -1325,6 +1432,7 @@ def test_hours_ok_overnight_wrap(cfg):
     assert crypto15m.hours_ok(cfg, hour=2) is True
     assert crypto15m.hours_ok(cfg, hour=6) is False
     assert crypto15m.hours_ok(cfg, hour=12) is False
+
 
 
 def test_apply_cross_asset_agreement_and_bias():
@@ -1401,6 +1509,7 @@ def test_crypto15m_daily_loss_limit_off_allows_entries(fresh_db, env_net, cfg, m
     calls = _capture_orders(monkeypatch)
     run_async(ct.run_tick(cfg, authed=True))
     assert len(calls) == 1
+
 
 
 def test_should_take_profit(cfg):
@@ -1550,6 +1659,7 @@ def test_overall_take_profit_disabled_clears_stale_baseline(fresh_db, env_net, c
         assert db.kv_get(conn, "c15_tp_baseline:mainnet") is None
 
 
+
 def _paired_asset(ticker="KXBTC15M-P1", model_prob=0.62):
     close = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"asset": "BTC", "series": "KXBTC15M", "ticker": ticker,
@@ -1566,6 +1676,8 @@ def _paired_cfg(cfg):
 
 
 def _mock_quotes(monkeypatch, *, yes_ask, no_asks):
+    """get_quote returns yes_ask always; the no side yields successive values
+    from `no_asks` so a chase re-quotes a moved book."""
     state = {"no": 0}
 
     async def _q(_ticker, side):
@@ -1579,6 +1691,8 @@ def _mock_quotes(monkeypatch, *, yes_ask, no_asks):
 
 
 def _mock_place(monkeypatch, *, fills):
+    """place_limit_order records calls; fills(side, price_cents)->bool decides
+    whether the FAK landed (order_id) or was killed (0 fill)."""
     calls = []
 
     async def _place(**kw):
@@ -1623,7 +1737,10 @@ def test_paired_naked_dominant_when_chase_too_expensive(fresh_db, env_net, cfg, 
     assert len(landed) == 1 and landed[0]["strategy"] == "paired"
 
 
+
 def _seed_settled_pnls(pnls, network="mainnet", dry_run=False):
+    """Seed settled positions in chronological order (LAST item = most
+    recent; the streak reader breaks resolved_at ties by id DESC)."""
     for pnl in pnls:
         p = _seed_c15(status="settled", network=network, dry_run=dry_run,
                       filled_contracts=5, target_contracts=5)
@@ -1703,6 +1820,7 @@ def test_compute_entry_contracts_streak_respects_risk_caps(cfg):
     assert n == 10
 
 
+
 def test_escalation_restamps_the_entry_as_a_taker(fresh_db, env_net, cfg,
                                                   monkeypatch):
     cfg["crypto15m_entry_style"] = "maker"
@@ -1751,6 +1869,9 @@ def test_escalation_restamps_the_entry_as_a_taker(fresh_db, env_net, cfg,
 
 def test_a_maker_that_lands_on_the_ask_is_stamped_as_a_taker(fresh_db, env_net,
                                                              cfg, monkeypatch):
+    """The re-quote returned no BID, so the maker keeps its stale snapshot
+    price — which is at/above the live ask and crosses on arrival. The order
+    still goes out as a GTC; the row must say the fill was a taker's."""
     cfg["crypto15m_entry_style"] = "maker"
     cfg["crypto15m_entry_threshold"] = 0.5
     a = signal_asset()
@@ -1788,3 +1909,204 @@ def test_a_maker_that_really_rests_is_still_a_maker(fresh_db, env_net, cfg,
     with db.get_db() as conn:
         r = db.get_open_crypto15m(conn, "mainnet")[0]
     assert ct._entry_is_maker(r) is True
+
+
+def test_a_paper_account_opens_nothing_and_keeps_the_switch(fresh_db, env_net, cfg, monkeypatch):
+    """Account mode gate: crypto15m_enabled stays as the user set it, the
+    account is Paper, and no order is sent (config.engine_on)."""
+    cfg["account_mode"] = "paper"
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
+    calls = _capture_orders(monkeypatch)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert calls == [] and cfg["crypto15m_enabled"] is True
+    assert ct.should_enter(signal_asset(), cfg, has_open=False, open_count=0) == (True, "ok")
+
+
+def _paper_resting_entry(cfg, monkeypatch, *, minutes_to_close, filled=0):
+    """A maker entry placed while Live (10 contracts at 85c) that is still
+    resting when the account is Paper. Returns (row, orders placed, cancels)."""
+    cfg["account_mode"] = "paper"
+    cfg["crypto15m_entry_style"] = "maker"
+    cfg["crypto15m_entry_threshold"] = 0.5
+    cfg["crypto15m_maker_escalate"] = True
+    close = (datetime.now(timezone.utc) + timedelta(minutes=minutes_to_close)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pos = _seed_c15(ticker="KXBTC15M-PAPER", status="submitted", target_contracts=10,
+                    filled_contracts=filled, cost_usd=filled * 0.85,
+                    entry_limit_cents=85, close_time=close, order_id="maker-p")
+    state = {"canceled": False}
+
+    async def _get_order(_oid):
+        return _order(filled, 10 - filled, filled * 0.85,
+                      status="canceled" if state["canceled"] else "resting")
+
+    async def _cancel(oid):
+        state["canceled"] = True
+        cancels.append(oid)
+
+    async def _quote(_t, _s):
+        return {"bid_cents": 86, "ask_cents": 88}
+
+    async def _wallet(**_kw):
+        return []
+
+    cancels: list = []
+    monkeypatch.setattr(polymarket_api, "get_order", _get_order)
+    monkeypatch.setattr(polymarket_api, "cancel_order", _cancel)
+    monkeypatch.setattr(polymarket_api, "get_quote", _quote)
+    monkeypatch.setattr(polymarket_api, "get_positions", _wallet)
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([]))
+    return pos, _capture_orders(monkeypatch), cancels
+
+
+def test_paper_never_escalates_a_resting_entry_into_a_real_buy(fresh_db, env_net, cfg, monkeypatch):
+    cfg["crypto15m_maker_cancel_min"] = 15.0
+    pos, orders, cancels = _paper_resting_entry(cfg, monkeypatch, minutes_to_close=5)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert orders == []
+    assert cancels == ["maker-p"]
+    with db.get_db() as conn:
+        r = db.fetch_crypto15m_by_id(conn, pos["id"])
+    assert r["status"] == "canceled" and r["resolved"] == 1
+    assert r["exit_reason"] == "paper_pulled"
+
+
+def test_paper_pulls_a_resting_entry_and_keeps_what_filled(fresh_db, env_net, cfg, monkeypatch):
+    cfg["crypto15m_maker_cancel_min"] = 0.0
+    cfg["crypto15m_maker_fill_sec"] = 0
+    pos, orders, cancels = _paper_resting_entry(cfg, monkeypatch, minutes_to_close=14, filled=3)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert orders == [] and cancels == ["maker-p"]
+    with db.get_db() as conn:
+        r = db.fetch_crypto15m_by_id(conn, pos["id"])
+    assert r["status"] == "filled" and r["resolved"] == 0
+    assert r["filled_contracts"] == 3
+
+
+def test_paper_keeps_the_stop_on_a_real_position(fresh_db, env_net, cfg, monkeypatch):
+    cfg["account_mode"] = "paper"
+    calls = _stop_case(monkeypatch, gamma_side=0.60, ws={"Y": (20, 24), "N": (76, 80)})
+    run_async(ct._manage_position(_filled(906), cfg, "mainnet"))
+    assert calls == [906]
+
+
+def _stop_case(monkeypatch, *, gamma_side, ws=None, book=None):
+    """A filled YES position; Gamma says our side is at `gamma_side`; the live
+    feed quotes `ws` ({token: (bid, ask)} or None); the REST books' bids are
+    `book` ({'yes': cents, 'no': cents} or None). Returns the stop calls."""
+    async def _mkt(_ticker):
+        return {"yes_bid_dollars": gamma_side, "yes_ask_dollars": gamma_side, "status": "open", "result": ""}
+    monkeypatch.setattr(polymarket_api, "fetch_market", _mkt)
+
+    async def _meta(_t):
+        return {"yes_token": "Y", "no_token": "N"}
+    monkeypatch.setattr(polymarket_api, "get_market_meta", _meta)
+    monkeypatch.setattr(ct.clob_ws, "warm", lambda *a: None)
+
+    def _q(token, *a, **k):
+        if not ws or token not in ws:
+            return None
+        b, a_ = ws[token]
+        return {"bid_cents": b, "ask_cents": a_}
+    monkeypatch.setattr(ct.clob_ws.feed, "get_quote_cents", _q)
+
+    async def _book(_t):
+        if not book:
+            return {"yes": [], "no": []}
+        return {"yes": [[book["yes"], 100.0]] if book.get("yes") else [],
+                "no": [[book["no"], 100.0]] if book.get("no") else []}
+    monkeypatch.setattr(polymarket_api, "get_orderbook", _book)
+
+    async def _no_chain(_pos):
+        return None
+    monkeypatch.setattr(ct, "_resolved_payout_from_chain", _no_chain)
+    calls = []
+
+    async def _fake_stop(p, market, c):
+        calls.append(p["id"])
+        return None
+    monkeypatch.setattr(ct, "_place_stop_loss", _fake_stop)
+    return calls
+
+
+def _filled(pid):
+    ct._stop_retry_at.pop(pid, None)
+    return {"id": pid, "ticker": "0xstop", "direction": "yes", "asset": "BTC",
+            "status": "filled", "filled_contracts": 10, "cost_usd": 6.0, "dry_run": 0}
+
+
+def test_stop_fires_when_the_book_collapsed_but_gamma_has_not(fresh_db, env_net, cfg, monkeypatch):
+    calls = _stop_case(monkeypatch, gamma_side=0.60, ws={"Y": (20, 24), "N": (76, 80)})
+    run_async(ct._manage_position(_filled(901), cfg, "mainnet"))
+    assert calls == [901]
+
+
+def test_stop_holds_a_winner_on_a_stale_low_gamma_mark(fresh_db, env_net, cfg, monkeypatch):
+    calls = _stop_case(monkeypatch, gamma_side=0.30, ws={"Y": (70, 72), "N": (28, 30)})
+    run_async(ct._manage_position(_filled(902), cfg, "mainnet"))
+    assert calls == []
+
+
+def test_stop_reads_the_rest_books_when_the_feed_is_cold(fresh_db, env_net, cfg, monkeypatch):
+    calls = _stop_case(monkeypatch, gamma_side=0.30, ws=None, book={"yes": 70, "no": 28})
+    run_async(ct._manage_position(_filled(903), cfg, "mainnet"))
+    assert calls == []
+    calls = _stop_case(monkeypatch, gamma_side=0.60, ws=None, book={"yes": 18, "no": 80})
+    run_async(ct._manage_position(_filled(904), cfg, "mainnet"))
+    assert calls == [904]
+
+
+def test_stop_falls_back_to_gamma_without_a_sane_book(fresh_db, env_net, cfg, monkeypatch):
+    calls = _stop_case(monkeypatch, gamma_side=0.30, ws={"Y": (None, 40)}, book={"yes": None, "no": None})
+    run_async(ct._manage_position(_filled(905), cfg, "mainnet"))
+    assert calls == [905]
+
+
+def test_live_side_prob_for_a_no_position(monkeypatch):
+    async def _meta(_t):
+        return {"yes_token": "Y", "no_token": "N"}
+    monkeypatch.setattr(polymarket_api, "get_market_meta", _meta)
+    monkeypatch.setattr(ct.clob_ws, "warm", lambda *a: None)
+    monkeypatch.setattr(ct.clob_ws.feed, "get_quote_cents",
+                        lambda t, *a, **k: {"Y": {"bid_cents": 20, "ask_cents": 22}, "N": {"bid_cents": 78, "ask_cents": 80}}[t])
+    assert run_async(ct._live_side_prob("0xm", "no")) == pytest.approx(0.79)
+    assert run_async(ct._live_side_prob("0xm", "yes")) == pytest.approx(0.21)
+
+
+def _sniper(cfg, monkeypatch, *, model_prob, snap_ask, live_ask):
+    """Model mode with the gate fed a `snap_ask` snapshot and the order path's
+    re-quote returning `live_ask` (cents). Returns the captured orders."""
+    cfg["crypto15m_direction_mode"] = "model"
+    cfg["crypto15m_model_autopause"] = False
+    a = signal_asset(ticker="KXBTC15M-SNIPE")
+    a.update({"modelProb": model_prob, "upAsk": snap_ask, "downAsk": 0.12,
+              "spotLive": True, "feeSchedule": None})
+    assert ct.should_enter(a, cfg, has_open=False, open_count=0) == (True, "ok")
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([a]))
+
+    async def _q(_t, _s):
+        return {"bid_cents": live_ask - 1, "ask_cents": live_ask}
+    monkeypatch.setattr(polymarket_api, "get_quote", _q)
+    return _capture_orders(monkeypatch)
+
+
+def test_sniper_skips_when_the_book_corrected_before_the_order(fresh_db, env_net, cfg, monkeypatch):
+    calls = _sniper(cfg, monkeypatch, model_prob=0.975, snap_ask=0.90, live_ask=96)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert calls == []
+    assert "edge gone" in ct._block_reasons.get("BTC", "")
+    with db.get_db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM crypto15m_positions").fetchone()[0] == 0
+
+    async def _back(_t, _s):
+        return {"bid_cents": 89, "ask_cents": 90}
+    monkeypatch.setattr(polymarket_api, "get_quote", _back)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert len(calls) == 1 and calls[0]["price_cents"] == 92
+
+
+def test_sniper_limit_never_pays_past_the_min_edge(fresh_db, env_net, cfg, monkeypatch):
+    calls = _sniper(cfg, monkeypatch, model_prob=0.975, snap_ask=0.90, live_ask=94)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert len(calls) == 1 and calls[0]["price_cents"] == 95
+    px = calls[0]["price_cents"]
+    assert 97.5 - px - crypto15m._fee_cents(px) >= 2.0

@@ -20,6 +20,27 @@ The renderer never talks to Polymarket directly — only through `window.krypt.*
 the scanners and trading engine, signs Polymarket CLOB orders locally with your wallet key (EIP-712),
 and persists to a local SQLite DB.
 
+## Paper | Live
+
+One switch for the whole app, in **Settings → Account**.
+
+- **Paper** (the default on a new install): Polymarket's real order books, imaginary money, no wallet
+  needed. Your orders from the terminal and the phone, standing stops and every AI agent trade the paper
+  book. Fills are walked out of the real book at the price you would actually have got, with Polymarket's
+  real fees, and never mix into your real P&L. **The engines (main, crypto, copy trading, Perps, live
+  scripts) send nothing.** Their switches are kept and they wait for Live. They are not simulated: to try
+  an engine without money, use its backtest, and for a script, shadow mode.
+- **Go live** is a checklist with the real state of each step: your wallet connected and tested, every
+  switch that will start spending real money, and a tick to confirm. Each engine keeps its own switch and
+  the agents their own trade mode; those can only narrow the account mode, never widen it.
+- **Back to Paper** stops every real order at once, including the standing stops, take-profits and engine
+  exits that manage your real positions. The positions themselves stay open on Polymarket, so the app asks
+  first.
+
+Upgrading from an older version: a terminal that was in paper mode comes up Paper, an existing setup comes
+up Live with every engine's switch where you left it, and a fresh install starts in Paper. Only you can
+change the account mode; an AI agent never can.
+
 ## Custom strategy scripts
 
 The **Scripts** tab lets you write a strategy in plain Python, backtest it on the ticks the app has
@@ -98,8 +119,8 @@ simulated in backtests** (the recorded corpus only covers crypto windows), so va
 every rail, but the exchange call is replaced by a recorded entry — the order it *would* have sent. Those
 shadow orders settle from the real window outcome with the same taker fee charged, so a script builds a
 genuine *forward* track record before it ever spends money. Arming it for real orders is an explicit,
-confirmed action. This is the closest thing the app has to a paper mode, and it exists precisely where
-the risk is highest: code you (or an AI) just wrote. Note that shadow simulates **entries only** — exits
+confirmed action. The account's Paper mode only stops an armed script's real orders; shadow is how a
+script is paper traded, and it exists precisely where the risk is highest: code you (or an AI) just wrote. Note that shadow simulates **entries only** — exits
 need a real position, so shadow orders are held to settlement; a strategy that leans on `manage()` for
 its exits will behave differently once live.
 
@@ -132,9 +153,10 @@ the script back, and the validator checks it before it can be enabled.
 ## AI analysis
 
 A **Read this market** button on any market page. It sends the question, the published resolution rules
-and the current quote to **Anthropic** or **OpenAI** and asks for a close reading: what the market turns
-on, the traps in the wording, the dated events between now and close that would move it, and what the
-model does not know.
+and the current quote to the AI provider you pick (**Anthropic**, **OpenAI**, **OpenRouter**, **Google
+Gemini**, or a model on your own machine through **Ollama** or **LM Studio**) and asks for a close
+reading: what the market turns on, the traps in the wording, the dated events between now and close that
+would move it, and what the model does not know.
 
 **It will not give you a number, and that is the design.**
 
@@ -144,7 +166,12 @@ would look like the most trustworthy — the same fictional-edge failure the
 [Kalshi cross-venue](../README.md#what-it-does) panel refuses to print. So the model is never asked for one, and the
 JSON schema it must answer in **has no numeric field at all** (`additionalProperties: false`), which
 means the provider's own structured-output layer rejects an invented `probability` before the app ever
-sees it. A prompt instruction can be talked out of it; a missing field cannot.
+sees it. A prompt instruction can be talked out of it; a missing field cannot. Providers enforce a schema
+in different ways, so the app checks every reply itself as well: an extra field, a wrong type or a numeric
+value anywhere rejects the whole reply, whichever provider sent it.
+
+The only numbers the app records about a market's chances are an **AI agent's own** forecasts, and those
+are scored against the market (see [AI agents](#ai-agents-mcp)). The app never makes one.
 
 What you get instead:
 
@@ -166,11 +193,12 @@ public data anyone can read on Polymarket. **Never your wallet, your positions, 
 orders.** That is enforced by the payload builder taking a market and having no access to an account, and
 covered by a test that fails if any account-shaped key appears in the outbound body.
 
-Both providers are declared in the terminal's host table, so the **offline switch stops them**, a 429
-parks them, and the **Data & privacy panel counts them** with live call/error/latency figures like every
-other host.
+Every provider is declared in the terminal's host table, so a 429 parks it and the **Data & privacy panel
+counts it** with live call/error/latency figures like every other host. The **offline switch stops the
+cloud providers**; Ollama and LM Studio run on your own machine and need no key.
 
-**Setup** (Settings → AI analysis): pick a provider, paste an API key, turn the feature on. The key is
+**Setup** (Settings → AI provider): pick a provider, paste an API key (cloud providers only), choose a
+model, turn the feature on. One provider and one model serve both this panel and Autopilot. The key is
 verified against the provider *before* it is stored — a typo fails there rather than as a button that
 never works — and is kept encrypted alongside your wallet key, never in `settings.json` and never read
 back to the screen. The model list is read from the provider with your own key, so it is always what that
@@ -190,6 +218,7 @@ Both ship **disabled** and answer **nobody** until you pair an account.
 /status /positions /pnl /balance /orders /price   read
 /pause /resume /flatten /cancelall                de-risk
 /buy /sell /confirm                               only if you enable remote trading
+/agents /approve n /reject n                      AI agent orders waiting for you (approve needs remote trading)
 ```
 
 **Setup.** Telegram: message `@BotFather`, `/newbot`, copy the token. Discord: create an application at
@@ -207,7 +236,7 @@ page (it is verified against the platform *before* it is stored), then generate 
   back to the UI.
 - **Placing orders from chat is a second switch**, off by default, and it never turns on with the first.
   Even on, every order is previewed, needs a fresh `/confirm` within 90 seconds, obeys a per-order dollar
-  cap enforced in the backend, and still passes your live-trading switch and paper mode.
+  cap enforced in the backend, and in Paper it trades the paper book like every other order.
 - **Stale commands never execute.** Telegram queues undelivered updates for ~24h, so a `/flatten` sent
   while the PC was asleep is acknowledged but **not run** when it wakes.
 - **Every command is logged** — accepted, refused, rate-limited or from a stranger.
@@ -219,26 +248,121 @@ Polymarket and Kalshi hosts and a switch that turns all outbound market data off
 ## AI agents (MCP)
 
 Let an AI client on your computer — **Claude Desktop, Claude Code, Cursor, Codex, Windsurf, VS Code** —
-use the app through the Model Context Protocol. It can research markets, paper trade, backtest, write
-strategy scripts, work the Perps market maker (board, status, backtest) and, if you allow it, trade live.
+use the app through the Model Context Protocol, or let **Autopilot** run one for you inside the app. An
+agent reads the same books, places orders through the same gates and lands in the same ledgers as a
+click. **AI Agents** is the page the app opens on.
 
-**Setup:** open **AI Agents** in the sidebar → turn on **Allow AI agents** → click **Add** next to your
-client → restart the client. Keep Krypt PolyBot open while the agent works.
+**Setup:** **AI Agents** → turn on **Allow AI agents** → click **Add** next to your client (Claude Desktop,
+Cursor, Codex and Windsurf are one click; Claude Code and VS Code get a snippet to paste) → restart the
+client. Keep Krypt PolyBot open while the agent works.
 
-**Three switches, all off by default:**
+**Named agents.** Make up to 12 (a careful researcher, a sports specialist) and see which one is any good.
+Each has a **guide** (your own words to the model), **rules** (categories from Polymarket's own tags, an
+entry-price band, time to close, sides, a minimum edge, max shares in one market, max open positions, its
+own per-order and daily caps) and **its own token**: the token decides which agent is calling. Start from
+a template or a blank card; import, export (no token, no id) or duplicate one. The guide is text for a
+model and unlocks nothing. The rules are enforced on every order, and they can only make the global rails
+stricter, never looser.
 
-| Switch | What the agent can do |
+**Trade mode**, one master switch for every agent:
+
+| Mode | What agents can do |
 | --- | --- |
-| **Allow AI agents** | Read everything, run backtests, and paper trade in **its own** paper account (separate from yours) |
-| **Allow live trading** | Real orders, stops, engine and settings changes — buys capped per order and per day (default $25 / $100) |
-| **Allow scripts** | Write and run strategy scripts (any with a critical security finding is refused) |
+| **Read only** | Read markets and record forecasts. Every order is refused |
+| **Paper** (default) | Fill against the real Polymarket book with imaginary money, each in **its own** paper account ($1,000 by default, separate from yours), settled on the real outcome |
+| **Live** | The agents you set to live spend real USDC; every other agent stays on paper. Only while the app itself is [Live](#paper--live) |
 
-Pausing engines and getting out of positions are never capped or blocked. Paper mode in Settings still
-blocks every live order. Every action and refusal is logged on the AI Agents page.
+**Go live** on the AI Agents page checks your wallet, your agent's record, the caps, approvals and the
+account mode on one screen, and offers **Use starter caps** ($5 per order, $20 a day, 3 positions, a $10
+loss stop) for a first week.
 
-**Security:** the server listens on `127.0.0.1` only, needs a token, and refuses requests from web pages.
+**The rails**, enforced in the backend as the agent the token belongs to, whatever the agent says:
+
+- **No buy without a forecast.** The agent records its own fair value for the market (`record_forecast`).
+  A buy must cite one it made in the last 30 minutes, and the price must beat it by the **minimum edge
+  after Polymarket's fee** (default 3¢). An unknown fee is not a zero fee: the buy is refused.
+- **Caps, all agents together:** $25 per order, $100 spend per UTC day, 10 open positions (defaults; 0 =
+  no cap). An agent's own caps can only be lower.
+- **Daily loss stop** ($50): losses realised today plus open losses at the bid. Gains elsewhere never
+  offset a loss, and live positions that can't be read pause buys. At the limit, agent buys stop for the
+  UTC day.
+- **Ask me before each live order**, on by default. A live order waits on the AI Agents page (with a
+  desktop notification) or on your paired phone (`/approve n`, `/reject n`). It is re-checked against the
+  market when you approve, counts against the daily cap while it waits, and expires after 10 minutes.
+- **Ownership.** An agent sells or cancels only what it opened: its own paper book, or what its own live
+  orders actually filled. It cannot close your positions or another agent's.
+- **Exits are never capped or blocked**, and pausing engines is always allowed.
+
+**Permissions, both off by default:** **Whole-account powers** (switching engines on, arming scripts or the
+crypto schedule live, engine settings that spend, flattening the wallet, the Perps account's live actions)
+and **Write and run strategy scripts** (an agent's script with a critical security finding is refused
+outright). An agent can never change the account mode, credentials, its own caps, AI keys, remote control
+or Autopilot.
+
+**Do your agents beat the market?** Every forecast is kept and, once the market resolves, scored against
+the market's own mid at the moment the forecast was made (Brier score, one forecast per agent per market).
+The scoreboard shows each agent against the market and gives no verdict under 30 resolved markets, because
+before that nobody can tell.
+
+**Autopilot** runs one of your named agents on a schedule (every 60 minutes by default, or **Run now**) with
+the provider from Settings → AI provider and your own key. It is just another client: the same tools,
+rules, forecast gate, caps, loss stop and approvals. It is off until you switch it on, and three budgets
+are checked before every call: runs per UTC day (12), tokens per UTC day (1.5M) and tool calls per run
+(15). A provider that reports no token counts is charged an estimate, never zero. A deleted or
+switched-off agent stops it; it never falls back to Default.
+
+**HTTP API**, off by default. **Enable the HTTP API** opens `GET /api/v1/tools`,
+`POST /api/v1/tools/{name}` and `GET /api/v1/openapi.json` on the same port, for scripts, n8n or
+LangChain, with the same token, rails and audit. **Copy curl + Python** puts an example with the chosen
+agent's token on your clipboard. It is the one place a token leaves the app.
+
+**Security:** the server listens on `127.0.0.1` only, needs a token, and refuses any request from a web
+page (an `Origin` header) or with a non-loopback `Host`. Client configs hold **no token**: they launch a
+small relay that reads that agent's token from the encrypted store. Calls are rate-limited (120 a minute
+per agent, 480 overall). Every order attempt, refusal and other action is listed under **Agent activity**,
+the **Connections** panel checks the wallet, AI provider, server, HTTP API, Autopilot, chat bots and price
+feeds, and secrets are scrubbed from every log line.
+
 **What leaves your machine:** whatever the agent reads — including your positions and balance — goes to
-that AI client's provider. Start with paper trading: no model has a proven edge.
+that AI client's provider. Start on paper: no model has a proven edge, and the scoreboard is how you find
+out.
+
+## Agent Hub
+
+Three 3D scenes of what the app is really doing, under **Agent Hub** in the sidebar. They read and never
+write: nothing in the hub can place an order or change a setting.
+
+- **Casino** — a casino hall at night. The house crew stages your real signals, orders and wins, and each
+  AI agent walks to the table of every real tool call it makes. **Walk** puts you on the floor in first
+  person (WASD, mouse to look, Shift to run, the doors or Esc to leave). Press **E** at a table to sit down
+  and play blackjack, roulette or the slots, or at the cashier for your stack. You play on the table itself:
+  click chips to bet and the lit plaques to act at blackjack, click the felt to place chips at roulette,
+  press the slot machine's buttons or pull its lever, and click the sportsbook terminal or the cashier's
+  ledger. These are **play chips**: 1,000 to
+  start, a top-up when you drop under 50, kept in this computer's browser profile, worth nothing and never
+  connected to your wallet. The **sportsbook** board is Polymarket's real sports markets at their live
+  prices (refreshed every 90 s while the casino is open); a play-chip ticket pays at the price you took
+  and settles on Polymarket's real result. Your enabled agents come in as guests and play the tables
+  with their own stacks between jobs.
+
+  On foot you have a hotbar: **1–5** picks empty paws, a cigarette, a beer, vodka or a revolver (**Q**
+  steps through), and holding **F** (or clicking, once the mouse is captured) uses it. Smoke and let go
+  to exhale, drink and watch the buzz meter (too much and you black out and wake by the door), or fire
+  the revolver (**R** reloads): it leaves bullet holes and the crowd puts its paws up, but nobody gets
+  hurt. They're props, like the chips.
+
+  Across the pit from the High-Limit salon, a door in the front wall leads to **The Velvet Tail**, a
+  gentlemen's club with a round stage, dancers on four poles, a cigar lounge, a DJ and a long bar. Walk up
+  to the bar and press **E** to order a cocktail for play chips: it goes in your hotbar's sixth slot.
+  **Space** jumps, and you can jump up onto the stages.
+
+  The Casino has **sound**: jazz in the hall and slower jazz in the club, mixed by where you stand, plus
+  sound effects for the games, the doors, the hotbar and the crowd. The speaker button next to **Walk** (or
+  **M**) turns it off, and the setting is remembered. The music is by Kevin MacLeod (incompetech.com),
+  licensed CC BY 4.0, credited on screen as each track starts, and bundled with the app.
+- **High Stakes** — your forecasters at a poker table: each one's fair value on a market as its bet,
+  scored when the market settles.
+- **Race Track** — every trade races in its price lane until it settles.
 
 ## Polymarket Perps (market maker)
 
@@ -283,7 +407,13 @@ krypt-polybot/
 │    ├─ ai_analysis.py     AI market reading — no numeric estimate, by schema
 │    ├─ ai_secrets.py      provider API keys, same encrypted writer as the wallet
 │    ├─ remote.py          chat command brain: pairing, gating, audit
-│    ├─ mcp_server.py      AI agent server (MCP)   mcp_tools.py  its tools + gates
+│    ├─ ai_providers.py    the six AI providers (cloud + Ollama / LM Studio)
+│    ├─ mcp_server.py      AI agent server (MCP + HTTP API)   mcp_tools.py  its 39 tools
+│    ├─ mcp_agents.py      named agents and their rules       mcp_rails.py  money rails + approvals
+│    ├─ forecast_ledger.py agents' forecasts, scored vs the market   mcp_stdio.py  client relay
+│    ├─ autopilot.py       runs one agent on a schedule, with budgets
+│    ├─ health.py          the Connections checks             logscrub.py   secret scrubber for logs
+│    ├─ perps_maker.py     Perps market maker (+ perps_api / perps_board / perps_backtest)
 │    ├─ bot_discord.py     Gateway transport      bot_telegram.py  long-poll transport
 │    └─ scanner/trader/crypto15m/service  the automation
 ├─ src/                  React UI (terminal, dashboard, settings, 15m crypto, etc.)
@@ -308,10 +438,11 @@ npm install
 npm run dev          # `predev` auto-creates python/.venv and installs backend deps (~30s, one-time)
 ```
 
-Then in the app: **Wallet** → paste your Polygon wallet private key (the one holding your USDC) → it
-derives Polymarket CLOB API credentials and shows your balance. Every engine
-starts **off**; nothing trades until you enable it — and once enabled it places **real orders**. The
-terminal's paper mode covers orders you place by hand; **it does not cover the engines**.
+Then in the app: the first-run wizard starts you on **Paper** (real order books, imaginary money, no wallet
+needed). To trade for real: **Wallet** → paste your Polygon wallet private key (the one holding your USDC)
+→ it derives Polymarket CLOB API credentials and shows your balance → **Settings → Account → Go live**.
+Every engine starts **off**. In Paper an engine you switch on sends nothing; once the app is Live it places
+**real orders**.
 
 Bootstrap just the Python venv without launching the app: `npm run py:setup`.
 
@@ -347,6 +478,7 @@ signs an order offline), so a backend missing a dependency can never reach an in
 ```bash
 npm run py:test                      # Python backend tests (pytest, 1,000+)
 npm run typecheck                    # TypeScript (renderer + electron)
+npm test                             # renderer + electron unit tests (vitest)
 npm run test:e2e                     # launches the real app; covers the script arming flow
 npm run py:backtest                  # fee-aware net-of-fee edge over YOUR resolved signals
 npm run py:backtest -- --breakdown   #   + per-category / per-entry-price breakdown
@@ -365,8 +497,9 @@ net-positive *after* Polymarket fees (see [Strategies & honesty](#strategies--ho
 
 The strategies are **heuristic point systems with hand-tuned constants**, not validated models, and they
 have **no proven, out-of-sample, fee-adjusted edge**. The entry/sizing logic does **not** fully model
-Polymarket's taker fees — which can erode small edges. The built-in engines have **no paper mode** —
-enabling one risks real money — so treat the example settings as examples, backtest them on your own
+Polymarket's taker fees — which can erode small edges. The built-in engines are **not simulated** in
+Paper (they simply send nothing), so enabling one on a Live account risks real money. Treat the example
+settings as examples, backtest them on your own
 resolved signals (`npm run py:backtest`), start with a small amount, and form your own view before
 sizing up. The one exception is **user scripts**, which start in
 [shadow mode](#custom-strategy-scripts) and record what they *would* have traded until you arm them.
@@ -411,8 +544,9 @@ Still open:
 | Settings | `%APPDATA%/Krypt PolyBot/settings.json` |
 | Credentials | `%APPDATA%/Krypt PolyBot/credentials/` |
 | Bot tokens | `%APPDATA%/Krypt PolyBot/credentials/bot.{discord,telegram}.token` (encrypted) |
-| AI provider keys | `%APPDATA%/Krypt PolyBot/credentials/ai.{openai,anthropic}.key` (encrypted) |
-| AI agent token | `%APPDATA%/Krypt PolyBot/credentials/mcp.token` (encrypted) |
+| AI provider keys | `%APPDATA%/Krypt PolyBot/credentials/ai.<provider>.key` (encrypted; Ollama and LM Studio need none) |
+| AI agent tokens | `%APPDATA%/Krypt PolyBot/credentials/mcp.token` (the Default agent) and `mcp_<id>.token` per named agent (encrypted) |
+| MCP relay pointer | `%APPDATA%/Krypt PolyBot/mcp/bridge.json` (port + pid, no secret) |
 | Database | `%APPDATA%/Krypt PolyBot/data/krypt-polybot.db` |
 | Logs | `%APPDATA%/Krypt PolyBot/logs/backend.log` |
 
@@ -424,8 +558,8 @@ rest with the OS keystore (DPAPI)** — tied to your user account, with no key s
 On non-Windows dev builds they fall back to plaintext. Anyone with your private key controls that wallet's
 funds, so use a dedicated trading wallet funded only with what you intend to trade.
 
-**Chat bot tokens** are stored the same way, in the same directory, and are never written to
-`settings.json`. If a bot token leaks, the paired-id allowlist still stops a stranger from issuing
+**Chat bot tokens, AI provider keys and AI agent tokens** are stored the same way, in the same directory,
+and are never written to `settings.json`. If a bot token leaks, the paired-id allowlist still stops a stranger from issuing
 commands — but revoke the token anyway (BotFather / the Discord developer portal) and unpair from the
 **Remote** page.
 

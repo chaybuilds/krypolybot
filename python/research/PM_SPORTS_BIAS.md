@@ -4,8 +4,8 @@ Evidence behind `examples/sports-favourite-bias.py`.
 
 ## Data
 
-A private tracker dataset of Polymarket sports snapshots (not included in this
-repo):
+`Krypt Scout`'s tracker DB (`data/kryptscout.sqlite`, 54 MB) — not its models,
+which are not the asset here:
 
 - **36,407** Polymarket sports markets, **35,784 settled** with a winner
 - **128,718** price snapshots stamped at T-1440 / T-360 / T-60 / T-15 minutes
@@ -26,8 +26,9 @@ Calibration at T-60, n=34,710. Implied vs actual win rate:
 | 80-90c | 1,648 | 85.0% | 85.9% | +0.9 |
 
 Within ~1 percentage point everywhere. **A better forecasting model will not
-find edge here** — the devigged closing line is already the best forecast. Do
-not go looking for alpha in the middle of this curve.
+find edge here** — which is what Krypt Scout's own docs concede when they say
+the devigged closing line beats every v1 model. Do not go looking for alpha in
+the middle of this curve.
 
 ## Nor is there exploitable pre-game drift
 
@@ -91,7 +92,7 @@ Stability by quarter (0.5c spread, 90-99c, T-60):
   may enter days out, where the bias is unmeasured. `MIN_VOLUME` is a crude
   proxy for proximity to the event.
 - Reproduce with the scratch scripts used on 2026-07-25 (calibration, drift,
-  stability, live spread) — they read the tracker dataset read-only.
+  stability, live spread) — they read the Scout DB read-only.
 
 ## Why this is NOT the crypto deep-favourite trade
 

@@ -1,3 +1,11 @@
+"""Unit tests for the pure decision logic in trader.py.
+
+Covers position sizing, signal-cost/edge interpretation, the should_trade
+gate matrix, limit-cross pricing, Polymarket order/position parsing, the
+order->db status machine, and binary settlement payout. These are the
+functions whose past regressions are documented in trader.py's module
+docstring and inline comments — pin them down.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +18,9 @@ from config import merge_with_defaults
 
 @pytest.fixture
 def cfg() -> dict:
+    """A fully-populated config (all DEFAULT_CONFIG keys present)."""
     return merge_with_defaults({})
+
 
 
 def test_size_below_base_edge_uses_min_fraction(cfg):
@@ -23,6 +33,7 @@ def test_size_above_max_edge_capped_by_hard_max(cfg):
 
 def test_size_interpolates_between_edges(cfg):
     assert trader._compute_position_usd(1000.0, 12.5, cfg) == pytest.approx(40.0)
+
 
 
 def test_signal_cost_whale_uses_taker_side_price():
@@ -44,6 +55,7 @@ def test_compute_edge_momentum_no_side():
         {"direction": "no", "price": 0.30, "confidence": 80.0}, "momentum"
     )
     assert edge == pytest.approx(10.0)
+
 
 
 def test_should_trade_passes_clean_whale(cfg):
@@ -170,6 +182,7 @@ def test_should_trade_momentum_signal_type_not_allowed(cfg):
     assert ok is False and "not allowed" in reason
 
 
+
 def test_signal_rule_values_are_direction_adjusted():
     sig = {"price": 0.30, "confidence": 80.0, "direction": "no"}
     v = trader._signal_rule_values(sig, "momentum")
@@ -213,6 +226,7 @@ def test_use_rules_still_honors_structural_gates(cfg):
             "direction": "no", "signal_type": "price_move"}
     ok, reason = trader.should_trade(msig, "momentum", cfg)
     assert ok is False and "not allowed" in reason
+
 
 
 def test_limit_cross_crosses_ask_plus_margin(cfg, monkeypatch):
@@ -268,6 +282,7 @@ def test_market_style_pays_up_to_cap(cfg):
     assert px == 99
 
 
+
 def test_parse_polymarket_order_matched():
     parsed = trader._parse_polymarket_order({
         "status": "MATCHED", "size_matched": "5", "original_size": "5",
@@ -299,6 +314,26 @@ def test_parse_polymarket_order_canceled():
     })
     assert parsed["status"] == "canceled"
     assert parsed["filled"] == 0
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("matched", "executed"), ("ORDER_STATUS_MATCHED", "executed"),
+    ("unmatched", "canceled"), ("ORDER_STATUS_UNMATCHED", "canceled"),
+    ("killed", "canceled"), ("CANCELED", "canceled"), ("cancelled", "canceled"),
+    ("ORDER_STATUS_CANCELED_MARKET_RESOLVED", "canceled"), ("INVALID", "canceled"),
+    ("LIVE", "resting"), ("ORDER_STATUS_LIVE", "resting"), ("delayed", "delayed"),
+])
+def test_parse_polymarket_order_status_is_compared_exactly(raw, want):
+    parsed = trader._parse_polymarket_order({"status": raw, "size_matched": "0",
+                                             "original_size": "5", "price": "0.5"})
+    assert parsed["status"] == want
+
+
+@pytest.mark.parametrize("raw", ["MATCHING", "rematch_pending", "mismatched"])
+def test_parse_polymarket_order_unknown_status_is_not_a_fill(raw):
+    parsed = trader._parse_polymarket_order({"status": raw, "size_matched": "0",
+                                             "original_size": "5", "price": "0.5"})
+    assert parsed["status"] != "executed"
 
 
 def test_parse_polymarket_fill_live_fp_dollars_shape():
@@ -349,6 +384,7 @@ def test_db_status_canceled_with_partial_fill():
 def test_db_status_resting_unfilled_is_submitted():
     parsed = {"status": "resting", "filled": 0}
     assert trader._db_status_from_order(parsed, target=5) == "submitted"
+
 
 
 def test_yes_payout_result_yes_is_one():

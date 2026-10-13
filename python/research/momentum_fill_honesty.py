@@ -1,3 +1,16 @@
+"""Fill-honesty stress test for the armed BTC 15m Price Momentum strategy.
+
+Re-runs the exact live probe config (imported from probe_btc_momentum) through
+replay.replay under a grid of quote-staleness / signal-to-fill-latency
+assumptions. The baseline cell (0, 0) is the historical fill-at-recorded-ask
+convention that produced +27.95c/ct — the question is how much of that edge
+survives when fills require a quote that didn't JUST move (stale-quote guard)
+and a realistic submit-to-match delay.
+
+Read-only against the funded default account's DB (safe while the probe runs).
+
+    python research/momentum_fill_honesty.py [--days 90] [--json out.json]
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +20,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ.setdefault("KRYPT_POLYBOT_USERDATA", os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Krypt PolyBot"))
+os.environ.setdefault("KRYPT_POLYBOT_USERDATA", r"C:\Users\maxwe\AppData\Roaming\Krypt PolyBot")
 
 import replay
 from config import merge_with_defaults

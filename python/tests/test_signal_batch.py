@@ -1,3 +1,13 @@
+"""Signal fan-out: a scan emits ONE `signal:batch`, not one event per row.
+
+A whale/momentum scan used to `await emit_event("signal:new", ...)` per row —
+one blocking stdout write plus one main→renderer IPC hop each, up to 40 per
+scan. The rows are now shipped as a single `signal:batch` event carrying the
+whole array; the renderer applies it in one state update.
+
+These drive one real iteration of the service loop rather than asserting on
+source text, so the wiring (row → JS shape → event) is what's under test.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +19,8 @@ import service
 
 
 class _FakeConn:
+    """Stands in for db.get_db()'s context manager — the loop only uses the
+    handle to look up already-traded signal ids, which we stub separately."""
 
     def __enter__(self):
         return self
@@ -18,6 +30,10 @@ class _FakeConn:
 
 
 def _drive_one_scan(monkeypatch, *, source, rows):
+    """Run a single loop iteration with only the `source` scan producing rows.
+
+    Returns the list of (event_name, data) the loop emitted.
+    """
     events: list[tuple[str, object]] = []
 
     async def _emit(name, data=None):
@@ -37,6 +53,10 @@ def _drive_one_scan(monkeypatch, *, source, rows):
         return 0
     monkeypatch.setattr(service.scanner, "sync_markets", _no_markets)
     monkeypatch.setattr(service.scanner, "sync_events", _no_markets)
+    monkeypatch.setattr(service.activity_ws, "start", lambda *a, **k: None)
+    monkeypatch.setattr(service.activity_ws, "stop", _no_markets)
+    monkeypatch.setattr(service.activity_ws, "is_running", lambda: False)
+    monkeypatch.setattr(service.crypto15m_record, "record_tick", _no_markets)
 
     async def _scan_whales(cfg):
         return (len(rows), rows) if source == "whale" else (0, [])

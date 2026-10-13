@@ -1,3 +1,10 @@
+"""AI agents over MCP — the wider toolset, pinned.
+
+update_config, read-only SQL over the research DB, the agent's own paper
+stops, live stops attributed to the agent, and the prompts. Each test guards
+a way "the agent can do anything" turns into "the agent did something nobody
+allowed".
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +16,8 @@ import mcp_server
 import mcp_tools
 import terminal_paper as tp
 import terminal_trade as tt
-from test_mcp import _call, _fake_service, _mock_book, _run, _text
+from test_mcp import (_agent_buy, _call, _fake_service, _forecast, _mock_book,
+                      _no_venue, _run, _text)
 
 
 @pytest.fixture
@@ -18,6 +26,7 @@ def fresh(tmp_path, monkeypatch):
     db.init_db()
     mcp_server._sessions.clear()
     return tmp_path
+
 
 
 def test_an_agent_cannot_touch_its_own_caps_or_permissions(fresh, monkeypatch):
@@ -42,7 +51,8 @@ def test_safe_changes_need_no_live_permission_and_risky_ones_do(fresh, monkeypat
     svc, events = _fake_service(monkeypatch, mcp_live_trading_enabled=False,
                                 copy_enabled=True)
     assert not _call("update_config", {"changes": {"copy_enabled": False}})["isError"]
-    assert not _call("update_config", {"changes": {"terminal_paper_mode": True}})["isError"]
+    assert _call("update_config", {"changes": {"terminal_paper_mode": True}})["isError"]
+    assert _call("update_config", {"changes": {"flatten_on_daily_stop": False}})["isError"]
     res = _call("update_config", {"changes": {"copy_fixed_usd": 500.0}})
     assert res["isError"] and "OFF" in _text(res)
     assert events[0] == ("mcp:configPatch", {"patch": {"copyEnabled": False}})
@@ -63,6 +73,7 @@ def test_live_permission_reaches_any_engine_setting_typed_and_clamped(fresh, mon
                                       "crypto15mDirectionMode": "contrarian"}
     assert _call("update_config", {"changes": {"copy_fixed_usd": "lots"}})["isError"]
     assert _call("update_config", {"changes": {"make_money": True}})["isError"]
+
 
 
 def test_sql_reads_work(fresh, monkeypatch):
@@ -98,6 +109,37 @@ def test_sql_row_limit_is_enforced(fresh, monkeypatch):
     assert len(out["rows"]) == 10 and out["truncated"] is True
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT k, v FROM app_kv",
+    "SELECT v FROM main.APP_KV WHERE k LIKE 'remote:%'",
+    "WITH x AS (SELECT * FROM app_kv) SELECT group_concat(v) FROM x",
+    "SELECT 1, (SELECT v FROM app_kv WHERE k LIKE '%paircode%')",
+    "SELECT count(*) FROM app_kv WHERE v LIKE '%\"code\": \"%'",
+])
+def test_sql_cannot_read_the_apps_private_state(fresh, monkeypatch, sql):
+    """app_kv is the app's own state, not recorded data — and the live
+    remote-control pairing code is in it. An agent that read the code (and
+    had any way out, like a web fetch) could pair a stranger's chat account
+    as a controller of the app."""
+    _fake_service(monkeypatch)
+    import remote
+    code = remote.new_pair_code("telegram")["code"]
+    res = _call("research_data", {"sql": sql})
+    assert res["isError"] and code not in _text(res), _text(res)
+    assert "app_kv" in _text(res)
+
+
+def test_the_inventory_does_not_offer_the_private_state(fresh, monkeypatch):
+    svc, _ = _fake_service(monkeypatch)
+
+    async def _stats(_p):
+        return {"streams": []}
+    svc._h_collection_stats = _stats
+    import json
+    out = json.loads(_text(_call("research_data", {})))
+    assert not [t for t in out["schema"] if t["table"] == "app_kv"]
+
+
 def test_inventory_lists_the_schema(fresh, monkeypatch):
     svc, _ = _fake_service(monkeypatch)
 
@@ -109,11 +151,13 @@ def test_inventory_lists_the_schema(fresh, monkeypatch):
     assert any(t["table"] == "terminal_orders" for t in out["schema"])
 
 
+
 def test_agent_paper_stop_fires_into_its_own_book(fresh, monkeypatch):
     _fake_service(monkeypatch)
     _mock_book(monkeypatch)
     buy = {"mode": "paper", "conditionId": "0xabc", "side": "yes", "action": "buy",
-           "size": 10, "priceCents": 50, "orderType": "FAK"}
+           "size": 10, "priceCents": 50, "orderType": "FAK",
+           "forecastId": _forecast()}
     assert not _call("place_order", buy)["isError"]
     res = _call("manage_standing_instructions", {
         "mode": "paper", "action": "add", "kind": "stopLoss",
@@ -128,19 +172,47 @@ def test_agent_paper_stop_fires_into_its_own_book(fresh, monkeypatch):
     assert _run(mcp_tools.paper_standing_tick()) == 0
 
 
-def test_agent_paper_stop_needs_mode(fresh, monkeypatch):
-    _fake_service(monkeypatch)
-    res = _call("manage_standing_instructions", {"action": "list"})
-    assert res["isError"]
+def test_agent_paper_stops_are_per_agent(fresh, monkeypatch):
+    _fake_service(monkeypatch, mcp_agents=[{"id": "default"}, {"id": "sam", "name": "Sam"}])
+    sam = {"client": "c", "agent": "sam", "reads": 0, "writes": 0, "refused": 0}
+    res = _run(mcp_tools.call("manage_standing_instructions", {
+        "action": "add", "kind": "alertAbove", "conditionId": "0xabc",
+        "side": "yes", "triggerCents": 70}, sam))
+    assert not res["isError"], _text(res)
+    import json
+    mine = json.loads(_text(_call("manage_standing_instructions", {"action": "list"})))
+    assert mine["instructions"] == [], "Default sees Sam's instruction"
+    sid = mcp_tools._ps_load()[0]["id"]
+    assert _call("manage_standing_instructions", {"action": "cancel", "id": sid})["isError"]
+
+
+def test_a_live_stop_needs_shares_the_agent_opened(fresh, monkeypatch):
+    _fake_service(monkeypatch, mcp_trade_mode="live",
+                  mcp_agents=[{"id": "default", "mode": "live"}])
+    _no_venue(monkeypatch)
+    stop = {"action": "add", "kind": "stopLoss", "conditionId": "0xabc",
+            "side": "yes", "triggerCents": 60, "size": 5}
+    res = _call("manage_standing_instructions", stop)
+    assert res["isError"] and "at most 0" in _text(res)
 
 
 def test_a_live_stop_written_by_the_agent_fires_as_an_ai_order(fresh, monkeypatch):
-    _fake_service(monkeypatch, mcp_live_trading_enabled=True)
+    """It is the agent's order; Track and the order log must not say 'You'.
+    And while it is armed it reserves the shares: the agent cannot also sell
+    them by hand."""
+    import mcp_rails
+    _fake_service(monkeypatch, mcp_trade_mode="live",
+                  mcp_agents=[{"id": "default", "mode": "live"}])
+    _no_venue(monkeypatch)
+    with db.get_db() as conn:
+        _agent_buy(conn, oid="0xb1", size=5, filled_shares=5)
     res = _call("manage_standing_instructions", {
         "mode": "live", "action": "add", "kind": "stopLoss",
         "conditionId": "0xabc", "side": "yes", "triggerCents": 60, "size": 5})
     assert not res["isError"], _text(res)
-    assert tt.standing_list()[0]["origin"] == "ai"
+    entry = tt.standing_list()[0]
+    assert entry["origin"] == "ai" and entry["agentId"] == "default"
+    assert mcp_rails.live_net("0xabc", "yes", "default") == 0.0
 
     async def _market(cid, include_raw=False):
         return {"conditionId": cid, "title": "T", "probability": 40.0}
@@ -151,6 +223,12 @@ def test_a_live_stop_written_by_the_agent_fires_as_an_ai_order(fresh, monkeypatc
 
     async def _place(req, *, origin="manual", standing_id=None):
         sent.append(origin)
+        tt._record_order({"condition_id": req["conditionId"], "side": req["side"],
+                          "action": "sell", "order_type": "FAK",
+                          "requested_size": req["size"], "requested_price_cents": 60,
+                          "sent_size": req["size"], "sent_price_cents": 60,
+                          "order_id": "0xstop", "status": "placed", "origin": origin,
+                          "standing_id": standing_id})
         return {"ok": True, "message": "sold"}
 
     async def _preview(req):
@@ -161,6 +239,8 @@ def test_a_live_stop_written_by_the_agent_fires_as_an_ai_order(fresh, monkeypatc
     monkeypatch.setattr(tt, "preview", _preview)
     _run(tt.standing_tick())
     assert sent == ["ai"]
+    assert mcp_rails.live_net("0xabc", "yes", "default") <= 0.0
+
 
 
 def test_prompts_list_and_render(fresh):

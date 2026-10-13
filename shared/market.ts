@@ -610,7 +610,17 @@ export type AiLean = 'cheap' | 'rich' | 'fair' | 'no_view';
 
 export type AiConfidence = 'low' | 'medium' | 'high';
 
-export type AiProvider = 'anthropic' | 'openai';
+export type AiProvider =
+  | 'anthropic' | 'openai' | 'openrouter' | 'gemini' | 'ollama' | 'lmstudio';
+
+export const AI_PROVIDERS: readonly AiProvider[] = [
+  'anthropic', 'openai', 'openrouter', 'gemini', 'ollama', 'lmstudio',
+];
+export const AI_KEYED_PROVIDERS: readonly AiProvider[] = ['anthropic', 'openai', 'openrouter', 'gemini'];
+export const AI_PROVIDER_LABEL: Record<AiProvider, string> = {
+  anthropic: 'Anthropic', openai: 'OpenAI', openrouter: 'OpenRouter', gemini: 'Google Gemini',
+  ollama: 'Ollama (local)', lmstudio: 'LM Studio (local)',
+};
 
 export interface AiSource {
   url: string;
@@ -643,15 +653,44 @@ export interface AiAnalysis {
 export interface AiKeyState {
   present: boolean;
   masked: string | null;
+  needsKey?: boolean;
+}
+
+export interface AiProviderCaps {
+  label?: string;
+  local?: boolean;
+  needsKey?: boolean;
+  webSearch?: boolean;
+  webSearchHow?: string;
+  tools?: 'all' | 'per-model';
+  toolsHow?: string;
+  tokens?: string;
+  pricing?: 'published' | 'provider' | 'none' | 'free';
+}
+
+export interface AiProviderCheck {
+  ok: boolean;
+  provider: AiProvider;
+  message: string;
+  model?: string;
+  models?: string[];
+  tools?: boolean | null;
+  webSearch?: boolean;
 }
 
 export interface AiStatus {
   enabled: boolean;
   provider: AiProvider;
+  model?: string;
   webSearch: boolean;
   offline: boolean;
-  models: Record<AiProvider, string>;
-  keys: Record<AiProvider, AiKeyState>;
+  models: Partial<Record<AiProvider, string | string[]>>;
+  keys: Partial<Record<AiProvider, AiKeyState>>;
+  providers?: AiProvider[];
+  capabilities?: Partial<Record<AiProvider, AiProviderCaps>>;
+  hasKey?: boolean;
+  webSearchSetting?: boolean;
+  prices?: Record<string, { inPerMTok: number; outPerMTok: number }>;
 }
 
 export const AI_LEAN_LABEL: Record<AiLean, string> = {
@@ -761,4 +800,281 @@ export function fmtHours(v: number | null | undefined): string {
     if (n < 48) return `${n.toFixed(1)}h`;
     return `${(n / 24).toFixed(0)}d`;
   });
-}
+}
+
+export type McpTradeMode = 'off' | 'paper' | 'live';
+export type AccountMode = 'paper' | 'live';
+
+export interface McpRails {
+  maxOrderUsd: number;
+  dailySpendUsd: number;
+  maxOpenPositions: number;
+  minEdgeCents: number;
+  dailyLossUsd: number;
+  forecastTtlMin: number;
+}
+
+export interface McpAgentStatus {
+  id: string;
+  name: string;
+  emoji: string;
+  color: string;
+  enabled: boolean;
+  configuredMode: 'paper' | 'live';
+  mode: McpTradeMode;
+  rails: McpRails;
+  rulesInWords: string[];
+  serverName: string;
+  spentTodayUsd: number | null;
+  hasToken: boolean;
+  tokenMasked: string | null;
+  sessions: number;
+}
+
+export interface McpOrderRow {
+  id: number;
+  at: string;
+  mode: 'paper' | 'live';
+  client: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  conditionId: string;
+  title: string | null;
+  side: 'yes' | 'no';
+  action: 'buy' | 'sell';
+  orderType?: string | null;
+  size: number;
+  priceCents: number;
+  forecastId: number | null;
+  committedUsd: number | null;
+  ok: boolean;
+  orderId: string | null;
+  filled: number | null;
+  avgFillCents: number | null;
+  message: string;
+  status: 'pending' | 'deciding' | 'approved' | 'rejected' | 'expired' | 'failed'
+    | 'unknown' | 'cancelled' | string | null;
+}
+
+export interface McpActivity {
+  orders: McpOrderRow[];
+  pending: McpOrderRow[];
+}
+
+export interface McpLossToday {
+  realizedUsd?: number;
+  unrealizedUsd?: number;
+  lossUsd: number;
+  unmarkedCostUsd?: number;
+  positionsUnreadable?: boolean;
+}
+
+export interface McpToolCallEvent {
+  v: 1;
+  kind: 'call' | 'connect';
+  at: number;
+  client: string;
+  transport: string | null;
+  model: string | null;
+  tool: string | null;
+  outcome: 'ok' | 'refused' | 'error';
+  reason: string | null;
+  durationMs: number;
+  summary: string;
+  conditionId?: string | null;
+  ticker?: string | null;
+  fairCents: number | null;
+  edgeCents: number | null;
+  midCents?: number | null;
+  side: 'yes' | 'no' | null;
+  mode: 'paper' | 'live' | null;
+  suppressed?: number;
+  agentId?: string | null;
+  agentName?: string | null;
+}
+
+export interface McpOrderEvent {
+  mode: McpTradeMode | 'action';
+  message: string;
+  approvalId?: number | null;
+  status?: string;
+  kind?: string;
+  ok?: boolean;
+  agentId?: string | null;
+  agentName?: string | null;
+  title?: string | null;
+  conditionId?: string | null;
+  side?: string | null;
+  action?: string | null;
+  orderType?: string | null;
+  size?: number | null;
+  price?: number | null;
+  orderId?: string | null;
+  filled?: number | null;
+  reason?: string | null;
+}
+
+export interface McpSeen {
+  clients: {
+    client: string; agentId?: string | null; at?: number | null; called?: boolean;
+    firstAt?: number; lastAt?: number; calls?: number; model?: string | null;
+  }[];
+  agents?: { agentId: string; firstAt: number; lastAt: number; calls: number; clients: string[] }[];
+  now?: number;
+}
+
+export type ForecastVerdict = 'too-few' | 'indistinguishable' | 'agent-better' | 'market-better';
+
+export interface ForecastScore {
+  n: number;
+  nPaired: number;
+  brierAgent: number | null;
+  brierAgentPaired: number | null;
+  brierMarket: number | null;
+  skill: number | null;
+  diffMean: number | null;
+  diffSe: number | null;
+  verdict: ForecastVerdict;
+}
+
+export interface ForecastRow {
+  id: number;
+  createdAt: string | null;
+  conditionId: string;
+  title: string | null;
+  model: string | null;
+  client: string | null;
+  agentId: string | null;
+  fairValueCents: number | null;
+  marketMidCents: number | null;
+  outcome: number | null;
+  resolvedAt: string | null;
+  brierAgent: number | null;
+  brierMarket: number | null;
+}
+
+export interface AgentScore extends ForecastScore {
+  agentId: string;
+  total: number;
+  pending: number;
+  lastAt: string | null;
+  models?: string[];
+  clients?: string[];
+}
+
+export interface ForecasterScore extends ForecastScore {
+  client: string | null;
+  model: string | null;
+  agentId?: string | null;
+  total: number;
+  pending: number;
+  lastAt: string | null;
+  open: { conditionId: string; fairValueCents: number; marketMidCents: number | null; createdAt: string | null }[];
+}
+
+export interface ForecastScoreboard {
+  totalForecasts: number;
+  pending: number;
+  resolved: number;
+  scoredMarkets: number;
+  minScored: number;
+  overall: ForecastScore;
+  buckets: { lo: number; hi: number; n: number; meanForecast: number; hitRate: number }[];
+  byAgent?: AgentScore[];
+  byForecaster?: ForecasterScore[];
+  recent: ForecastRow[];
+}
+
+export type HealthStatus = 'ok' | 'warn' | 'fail' | 'off';
+
+export type HealthAction =
+  | { kind: 'nav'; page: string; label: string }
+  | { kind: 'copy'; text: string; label: string };
+
+export interface HealthRow {
+  id: string;
+  label: string;
+  status: HealthStatus;
+  detail: string;
+  fix: string | null;
+  action: HealthAction | null;
+  network: boolean;
+  tested: boolean;
+}
+
+export interface HealthReport {
+  checkedAt: string;
+  deep: boolean;
+  rows: HealthRow[];
+}
+
+export interface PaperStatus {
+  accountMode?: AccountMode;
+  bankrollUsd: number;
+  cashUsd: number | null;
+  equityUsd: number | null;
+  realizedPnlUsd: number | null;
+  unrealizedPnlUsd?: number | null;
+  returnPct?: number | null;
+  openPositions: number;
+  restingOrders?: number;
+  nextBankrollUsd?: number | null;
+  hasWalletKey?: boolean;
+  unmarked?: number;
+  fetchedAt?: string;
+}
+
+export interface AgentPaper {
+  portfolio: {
+    cashUsd?: number | null; equityUsd?: number | null; returnPct?: number | null;
+    realizedPnlUsd?: number | null; totalUnrealizedPnlUsd?: number | null; bankrollUsd?: number;
+    positions?: {
+      conditionId: string; title: string | null; side: string; size: number;
+      avgCostCents: number | null; markCents: number | null; unrealizedPnlUsd: number | null;
+    }[];
+  } | null;
+  orders: {
+    orders?: {
+      localId: number; title: string | null; side: string; action: string;
+      filledSize: number; avgFillPriceCents: number | null; status: string; createdAt: string;
+    }[];
+  } | null;
+}
+
+export interface AutopilotRun {
+  id: number;
+  startedAt: string;
+  finishedAt: string | null;
+  trigger: 'schedule' | 'manual' | string;
+  provider: string;
+  model: string;
+  status: 'running' | 'ok' | 'steps' | 'budget' | 'context' | 'stopped' | 'error' | string;
+  steps: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  tokensEstimated?: boolean;
+  costUsd: number | null;
+  summary: string;
+  error: string | null;
+  tools: { tool: string; ok: boolean; brief: string }[];
+}
+
+export interface AutopilotStatus {
+  enabled: boolean;
+  running: boolean;
+  startedAt?: string | null;
+  step?: number;
+  lastError: string | null;
+  nextRunAt: string | null;
+  blockedReason: string | null;
+  today: { runs: number; tokens: number; costUsd: number | null };
+  limits: { intervalMin: number; maxRunsPerDay: number; dailyTokenBudget: number; maxSteps: number };
+  provider: string;
+  providerLabel?: string;
+  model: string;
+  tokenAccounting?: string;
+  toolCount?: number;
+  runs: AutopilotRun[];
+  agentId?: string;
+  agentName?: string | null;
+}

@@ -1,3 +1,22 @@
+"""15-minute crypto market monitor (READ-ONLY).
+
+Powers the "15m Crypto" tab. Tracks Polymarket's seven 15-minute crypto
+series and surfaces a momentum entry *signal* for each: in the last
+`time_delay` minutes of a quarter, when one side is a strong favorite
+(>= entry threshold) and the underlying has moved at least
+`min_delta_pct` from the quarter's opening spot price.
+
+This module NEVER places, modifies, or cancels an order — it only reads
+public Polymarket market data and a public crypto spot feed. The spot price
+(needed to compute delta) comes from CoinGecko because Polymarket's API only
+exposes contract probabilities, not the live underlying price.
+
+Every threshold is user-configurable from the 15m Crypto tab and
+overridable via `crypto15m_*` config keys. The shipped defaults
+(8-minute window, 85c favorite, 40c stop, 0.02 markup) are just one
+common favorite-follow baseline — treat them as a starting point, not a
+proven edge.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +54,9 @@ ALL_ASSETS = [s["asset"] for s in SERIES]
 
 
 def asset_enabled(cfg: dict, asset: str) -> bool:
+    """True if the executor may open NEW positions on `asset`. None/missing
+    `crypto15m_assets` = all enabled; a list restricts to those symbols (an
+    empty list disables every asset)."""
     raw = (cfg or {}).get("crypto15m_assets")
     if isinstance(raw, list):
         return asset.upper() in {str(a).upper() for a in raw}
@@ -110,6 +132,9 @@ def _to_float(v) -> float:
 
 
 def _price_dollars(m: dict, key: str) -> float:
+    """Polymarket ships both integer-cents (`yes_bid`) and dollar
+    (`yes_bid_dollars`) fields for prices; prefer the dollar form and
+    fall back to cents/100."""
     d = m.get(f"{key}_dollars")
     if d is not None:
         return _to_float(d)
@@ -131,6 +156,7 @@ def _parse_close_epoch(close_time: str) -> Optional[float]:
 
 
 async def _spots_cryptocompare(client: httpx.AsyncClient) -> dict[str, float]:
+    """One call covers every tracked asset (incl. HYPE/BNB)."""
     syms = ",".join(s["asset"] for s in SERIES)
     resp = await client.get(_CRYPTOCOMPARE_URL, params={"fsyms": syms, "tsyms": "USD"})
     resp.raise_for_status()
@@ -146,6 +172,7 @@ async def _spots_cryptocompare(client: httpx.AsyncClient) -> dict[str, float]:
 
 
 async def _spots_coinbase(client: httpx.AsyncClient) -> dict[str, float]:
+    """Per-asset spot fallback. Coinbase now lists every tracked coin."""
     async def one(s: dict) -> tuple[str, Optional[float]]:
         try:
             r = await client.get(_COINBASE_URL.format(sym=s["asset"]))
@@ -160,6 +187,7 @@ async def _spots_coinbase(client: httpx.AsyncClient) -> dict[str, float]:
 
 
 async def _spots_coingecko(client: httpx.AsyncClient) -> dict[str, float]:
+    """Original source, now last-resort (free tier rate-limits hard)."""
     ids = ",".join(s["cg"] for s in SERIES)
     resp = await client.get(_COINGECKO_URL, params={"ids": ids, "vs_currencies": "usd"})
     resp.raise_for_status()
@@ -180,23 +208,41 @@ _SPOT_SOURCES = [
 
 
 async def fetch_spots() -> tuple[dict[str, float], str]:
+    """Every tracked asset's USD spot, with the source that supplied it.
+
+    Returns ``({asset: usd}, source)``. Tries each feed in turn and caches
+    the first non-empty result for `_SPOT_CACHE_TTL` seconds so the three
+    callers (monitor, executor, recorder) share one upstream request. If
+    every feed fails it serves the last good cache (marked "(stale)") so
+    Spot/Open/Δ don't all blank out during a transient outage."""
+    spots, source, _stale = await _fetch_spots()
+    return spots, source
+
+
+async def _fetch_spots() -> tuple[dict[str, float], str, set[str]]:
+    """`fetch_spots`, plus the assets whose price is that stale last-good
+    cache. The source tag alone can't say which: live push feeds still
+    overlay the assets they cover during a REST outage."""
     loop = asyncio.get_event_loop()
     now = loop.time()
 
-    def _overlay(spots: dict, source: str) -> tuple[dict[str, float], str]:
+    def _overlay(spots: dict, source: str,
+                 stale: bool = False) -> tuple[dict[str, float], str, set[str]]:
         cb = spot_ws.fresh_spots()
         ch = rtds_ws.fresh_spots()
+        rest_only = {a for a in spots if a not in cb and a not in ch}
+        stale_assets = rest_only if stale else set()
         if not cb and not ch:
-            return spots, source
+            return spots, source, stale_assets
         merged = {**spots, **cb, **ch}
         parts = []
         if ch:
             parts.append("rtds-ws")
         if any(a in cb and a not in ch for a in merged):
             parts.append("coinbase-ws")
-        if any(a not in ch and a not in cb for a in merged):
+        if rest_only:
             parts.append(source)
-        return merged, "+".join(parts)
+        return merged, "+".join(parts), stale_assets
 
     if _spot_cache["spots"] and (now - _spot_cache["at"]) < _SPOT_CACHE_TTL:
         return _overlay(dict(_spot_cache["spots"]), _spot_cache["source"])
@@ -213,7 +259,8 @@ async def fetch_spots() -> tuple[dict[str, float], str]:
             return _overlay(dict(spots), name)
 
     if _spot_cache["spots"]:
-        return _overlay(dict(_spot_cache["spots"]), f"{_spot_cache['source']} (stale)")
+        return _overlay(dict(_spot_cache["spots"]), f"{_spot_cache['source']} (stale)",
+                        stale=True)
     return _overlay({}, "unavailable")
 
 
@@ -235,6 +282,10 @@ def live_velocity_pct(
     asset: str, spot: Optional[float],
     horizon_s: float = 60.0, tol_s: float = 35.0,
 ) -> Optional[float]:
+    """(spot now / spot ~60s ago − 1)·100 from the rolling live-spot history.
+    Reference = the newest sample at least `horizon_s` old, accepted up to
+    horizon_s+tol_s stale. None until history covers the horizon (callers
+    then fall back to the candle-derived velocity)."""
     if spot is None:
         return None
     dq = _spot_hist.get(asset)
@@ -260,6 +311,9 @@ _indicator_cache: dict[str, dict] = {}
 async def _fetch_closes(
     asset: str, client: httpx.AsyncClient, lookback_min: int
 ) -> tuple[list[float], list[float]]:
+    """The last `lookback_min` one-minute (closes, volumes) for `asset` from
+    Hyperliquid, oldest→newest. Volumes feed the VWAP field (TWAP fallback when
+    absent). Empty lists on any error (caller degrades to None fields)."""
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     body = {
         "type": "candleSnapshot",
@@ -298,6 +352,9 @@ async def _fetch_closes(
 
 
 async def asset_indicators(asset: str) -> dict:
+    """MACD/RSI bundle for one asset's underlying, cached ~60s and shared by
+    the monitor poll, executor tick and recorder. All-None on any failure or
+    until there's enough candle history."""
     loop = asyncio.get_event_loop()
     now = loop.time()
     cached = _indicator_cache.get(asset)
@@ -333,6 +390,13 @@ def _blank_asset(entry: dict, spot: Optional[float], error: Optional[str] = None
 
 
 def _friendly_market_error(e) -> str:
+    """User-facing label for a failed/timed-out market fetch.
+
+    The raw exception name ('TimeoutError') reads like an app bug, but the cause
+    is almost always that Polymarket's Gamma API is unreachable or slow from the
+    user's network/region (it's Cloudflare-fronted and geo-restricted) — while
+    the SPOT price, a DIFFERENT host, still loads. Point the user at the real fix
+    instead of a cryptic type name."""
     name = type(e).__name__
     msg = str(e).lower()
     if ("403" in msg or "451" in msg or "forbidden" in msg
@@ -348,6 +412,10 @@ def _friendly_market_error(e) -> str:
 
 
 def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
+    """Is the (UTC) hour inside the configured trading window?
+
+    [start, end) in UTC hours; start == end (or the full 0..24) means
+    always-on; start > end wraps overnight (e.g. 22 -> 6)."""
     try:
         start = int(cfg.get("crypto15m_hours_start_utc", 0) or 0)
         end = int(cfg.get("crypto15m_hours_end_utc", 24) or 24)
@@ -363,7 +431,17 @@ def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
     return hour >= start or hour < end
 
 
+
 def hour_override(cfg: dict, hour: Optional[int] = None) -> Optional[dict]:
+    """The effective config for `hour` under cfg["crypto15m_hour_configs"].
+
+    No schedule set (key absent/None) -> cfg unchanged. Schedule set and the
+    hour seated -> a merged copy (override wins). Schedule set but the hour
+    unseated -> None (= don't trade this hour). Never mutates cfg.
+
+    An EMPTY schedule dict is "set, nothing seated" -> None for every hour, NOT
+    "no schedule". Conflating the two fell through to the base config while the
+    caller still stamped the rows as parlay, which exempts them from every exit."""
     hcs = cfg.get("crypto15m_hour_configs")
     if hcs is None or not isinstance(hcs, dict):
         return cfg
@@ -378,6 +456,11 @@ def hour_override(cfg: dict, hour: Optional[int] = None) -> Optional[dict]:
 
 
 def resignal_asset(asset: dict, cfg: dict) -> dict:
+    """Recompute the config-derived snapshot fields (inWindow, signal) under a
+    DIFFERENT config than the one the snapshot was built with — the per-hour
+    override. The snapshot bakes the base config's window/threshold into
+    `signal`, so an overlay that only re-gates should_enter would still be
+    reading the OLD signal. Mirrors the snapshot/replay signal expression."""
     a = dict(asset)
     ml = a.get("minsLeft")
     in_window = ml is not None and float(ml) <= _const(cfg, "time_delay_min")
@@ -401,7 +484,18 @@ STRIKE_SOURCES_OK = ("twap", "spot-avg", "binance")
 
 
 def settle_twap_sec(interval: str) -> float:
+    """Length of the settlement average per series: the 5m/15m/4h windows
+    settle on Chainlink's 60s TWAP; the hourly series on a Binance candle's
+    close — a single print."""
     return 0.0 if interval == "hourly" else SETTLE_TWAP_SEC
+
+
+TWAP_SETTLEMENT_SINCE = {"5m": "2026-08-14", "15m": "2026-08-07", "4h": "2026-08-07"}
+
+
+def twap_settlement_since(interval: str) -> Optional[str]:
+    """'YYYY-MM-DD' the series switched to TWAP settlement, or None."""
+    return TWAP_SETTLEMENT_SINCE.get(str(interval or "15m"))
 
 
 def _norm_cdf(x: float) -> float:
@@ -413,6 +507,8 @@ FEE_EXPONENT_CRYPTO = 1.0
 
 
 def _fee_cents(price_cents: float, schedule: Optional[dict] = None) -> float:
+    """Taker fee in cents/share at `price_cents`, using the market's own fee
+    schedule when Gamma provided one (else the crypto-category curve)."""
     if schedule is not None and not schedule.get("enabled", True):
         return 0.0
     rate, exponent = FEE_RATE_CRYPTO, FEE_EXPONENT_CRYPTO
@@ -442,6 +538,10 @@ def model_up_prob(
     *, known_sum: float = 0.0, known_count: int = 0,
     settle_twap_sec: float = SETTLE_TWAP_SEC,
 ) -> Optional[float]:
+    """P(up): probability the settlement value (the `settle_twap_sec` TWAP at
+    the close; a single print when 0) is ≥ the strike. `known_sum` /
+    `known_count` are the live 1-second prints already observed inside the
+    settlement window — ignored outside it. See the block comment above."""
     if spot is None or strike is None or sigma_1m is None or mins_left is None:
         return None
     if spot <= 0 or strike <= 0 or sigma_1m <= 0:
@@ -474,6 +574,11 @@ def model_edge_net_cents(
     up_prob: Optional[float], yes_ask: Optional[float], no_ask: Optional[float],
     fee_schedule: Optional[dict] = None,
 ) -> Optional[float]:
+    """Best fee-adjusted cents of edge the model sees on EITHER side: buy-up
+    edge = P(up)·100 − upAsk − fee, buy-down mirrored. Positive = the model
+    thinks a side is underpriced net of the taker fee (each side's fee is
+    evaluated at its own ask on the fee curve); which side is implied by
+    upProb vs the asks. None when the model or both asks are unavailable."""
     if up_prob is None:
         return None
     edges = []
@@ -493,6 +598,9 @@ _STRIKE_GRACE_SEC = 12.0
 
 def _ring_avg(asset: str, end_epoch: float,
               min_count: int = 45) -> Optional[float]:
+    """Our own average of live 1-second spot prints over (end − span, end],
+    from the Chainlink/Pyth ring, else the Coinbase ring. None when too
+    sparse to stand in for the official TWAP."""
     for mod in (rtds_ws, spot_ws):
         try:
             total, count = mod.window_partial(asset, end_epoch, now=end_epoch)
@@ -507,6 +615,18 @@ def _track_window_open(
     asset: str, window_start: int, spot: Optional[float],
     now_epoch: Optional[float] = None,
 ) -> Optional[float]:
+    """Record a window's strike (the price to beat) and return it.
+
+    Priority:
+      1. the official Chainlink 60s TWAP point stamped at the open second;
+      2. our own 60s average of live spot ending at the open ("spot-avg");
+      3. the boundary print from a ring, or the current spot within
+         _STRIKE_GRACE_SEC of the open ("spot" — approximate under TWAP
+         settlement; model entries refuse it);
+      4. otherwise None for the window's whole life — a mid-window restart
+         (rings empty, grace blown) sits out rather than fabricate a strike.
+    A strike recorded from a fallback is upgraded the moment the official
+    TWAP point shows up (it can arrive in PolyBolt's replay a little later)."""
     key = (asset, window_start)
     cur = _window_open.get(key)
     if cur is not None and cur[1] == "twap":
@@ -541,6 +661,8 @@ def strike_source(asset: str, window_start: int) -> Optional[str]:
 
 
 def known_partial(asset: str, close_epoch: float, now_epoch: float) -> tuple[float, int]:
+    """Live 1-second prints already inside the settlement average
+    (close − 60s, now] — Chainlink/Pyth ring first, else Coinbase."""
     for mod in (rtds_ws, spot_ws):
         try:
             total, count = mod.window_partial(asset, close_epoch, now=now_epoch)
@@ -552,6 +674,8 @@ def known_partial(asset: str, close_epoch: float, now_epoch: float) -> tuple[flo
 
 
 def _ws_mid(q: Optional[dict]) -> Optional[float]:
+    """Sane best-bid/ask mid (0..1) from a live WS quote, or None if the book is
+    one-sided / crossed / out of range (so the caller falls back to Gamma)."""
     if not q:
         return None
     b, a = q.get("bid_cents"), q.get("ask_cents")
@@ -561,6 +685,9 @@ def _ws_mid(q: Optional[dict]) -> Optional[float]:
 
 
 def _ws_up_price(yes_q: Optional[dict], no_q: Optional[dict]) -> Optional[float]:
+    """Real 'up' probability (0..1) from the live CLOB book, or None if unusable.
+    Averages the YES mid and (1 − NO mid) when both are sane for a tighter, less
+    one-sided estimate; else uses whichever side is sane."""
     ym, nm = _ws_mid(yes_q), _ws_mid(no_q)
     if ym is not None and nm is not None:
         return max(0.0, min(1.0, (ym + (1.0 - nm)) / 2.0))
@@ -572,6 +699,7 @@ def _ws_up_price(yes_q: Optional[dict], no_q: Optional[dict]) -> Optional[float]
 
 
 def _ws_fav_ask(favorite: str, yes_q: Optional[dict], no_q: Optional[dict]) -> Optional[float]:
+    """Real cost to BUY the favorite side = its best ASK (fraction), or None."""
     q = yes_q if favorite == "up" else no_q
     a = (q or {}).get("ask_cents")
     if a is None or not (0 < a <= 100):
@@ -579,9 +707,11 @@ def _ws_fav_ask(favorite: str, yes_q: Optional[dict], no_q: Optional[dict]) -> O
     return a / 100.0
 
 
-async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epoch: float) -> dict:
+async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epoch: float,
+                          *, spot_stale: bool = False) -> dict:
     asset, series = entry["asset"], entry["series"]
     interval = _interval(cfg)
+    model_spot_ok = not spot_stale
     if interval == "hourly":
         try:
             bspot = (await binance_ref.spots([asset])).get(asset)
@@ -589,6 +719,8 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
             bspot = None
         if bspot:
             spot = bspot
+            spot_stale = False
+        model_spot_ok = bool(bspot)
     _note_spot(asset, spot)
     try:
         markets = await polymarket_api.fetch_crypto_updown(asset, interval, fast=True)
@@ -639,7 +771,8 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         yes_bid = (ws_yes.get("bid_cents") / 100.0) if (ws_yes and ws_yes.get("bid_cents")) else up
         yes_ask = (ws_yes.get("ask_cents") / 100.0) if (ws_yes and ws_yes.get("ask_cents")) else up
     else:
-        up = max(0.0, min(1.0, _price_dollars(m, "yes_bid")))
+        up = max(0.0, min(1.0, _price_dollars(m, "last_price")
+                          or _price_dollars(m, "yes_bid")))
         price_source = "gamma"
         yes_bid = up
         yes_ask = up
@@ -745,8 +878,9 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         )
         _L = settle_twap_sec(interval)
         _ks, _kc = known_partial(asset, close_epoch, now_epoch) if _L > 0 else (0.0, 0)
-        mp = model_up_prob(spot, open15m, ind.get("sigma1m"), mins_left,
-                           known_sum=_ks, known_count=_kc, settle_twap_sec=_L)
+        out["spotStale"] = spot_stale
+        mp = model_up_prob(spot if model_spot_ok else None, open15m, ind.get("sigma1m"),
+                           mins_left, known_sum=_ks, known_count=_kc, settle_twap_sec=_L)
         out["settleKnownSec"] = _kc
         out["modelProb"] = round(mp, 4) if mp is not None else None
         out["feeSchedule"] = m.get("fee_schedule")
@@ -760,6 +894,16 @@ _INTERVAL_MINUTES = {"5m": 5.0, "15m": 15.0, "1h": 60.0, "hourly": 60.0, "4h": 2
 
 
 def derive_script_fields(a: dict, interval: str = "15m") -> None:
+    """Add the convenience fields scripts read, IN PLACE.
+
+    Called from BOTH the live snapshot and the backtest's tick_to_asset, so
+    these can never drift between the two — which is the whole reason they
+    live here instead of being recomputed at each call site. Every field is a
+    pure function of values already present in the dict (no per-window memory,
+    no clock), so live and replay produce identical results from identical
+    inputs. Anything missing stays None: a script comparing a None it didn't
+    check crashes and gets disabled, so silence is never an option.
+    """
     yb, ya = a.get("yesBid"), a.get("yesAsk")
     a["spreadCents"] = (
         round((float(ya) - float(yb)) * 100.0, 2)
@@ -791,6 +935,18 @@ _ASSET_SNAPSHOT_TIMEOUT = 10.0
 
 
 def _apply_cross_asset(assets: list[dict], now_epoch: float) -> None:
+    """Compute timing + cross-asset correlation fields across the whole snapshot
+    and inject them per-asset (so the rule builder can gate on them):
+
+      hourUtc     current UTC hour 0-23 (also stamped on blank/errored assets)
+      marketBias  market-wide directional lean = (#up - #down) / #withFavorite,
+                  range -1..1; same for every asset (a breadth gauge)
+      peersAgree  fraction of the OTHER favorited assets whose favorite matches
+                  this asset's, range 0..1 — the correlation gate: high = the
+                  pack agrees (herding/momentum), low = this coin diverges.
+
+    These are OPTIONAL rule fields, never forced gates — assets can and do
+    diverge, so the user decides whether agreement helps or hurts their edge."""
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
     favs = [a.get("favorite") for a in assets
             if a.get("hasMarket") and a.get("favorite") in ("up", "down")]
@@ -816,6 +972,14 @@ _SNAPSHOT_TTL = 3.0
 
 
 async def snapshot(cfg: dict) -> dict:
+    """Build the full monitor snapshot for all seven series. Resilient:
+    a failure OR a timeout on the spot feed or any single series degrades that
+    field rather than failing/hanging the whole call.
+
+    Cached for ~3s so the 4-second executor poll and the open Crypto tab SHARE
+    one snapshot instead of each firing the full ~7-calls-per-series fan-out —
+    halving the API load (a 429 hazard). 3s is well inside the executor's poll
+    interval and a 15-min window, so the slight staleness is immaterial."""
     now_epoch = datetime.now(timezone.utc).timestamp()
     cached = _snapshot_cache.get("data")
     if (
@@ -825,17 +989,19 @@ async def snapshot(cfg: dict) -> dict:
     ):
         return cached
     try:
-        spots, spot_source = await asyncio.wait_for(fetch_spots(), _SPOT_FETCH_TIMEOUT)
+        spots, spot_source, stale = await asyncio.wait_for(_fetch_spots(), _SPOT_FETCH_TIMEOUT)
     except Exception as e:
         logger.debug(f"crypto15m spot fetch failed/timeout: {e}")
         spots = dict(_spot_cache.get("spots") or {})
         spot_source = f"{_spot_cache.get('source', '?')} (stale)" if spots else "unavailable"
+        stale = set(spots)
     spot_ok = bool(spots)
 
     async def _bounded(entry: dict) -> dict:
         try:
             return await asyncio.wait_for(
-                _asset_snapshot(entry, spots.get(entry["asset"]), cfg, now_epoch),
+                _asset_snapshot(entry, spots.get(entry["asset"]), cfg, now_epoch,
+                                spot_stale=entry["asset"] in stale),
                 _ASSET_SNAPSHOT_TIMEOUT,
             )
         except Exception as e:

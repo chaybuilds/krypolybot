@@ -168,7 +168,7 @@ export function ScriptsPage() {
       setConfirmDelete(false);
       setAudit(sel.audit ?? null);
     }
-  }, [selId]);
+  }, [selId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = async (): Promise<UserScript | null> => {
     if (!sel) return null;
@@ -909,9 +909,9 @@ function BacktestResult({ res, busy }: { res: ScriptBacktest | null; busy: boole
       <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-6">
         <Stat label="Trades" value={`${res.n}`} sub={`${res.windowsScanned} windows`} />
         <Stat label="Win rate" value={res.n ? `${(res.winRate * 100).toFixed(1)}%` : '—'} />
-        <Stat label="Edge / contract" value={`${res.netEvCentsPerContract.toFixed(2)}¢`} tone={res.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
-        <Stat label="Total P&L" value={fmtUsd(res.totalPnlUsd, { sign: true })} tone={res.totalPnlUsd >= 0 ? 'good' : 'bad'} />
-        <Stat label="t-stat" value={res.tStat != null ? res.tStat.toFixed(2) : '—'} sub={res.tStat != null && Math.abs(res.tStat) >= 2 ? 'significant-ish' : 'noise-level'} />
+        <Stat label="Edge / contract" value={res.n ? `${res.netEvCentsPerContract.toFixed(2)}¢` : '—'} tone={!res.n ? undefined : res.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
+        <Stat label="Total P&L" value={res.n ? fmtUsd(res.totalPnlUsd, { sign: true }) : '—'} tone={!res.n ? undefined : res.totalPnlUsd >= 0 ? 'good' : 'bad'} />
+        <Stat label="t-stat" value={res.tStat != null ? res.tStat.toFixed(2) : '—'} sub={`${res.tStat != null && Math.abs(res.tStat) >= 2 ? 'significant-ish' : 'noise-level'}${res.nClusters ? ` · ${res.nClusters} closes` : ''}`} />
         <Stat label="Max drawdown" value={fmtUsd(res.maxDrawdownUsd)} tone="bad" />
       </div>
       {Object.keys(res.byAsset).length > 0 && (
@@ -932,8 +932,8 @@ function BacktestResult({ res, busy }: { res: ScriptBacktest | null; busy: boole
           <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-5">
             <Stat label="Follows" value={`${res.signalResult.n}`} sub={`${res.signalResult.windowsScanned} signals scanned`} />
             <Stat label="Win rate" value={res.signalResult.n ? `${(res.signalResult.winRate * 100).toFixed(1)}%` : '—'} />
-            <Stat label="Edge / contract" value={`${res.signalResult.netEvCentsPerContract.toFixed(2)}¢`} tone={res.signalResult.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
-            <Stat label="Total P&L" value={fmtUsd(res.signalResult.totalPnlUsd, { sign: true })} tone={res.signalResult.totalPnlUsd >= 0 ? 'good' : 'bad'} />
+            <Stat label="Edge / contract" value={res.signalResult.n ? `${res.signalResult.netEvCentsPerContract.toFixed(2)}¢` : '—'} tone={!res.signalResult.n ? undefined : res.signalResult.netEvCentsPerContract >= 0 ? 'good' : 'bad'} />
+            <Stat label="Total P&L" value={res.signalResult.n ? fmtUsd(res.signalResult.totalPnlUsd, { sign: true }) : '—'} tone={!res.signalResult.n ? undefined : res.signalResult.totalPnlUsd >= 0 ? 'good' : 'bad'} />
             <Stat label="t-stat" value={res.signalResult.tStat != null ? res.signalResult.tStat.toFixed(2) : '—'} />
           </div>
           <ul className="mt-1.5 space-y-0.5">

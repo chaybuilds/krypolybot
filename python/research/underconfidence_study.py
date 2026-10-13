@@ -1,3 +1,35 @@
+"""Politics-underconfidence + sports favorite-bias validation on OFFICIAL data.
+
+Replicates two external findings the 2026-07-16 resource swarm surfaced, using
+only Gamma + CLOB endpoints (no third-party datasets):
+
+  1. Politics underconfidence (namanhzz calibration study, 292M trades):
+     political favorites at 12h-1mo horizons resolve MORE often than their
+     price implies (slopes 1.23-1.98) -> buy-the-favorite edge ~+10-14c/ct
+     gross at 70c. Politics taker fee is now 0.04*P*(1-P) (verified live).
+  2. Sports favorite-longshot bias at T-7d (sturzael/polymarket-edge-research):
+     favorites priced 0.55-0.60 seven days before end_date resolved YES 83.3%
+     (+25.8pp, z=7.6, n=120); every 0.55-0.80 bucket z>5; 0.45-0.50 control
+     calibrated. Sports taker fee is now 0.05*P*(1-P).
+
+Method: enumerate CLOSED binary markets by tag via Gamma /events (windowed by
+end-date month to dodge offset caps), take each market's YES price at fixed
+horizons before endDate from CLOB /prices-history (interval=max, fidelity
+adapted to market lifetime), outcome from outcomePrices. Both a calibration
+table (win rate vs price bucket, YES side) and a favorite-framed trading table
+(buy the >=0.5 side, net of today's fee-v2 schedule) are reported, split by
+end-date half-year for persistence. T-stats cluster P&L per EVENT (negRisk
+siblings and same-game markets are correlated).
+
+Honesty: prices are Polymarket's charting series (trade-price based), not
+bid/ask -- expect a 1-3pp execution haircut on any edge found (the same caveat
+the sources carry). Markets not yet listed/traded at a horizon simply lack a
+row there (survivorship of early-listed markets is possible and reported via
+coverage counts).
+
+    python research/underconfidence_study.py --category politics --max-markets 4000
+    python research/underconfidence_study.py --category sports --max-markets 9000
+"""
 from __future__ import annotations
 
 import argparse
@@ -59,6 +91,7 @@ async def _get(client: httpx.AsyncClient, url: str, params: dict,
 
 
 def _month_windows(start: str, end: str) -> list[tuple[str, str]]:
+    """[(min_iso, max_iso)] month windows over [start, end] (YYYY-MM-DD)."""
     out = []
     y, m = int(start[:4]), int(start[5:7])
     ey, em = int(end[:4]), int(end[5:7])
@@ -71,6 +104,8 @@ def _month_windows(start: str, end: str) -> list[tuple[str, str]]:
 
 async def fetch_markets(client: httpx.AsyncClient, cat: str, max_markets: int,
                         date_min: str, date_max: str) -> list[dict]:
+    """Closed, resolved, binary, volume-filtered markets for the tag, deduped
+    by conditionId, windowed by end-date month to avoid deep offsets."""
     cfg = CFG[cat]
     seen: dict[str, dict] = {}
     for lo, hi in _month_windows(date_min, date_max):
@@ -130,6 +165,9 @@ async def fetch_markets(client: httpx.AsyncClient, cat: str, max_markets: int,
 
 async def fetch_history(client: httpx.AsyncClient, mkt: dict,
                         sem: asyncio.Semaphore) -> list[dict]:
+    """(t, p) series for the YES token across the market's life. Fidelity is
+    chosen from the lifetime (the endpoint returns EMPTY when the point count
+    is too large) and escalated coarser until data returns."""
     life_min = max(1.0, (mkt["end_ts"] - (mkt["start_ts"] or mkt["end_ts"] - 90 * 86400)) / 60.0)
     start_idx = 0
     for i, f in enumerate(FIDS):
@@ -153,6 +191,8 @@ async def fetch_history(client: httpx.AsyncClient, mkt: dict,
 
 
 def horizon_rows(mkt: dict, hist: list[dict], horizons_h: list[int]) -> list[dict]:
+    """One row per horizon where a price point exists close enough to
+    end_ts - horizon. Tolerance scales with the series fidelity."""
     if not hist:
         return []
     fid = mkt.get("fid") or 1440

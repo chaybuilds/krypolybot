@@ -1,3 +1,22 @@
+"""Polymarket Data API v2 (data-api.polymarket.com/v2, live since 2026-09-04;
+v1 is frozen). The reads the app uses:
+
+  /v2/user-pnl      the wallet's cumulative P&L series, as Polymarket books
+                    it — including MAKER/TAKER REBATES, reward and referral
+                    income and refunded fees, which the app cannot see on its
+                    own (rebates are paid separately, daily).
+  /v2/resolutions   resolution lifecycle per market, with
+                    `expected_settlement_time` + `settlement_time_basis`
+                    (since 2026-09-28) — "when will this pay out?".
+  /v2/holders       a market's top holders, with per-holder P&L
+                    (`include_pnl=true`, one condition per call).
+  /v2/biggest-winners  the largest resolved wins by period — copy-trade
+                    discovery.
+
+Contract: every payload is wrapped in `data`; paginated reads carry opaque
+cursors; money is JSON numbers (`_usdc` fields are USD). 429s come with
+Retry-After. All reads are public and keyless.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -74,7 +93,15 @@ _PNL_FIELDS = (
 )
 
 
-def summarize_pnl(points: list[dict]) -> dict:
+def summarize_pnl(points: list[dict], *, since_inception: bool = False) -> dict:
+    """Window figures from a cumulative series: the change from the first
+    point to the last for flows, the last value for unrealized P&L, plus a
+    compact economic-P&L series for a sparkline. Pure.
+
+    The series is cumulative from the wallet's first activity, so for the
+    all-time view (`since_inception`) every flow is simply the last value.
+    Its first point is already a bucket of trading, and last minus first
+    dropped it: a day for an old wallet, most of the history for a young one."""
     pts = [p for p in points or [] if isinstance(p, dict)]
     if not pts:
         return {"points": 0}
@@ -87,10 +114,10 @@ def summarize_pnl(points: list[dict]) -> dict:
         a, b = _f(first.get(k)), _f(last.get(k))
         if b is None:
             continue
-        out[k] = b if (k == "unrealized_pnl" or a is None) else b - a
+        out[k] = b if (since_inception or k == "unrealized_pnl" or a is None) else b - a
     out["rebatesAndRewards"] = sum(out.get(k) or 0.0 for k in (
         "maker_rebate", "taker_rebate", "reward_income", "referral_income", "fees_refunded"))
-    base = _f(first.get("economic_pnl")) or 0.0
+    base = 0.0 if since_inception else (_f(first.get("economic_pnl")) or 0.0)
     out["series"] = [[int(p.get("timestamp") or 0), round((_f(p.get("economic_pnl")) or 0.0) - base, 4)]
                      for p in pts]
     return out
@@ -101,7 +128,8 @@ async def user_pnl(user: str, interval: str = "1w") -> dict:
     data = await _get("/user-pnl", {"user": user, "interval": iv,
                                     "fidelity": _FIDELITY[iv]}, ttl=60.0)
     points = (data or {}).get("points") or [] if isinstance(data, dict) else []
-    return {"interval": iv, **summarize_pnl(points)}
+    return {"interval": iv, **summarize_pnl(points, since_inception=iv == "max")}
+
 
 
 def _resolution_row(r: dict) -> dict:
@@ -116,6 +144,8 @@ def _resolution_row(r: dict) -> dict:
 
 
 async def resolutions(condition_ids: list[str]) -> dict[str, dict]:
+    """{condition_id: resolution state} for up to any number of markets
+    (batched 20 per request, cached a minute)."""
     ids = [c for c in dict.fromkeys(condition_ids or []) if isinstance(c, str) and c.startswith("0x")]
     out: dict[str, dict] = {}
     chunks = [ids[i:i + 20] for i in range(0, len(ids), 20)]
@@ -132,7 +162,9 @@ async def resolutions(condition_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+
 async def holders(condition_id: str, limit: int = 10) -> list[dict]:
+    """Top holders per outcome of one market, with their position P&L."""
     data = await _get("/holders", {"condition": condition_id, "limit": max(1, min(100, limit)),
                                    "include_pnl": "true"}, ttl=60.0)
     out = []

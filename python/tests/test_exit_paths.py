@@ -1,3 +1,10 @@
+"""The engine EXIT paths, pinned.
+
+An exit failing is worse than an entry failing: you are already in the
+position. These tests guard the two ways that goes wrong — an exit that
+silently gives up, and an exit that retries so hard it becomes a problem of
+its own.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +35,7 @@ def _pos(pid=1):
 
 
 def _wire(monkeypatch, fail):
+    """Stub the order submit + the DB writes _place_exit_sell performs."""
     calls = []
 
     async def _place(**kw):
@@ -45,6 +53,9 @@ def _wire(monkeypatch, fail):
 
 
 def test_a_failed_exit_backs_off_instead_of_retrying_every_tick(fresh, monkeypatch):
+    """Take-profit and sell-strength had NO throttle: a deterministic refusal
+    re-submitted a real order on every 4s tick — roughly 900 attempts an hour
+    against the CLOB for an exit that can never succeed."""
     calls = _wire(monkeypatch, fail=True)
     for _ in range(5):
         _run(c15._place_exit_sell(_pos(), {}, exit_cents=50, reason="take_profit"))
@@ -77,6 +88,9 @@ def test_a_successful_exit_clears_the_backoff(fresh, monkeypatch):
 
 
 def test_a_failed_exit_is_logged(fresh, monkeypatch, caplog):
+    """It wrote an `error` field to the row and said nothing anywhere else —
+    no log line, and the UI styles rows on `status`, not on `error`. So a
+    failed exit was invisible while the position stayed open."""
     _wire(monkeypatch, fail=True)
     with caplog.at_level("WARNING"):
         _run(c15._place_exit_sell(_pos(), {}, exit_cents=50, reason="stop_loss"))
@@ -91,7 +105,9 @@ def test_a_successful_exit_is_not_throttled(fresh, monkeypatch):
     assert len(calls) == 3, "a working exit got delayed by the failure cooldown"
 
 
+
 def _paper_rows(monkeypatch, n_orders, n_markets):
+    """n resting paper orders spread across n_markets distinct markets."""
     import terminal_paper as tp
     rows = [{
         "id": i, "condition_id": f"0x{i % n_markets}", "side": "yes",
@@ -117,6 +133,9 @@ def _paper_rows(monkeypatch, n_orders, n_markets):
 
 
 def test_paper_fetches_one_book_per_market_not_per_order():
+    """Ten resting orders on one market used to mean ten identical CLOB calls
+    every tick. Paper trading costs nothing; it must not cost the terminal its
+    rate budget either."""
     import pytest as _p
     mp = _p.MonkeyPatch()
     try:
@@ -128,6 +147,8 @@ def test_paper_fetches_one_book_per_market_not_per_order():
 
 
 def test_paper_book_fetches_are_capped_per_tick():
+    """Unbounded, enough resting paper orders would park the CLOB on a 429 and
+    starve the REAL chart and book."""
     import pytest as _p
     mp = _p.MonkeyPatch()
     try:

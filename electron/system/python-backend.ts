@@ -234,7 +234,7 @@ class PythonBackend {
         if (!probe.error && probe.status === 0) {
           return { cmd: c.cmd, args: [...c.pre, servicePath], cwd: pyDir };
         }
-      } catch {}
+      } catch { }
     }
     this.lastError = 'No Python 3 interpreter found. Run `npm run py:setup` or install Python 3.10+ from https://python.org.';
     return null;

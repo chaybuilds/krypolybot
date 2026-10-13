@@ -1,3 +1,9 @@
+"""The copy-trading entry-price band.
+
+A max alone let the engine follow a whale into a 3c lottery ticket, which is a
+different bet from following them into a 60c conviction trade — and the loss
+rate on the cheap end is what quietly bleeds a copy book.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -42,6 +48,7 @@ def _wire(monkeypatch, ask_cents):
     return placed
 
 
+
 def test_a_copy_below_the_floor_is_skipped(monkeypatch):
     placed = _wire(monkeypatch, ask_cents=3)
     r = _run(copy_trader._enter_copy(
@@ -80,11 +87,14 @@ def test_a_price_inside_the_band_is_copied(monkeypatch):
     assert placed and placed[0]["price_cents"] == 60
 
 
+
 def test_the_default_is_off():
     assert _cfg()["copy_entry_min_cents"] == 0
 
 
 def test_a_floor_above_the_ceiling_is_clamped_not_obeyed():
+    """Obeying it literally would reject EVERY copy while the UI still showed
+    the engine as armed — a silent no-op is worse than a clamped setting."""
     c = _cfg(copy_entry_min_cents=99, copy_entry_max_cents=50)
     assert c["copy_entry_min_cents"] < c["copy_entry_max_cents"]
     assert c["copy_entry_min_cents"] == 49

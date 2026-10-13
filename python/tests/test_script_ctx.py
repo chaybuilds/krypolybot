@@ -1,3 +1,11 @@
+"""The ctx vocabulary handed to user scripts.
+
+The load-bearing property is PARITY: a field must mean the same thing in the
+live snapshot and in a backtest, or a script tuned on recorded data behaves
+differently with real money. The derived fields therefore come from one
+shared helper, and this file pins both that helper's arithmetic and the
+promise that the docs, the derivable set, and the helper agree.
+"""
 from __future__ import annotations
 
 import pytest
@@ -16,6 +24,7 @@ def _asset(**over) -> dict:
     }
     a.update(over)
     return a
+
 
 
 def test_spread_cents_is_the_book_width():
@@ -73,6 +82,8 @@ def test_time_frac_left_is_clamped():
     "yesBid", "yesAsk", "upProb", "modelProb", "minsLeft",
 ])
 def test_missing_inputs_yield_none_never_a_crash(missing):
+    """Fail-closed: a script that forgets a None check must crash and get
+    disabled, but the ENGINE must never crash producing the field."""
     a = _asset(**{missing: None})
     crypto15m.derive_script_fields(a, "15m")
     assert set(("spreadCents", "modelEdgePts", "favoriteAskCents",
@@ -86,10 +97,12 @@ def test_an_empty_asset_gets_every_field_as_none():
                  "favoriteAskCents": None, "timeFracLeft": None}
 
 
+
 DERIVED = ("spreadCents", "modelEdgePts", "favoriteAskCents", "timeFracLeft")
 
 
 def test_replay_produces_the_same_derived_fields_as_live():
+    """Same numbers in, same numbers out — via the one shared helper."""
     tick = {
         "asset": "BTC", "ticker": "tk", "yes_bid": 0.55, "yes_ask": 0.60,
         "up_prob": 0.575, "up_ask": 0.61, "no_ask": 0.41, "ws_ask": 60.0,
@@ -106,8 +119,12 @@ def test_replay_produces_the_same_derived_fields_as_live():
 
 
 def test_every_derived_field_is_marked_backtestable():
+    """These are pure functions of already-recorded fields, so a backtest can
+    compute them. If one ever stops being derivable it must be moved to the
+    live-only list, or scripts would silently see None in backtests."""
     for f in DERIVED:
         assert f in replay._DERIVABLE
+
 
 
 def test_every_derived_field_is_documented():
@@ -121,6 +138,8 @@ def test_documented_live_only_fields_are_really_not_derivable():
 
 
 def test_no_documented_field_is_silently_missing_from_the_derivable_set():
+    """Anything documented and not flagged LIVE-ONLY must be backtestable —
+    otherwise the docs promise data the backtest hands back as None."""
     undocumented_gap = (
         set(script_docs.FIELD_DOCS)
         - set(replay._DERIVABLE)

@@ -1,8 +1,52 @@
+"""Static risk audit for user strategy scripts.
+
+Scripts run as full, unsandboxed Python inside the process that holds the
+decrypted wallet key (see script_sandbox for why). This module is what
+replaced the language sandbox: instead of restricting what a script may do,
+it READS the script and reports what it appears to do, so the user reviewing
+a pasted or AI-generated strategy sees the alarming parts before enabling it.
+
+Be honest about the limits. This is an AST scan:
+
+  • It cannot see through obfuscation. So obfuscation is itself a CRITICAL
+    finding — a strategy script has no legitimate reason to base64-decode a
+    blob, resolve attributes from computed strings, or exec() anything. A
+    script that hides what it does is reported as hiding what it does, which
+    is the only honest thing a static tool can say about it.
+  • It is not a permission system. Nothing here blocks execution; the UI
+    surfaces findings and makes the user confirm. A determined attacker who
+    gets you to run their script wins regardless.
+  • Clean findings mean "nothing alarming was recognized", never "safe".
+
+The categories are ordered by what would actually cost the user money:
+credential access and network egress first, then code that can escape review
+(dynamic execution), then process/filesystem, then the merely noteworthy.
+"""
 from __future__ import annotations
 
 import ast
 import re
+import sys
 from typing import Any, Optional
+
+_RECURSION_LIMIT = 1000
+
+
+def pin_recursion_limit() -> None:
+    """Load py_ecc now, under our control, and put the limit back. Once it is
+    in sys.modules a later `import eth_account` cannot raise the limit again.
+    Cheap and idempotent; called at import here and in script_sandbox, and
+    before every audit."""
+    if "py_ecc" not in sys.modules:
+        try:
+            import py_ecc  # noqa: F401
+        except Exception:  # noqa: BLE001 — absent on eth-account < 0.14
+            pass
+    if sys.getrecursionlimit() > _RECURSION_LIMIT:
+        sys.setrecursionlimit(_RECURSION_LIMIT)
+
+
+pin_recursion_limit()
 
 _RANK = {"critical": 0, "warning": 1, "info": 2}
 
@@ -157,6 +201,7 @@ _HEX_PAT = re.compile(r"^(?:0x)?[0-9a-fA-F\s]{200,}$")
 
 
 def _dotted(node: ast.AST) -> Optional[str]:
+    """Dotted name for an attribute chain rooted at a plain Name."""
     parts: list[str] = []
     cur: Any = node
     while isinstance(cur, ast.Attribute):
@@ -185,6 +230,7 @@ class _Scan(ast.NodeVisitor):
         })
 
     def _resolve(self, dotted: str) -> str:
+        """Rewrite an aliased root back to the real module path."""
         head, _, tail = dotted.partition(".")
         real = self.aliases.get(head)
         if not real:
@@ -315,24 +361,15 @@ _UNREADABLE = (SyntaxError, ValueError, RecursionError, MemoryError)
 
 _UNWALKABLE = (RecursionError, MemoryError)
 
-# Whether the recursive walk overflows depends on the interpreter's recursion
-# limit and C stack, which differ by version and OS. Measure depth iteratively
-# and refuse past a fixed cap so the verdict is the same everywhere. Real
-# strategy code sits far below this.
-_MAX_DEPTH = 200
-
-
-def _too_deep(tree: ast.AST) -> bool:
-    stack = [(tree, 1)]
-    while stack:
-        node, depth = stack.pop()
-        if depth > _MAX_DEPTH:
-            return True
-        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
-    return False
-
 
 def _unreadable(e: BaseException) -> dict:
+    """The verdict for source we could not read.
+
+    Refusing loudly is the honest answer. "Nothing found" on code that was
+    never audited would read as a clean bill of health, so this carries a
+    CRITICAL finding: `ok` is False, and an armed script whose code changes to
+    something unreadable disarms itself rather than hot-swapping into it.
+    """
     lineno = getattr(e, "lineno", None) if isinstance(e, SyntaxError) else None
     where = f" (syntax error line {lineno})" if lineno else ""
     if isinstance(e, RecursionError):
@@ -354,13 +391,255 @@ def _unreadable(e: BaseException) -> dict:
     }
 
 
+AGENT_MODULES = frozenset({
+    "math", "statistics", "datetime", "collections", "itertools", "functools",
+    "re", "json", "random", "bisect", "heapq", "decimal", "fractions",
+})
+
+_AGENT_INJECTED_MODULES = ("math", "statistics")
+
+_AGENT_DENIED_BUILTINS = frozenset({
+    "getattr", "setattr", "delattr", "vars", "globals", "locals", "eval",
+    "exec", "compile", "open", "__import__", "breakpoint", "input", "help",
+    "dir", "memoryview", "exit", "quit", "license", "credits", "copyright",
+    "__build_class__", "__loader__", "__spec__", "__builtins__",
+})
+
+_AGENT_DENIED_ATTR_PREFIXES = ("_", "f_", "gi_", "cr_", "ag_", "tb_", "co_")
+_AGENT_DENIED_ATTRS = frozenset({"format", "format_map", "mro", "with_traceback"})
+
+_AGENT_DUNDER_DEFS = frozenset({
+    "__init__", "__repr__", "__str__", "__eq__", "__ne__", "__lt__", "__le__",
+    "__gt__", "__ge__", "__hash__", "__len__", "__iter__", "__next__",
+    "__contains__", "__getitem__", "__setitem__", "__bool__", "__call__",
+})
+
+
+def _agent_module_ok(mod: Any) -> bool:
+    import types
+    if not isinstance(mod, types.ModuleType):
+        return True
+    name = str(getattr(mod, "__name__", "") or "")
+    parts = name.split(".")
+    return parts[0] in AGENT_MODULES and not any(p.startswith("_") for p in parts)
+
+
+def _agent_attr_denied(attr: str) -> bool:
+    return attr.startswith(_AGENT_DENIED_ATTR_PREFIXES) or attr in _AGENT_DENIED_ATTRS
+
+
+class _AgentCheck(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.modules: dict[str, Any] = {}
+        import importlib
+        for m in _AGENT_INJECTED_MODULES:
+            self.modules[m] = importlib.import_module(m)
+        self._chained: set[int] = set()
+
+    def err(self, node: ast.AST, msg: str) -> None:
+        self.errors.append(f"line {int(getattr(node, 'lineno', 0) or 0)}: {msg}")
+
+    def _import_module(self, node: ast.AST, name: str) -> Any:
+        import importlib
+        parts = name.split(".")
+        if parts[0] not in AGENT_MODULES or any(p.startswith("_") for p in parts):
+            self.err(node, f"imports '{name}' — scripts written by an AI agent may "
+                           f"only import {', '.join(sorted(AGENT_MODULES))}.")
+            return None
+        try:
+            mod = importlib.import_module(name)
+        except Exception:  # noqa: BLE001 — not importable is a refusal
+            self.err(node, f"imports '{name}', which does not exist.")
+            return None
+        if not _agent_module_ok(mod):
+            self.err(node, f"imports '{name}', which is outside the allowed set.")
+            return None
+        return mod
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for a in node.names:
+            mod = self._import_module(node, a.name)
+            if mod is None:
+                continue
+            if a.asname:
+                self.modules[a.asname] = mod
+            else:
+                import importlib
+                root = a.name.split(".")[0]
+                self.modules[root] = importlib.import_module(root)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.level or not node.module:
+            self.err(node, "uses a relative import.")
+            return
+        mod = self._import_module(node, node.module)
+        if mod is None:
+            return
+        for a in node.names:
+            if a.name == "*":
+                self.err(node, f"uses 'from {node.module} import *' — name what you use.")
+                continue
+            if a.name.startswith("_"):
+                self.err(node, f"imports the private name '{a.name}'.")
+                continue
+            if hasattr(mod, a.name):
+                obj = getattr(mod, a.name)
+            else:
+                obj = self._import_module(node, f"{node.module}.{a.name}")
+                if obj is None:
+                    continue
+            if not _agent_module_ok(obj):
+                self.err(node, f"imports '{node.module}.{a.name}', a module outside "
+                               "the allowed set.")
+                continue
+            import types
+            if isinstance(obj, types.ModuleType):
+                self.modules[a.asname or a.name] = obj
+        self.generic_visit(node)
+
+    def _chain(self, node: ast.Attribute) -> tuple[Optional[str], list[ast.Attribute]]:
+        links: list[ast.Attribute] = []
+        cur: Any = node
+        while isinstance(cur, ast.Attribute):
+            links.append(cur)
+            cur = cur.value
+        links.reverse()
+        return (cur.id if isinstance(cur, ast.Name) else None), links
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in ("format", "format_map"):
+            self.err(node, f"calls '.{node.attr}' — it looks attributes up by names "
+                           "written inside a string. Use an f-string instead.")
+        elif _agent_attr_denied(node.attr):
+            self.err(node, f"accesses '.{node.attr}' — interpreter internals and "
+                           "private attributes are off limits to agent scripts.")
+        if id(node) not in self._chained:
+            root, links = self._chain(node)
+            for ln in links:
+                self._chained.add(id(ln))
+            if root is not None and root in self.modules:
+                obj = self.modules[root]
+                path = root
+                for ln in links:
+                    path = f"{path}.{ln.attr}"
+                    if _agent_attr_denied(ln.attr):
+                        break
+                    if not hasattr(obj, ln.attr):
+                        self.err(ln, f"'{path}' does not exist.")
+                        break
+                    obj = getattr(obj, ln.attr)
+                    if not _agent_module_ok(obj):
+                        self.err(ln, f"'{path}' is a module outside the allowed set.")
+                        break
+                else:
+                    import types
+                    if isinstance(obj, types.ModuleType):
+                        self.err(node, f"uses the module '{path}' as a value — only "
+                                       "its functions and constants may be used.")
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id.startswith("__") or node.id in _AGENT_DENIED_BUILTINS:
+            self.err(node, f"uses '{node.id}', which agent scripts may not use.")
+        elif node.id in self.modules and isinstance(node.ctx, ast.Load):
+            parent = getattr(node, "_kp_parent", None)
+            if not (isinstance(parent, ast.Attribute) and parent.value is node):
+                self.err(node, f"uses the module '{node.id}' as a value — only its "
+                               "functions and constants may be used.")
+        self.generic_visit(node)
+
+    def _check_def_name(self, node: ast.AST, name: str, in_class: bool) -> None:
+        if name.startswith("__") and not (in_class and name in _AGENT_DUNDER_DEFS):
+            self.err(node, f"defines '{name}', which agent scripts may not define.")
+        elif name in _AGENT_DENIED_BUILTINS:
+            self.err(node, f"defines '{name}', the name of a refused builtin.")
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_def_name(node, node.name,
+                             isinstance(getattr(node, "_kp_parent", None), ast.ClassDef))
+        for a in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                  + [x for x in (node.args.vararg, node.args.kwarg) if x]):
+            if a.arg.startswith("__"):
+                self.err(a, f"uses the parameter name '{a.arg}'.")
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._check_def_name(node, node.name, False)
+        self.generic_visit(node)
+
+    def visit_MatchClass(self, node: Any) -> None:
+        for a in getattr(node, "kwd_attrs", []) or []:
+            if _agent_attr_denied(a) or a.startswith("_"):
+                self.err(node, f"matches on the attribute '{a}'.")
+        self.generic_visit(node)
+
+    def visit_keyword(self, node: ast.keyword) -> None:
+        if node.arg and node.arg.startswith("__"):
+            self.err(node, f"passes the keyword '{node.arg}'.")
+        self.generic_visit(node)
+
+    def visit_alias(self, node: ast.alias) -> None:
+        if node.asname and (node.asname.startswith("__")
+                            or node.asname in _AGENT_DENIED_BUILTINS):
+            self.err(node, f"imports under the name '{node.asname}'.")
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        v = node.value
+        if isinstance(v, str) and "__" in v:
+            self.err(node, "contains a string with '__' in it — dunder names in "
+                           "strings are how attribute lookups get hidden.")
+        elif isinstance(v, bytes) and b"__" in v:
+            self.err(node, "contains bytes with '__' in them.")
+
+
+def validate_agent(code: str) -> list[str]:
+    """Errors that make `code` unacceptable FROM AN AI AGENT ([] = allowed).
+
+    The allowlist described above. Parse failures are errors too: code that
+    could not be read was not checked."""
+    pin_recursion_limit()
+    try:
+        tree = ast.parse(code or "")
+    except _UNREADABLE as e:
+        line = getattr(e, "lineno", None) if isinstance(e, SyntaxError) else None
+        return [f"the script could not be read{f' (line {line})' if line else ''}, "
+                "so it was not checked — refused."]
+    try:
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                child._kp_parent = parent  # type: ignore[attr-defined]
+        chk = _AgentCheck()
+        chk.visit(tree)
+    except _UNWALKABLE:
+        return ["the script is nested too deeply to check — refused."]
+    seen: set[str] = set()
+    out: list[str] = []
+    for e in chk.errors:
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+    return out[:40]
+
+
 def audit(code: str) -> dict:
+    """Scan `code` and return a verdict.
+
+    {"ok": bool,                  # parsed and nothing critical
+     "parsed": bool,
+     "critical": int, "warning": int, "info": int,
+     "categories": ["network", "wallet", ...],
+     "findings": [{severity, category, line, message}, ...],
+     "summary": "one line for the UI"}
+    """
+    pin_recursion_limit()
     try:
         tree = ast.parse(code or "")
     except _UNREADABLE as e:
         return _unreadable(e)
-    if _too_deep(tree):
-        return _unreadable(RecursionError())
 
     scan = _Scan()
     try:

@@ -1,3 +1,10 @@
+"""Remote control, pinned.
+
+These bots let a chat message move real money, so every test here guards a
+specific way that goes wrong: a stranger reaching a command, a switch that
+turns on more than it should, a stale confirmation still being live tomorrow,
+or a refusal that leaves no trace.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,13 +29,16 @@ def fresh(tmp_path, monkeypatch):
     return tmp_path
 
 
+
 def test_an_unpaired_sender_reaches_no_command(fresh, monkeypatch):
+    """The token is not the boundary — tokens leak into screenshots and pasted
+    logs. The paired-id list is, so an unlisted sender must be stopped before
+    the command is even parsed."""
     called = []
     monkeypatch.setattr(remote, "_dispatch",
                         lambda *a, **k: called.append(a) or "should not run")
     for cmd in ("/status", "/flatten", "/buy 0xabc yes 10 50", "/pause"):
-        reply = _run(remote.handle("discord", "999", cmd))
-        assert "not paired" in reply.lower()
+        _run(remote.handle("discord", "999", cmd))
     assert called == [], "an unpaired sender reached the dispatcher"
 
 
@@ -37,6 +47,44 @@ def test_an_unauthorised_attempt_is_logged(fresh):
     rows = remote.audit_log(10)
     assert rows and rows[0]["outcome"] == "unauthorised"
     assert rows[0]["sender"] == "12345"
+
+
+def test_a_stranger_is_answered_once(fresh):
+    """The first reply tells a real user how to pair. Every later one only
+    tells a stranger the bot is alive and listening."""
+    assert "not paired" in _run(remote.handle("discord", "999", "/status")).lower()
+    assert _run(remote.handle("discord", "999", "/status")) == ""
+    assert _run(remote.handle("discord", "999", "hello")) == ""
+    assert "No pairing code" in _run(remote.handle("discord", "999", "/pair 123456"))
+
+
+def test_a_strangers_messages_are_one_row_with_a_count(fresh):
+    for _ in range(3):
+        _run(remote.handle("telegram", "12345", "/flatten"))
+    rows = [r for r in remote.audit_log(100) if r["sender"] == "12345"]
+    assert len(rows) == 1 and rows[0]["count"] == 3
+
+
+def test_stranger_spam_cannot_push_the_owners_commands_out_of_the_log(
+        fresh, monkeypatch):
+    """The log is capped. Every stranger message used to be its own row in
+    the same log as the owner's commands, so anyone who could DM the bot
+    could flush the owner's real history out of it."""
+    async def _dispatch(*a, **k):
+        return "ok"
+    monkeypatch.setattr(remote, "_dispatch", _dispatch)
+    remote.add_paired("discord", "111")
+    _run(remote.handle("discord", "111", "/flatten"))
+    for _ in range(remote.AUDIT_MAX + 20):
+        _run(remote.handle("discord", "999000111", "hello"))
+    rows = [r for r in remote.audit_log(remote.AUDIT_MAX) if r["sender"] == "999000111"]
+    assert len(rows) == 1 and rows[0]["count"] == remote.RATE_LIMIT_PER_MIN
+    for i in range(remote.AUDIT_MAX + 20):
+        _run(remote.handle("discord", f"9{i:05d}", "hello"))
+    rows = remote.audit_log(remote.AUDIT_MAX)
+    assert any(r["sender"] == "111" and r["command"] == "/flatten" for r in rows), \
+        "stranger noise pushed the owner's command out of the log"
+    assert sum(r["outcome"] == "unauthorised" for r in rows) == remote.STRANGER_AUDIT_MAX
 
 
 def test_pairing_is_per_platform(fresh):
@@ -56,6 +104,7 @@ def test_unpairing_revokes_access(fresh):
     remote.remove_paired("discord", "111")
     assert not remote.is_allowed("discord", "111")
     assert "not paired" in _run(remote.handle("discord", "111", "/status")).lower()
+
 
 
 def test_a_pairing_code_works_once(fresh):
@@ -81,6 +130,20 @@ def test_an_expired_code_is_refused(fresh, monkeypatch):
     assert not ok and "expired" in msg
 
 
+def test_a_pairing_code_dies_after_five_wrong_tries_from_anyone(fresh):
+    """The rate limit is per sender, so N accounts got N x the guesses at a
+    six-digit code. Five wrong tries in all, and the code is gone."""
+    code = remote.new_pair_code("telegram")["code"]
+    wrong = "000000" if code != "000000" else "111111"
+    for i in range(remote.PAIR_CODE_MAX_FAILS):
+        ok, msg = remote.consume_pair_code("telegram", wrong, f"77{i}")
+        assert not ok
+    assert "canceled" in msg.lower()
+    ok, msg = remote.consume_pair_code("telegram", code, "555")
+    assert not ok and not remote.is_allowed("telegram", "555")
+    assert "No pairing code" in msg
+
+
 def test_pairing_with_no_code_active_is_refused(fresh):
     ok, msg = remote.consume_pair_code("telegram", "123456", "999")
     assert not ok and "No pairing code" in msg
@@ -93,7 +156,10 @@ def test_an_unpaired_sender_may_only_run_pair(fresh):
     assert remote.is_allowed("telegram", "555")
 
 
+
 def test_remote_trading_needs_both_switches():
+    """Two switches on purpose: placing orders from a phone has a far bigger
+    blast radius than reading from one, and must never ride along."""
     assert not remote.trading_allowed({})
     assert not remote.trading_allowed({"remote_enabled": True})
     assert not remote.trading_allowed({"remote_trading_enabled": True})
@@ -124,6 +190,7 @@ def test_help_hides_trading_commands_when_it_is_off(fresh, monkeypatch):
         return {"remote_enabled": True, "remote_trading_enabled": True}
     monkeypatch.setattr(remote, "_cfg", _cfg2)
     assert "/buy" in _run(remote.handle("discord", "111", "/help"))
+
 
 
 def _trading_cfg(monkeypatch, cap=100.0, paper=False, live=True):
@@ -181,6 +248,8 @@ def test_confirm_places_the_staged_order(fresh, monkeypatch):
 
 
 def test_a_confirmation_expires(fresh, monkeypatch):
+    """A '/buy 50' left unconfirmed overnight must not be executable by
+    whoever picks the phone up tomorrow."""
     remote.add_paired("discord", "111")
     _trading_cfg(monkeypatch)
     _fake_preview(monkeypatch)
@@ -224,6 +293,10 @@ def test_a_blocked_order_never_stages(fresh, monkeypatch):
 
 
 def test_confirm_is_independent_of_the_automation_switch(fresh, monkeypatch):
+    """A chat order is a MANUAL order. `enable_trading` runs the engines; it
+    must not gate the terminal (2026-09-01, owner's decision). Paper mode, the
+    remote's own trading switch, the per-order cap and place()'s gates still
+    apply — those are exercised by the tests around this one."""
     remote.add_paired("discord", "111")
     _trading_cfg(monkeypatch, live=False)
     _fake_preview(monkeypatch)
@@ -273,6 +346,7 @@ def test_a_malformed_order_is_rejected(fresh, monkeypatch):
         assert "Usage" in reply or "must be" in reply, f"accepted {bad!r}"
 
 
+
 def test_rate_limiting_kicks_in(fresh, monkeypatch):
     remote.add_paired("discord", "111")
 
@@ -297,6 +371,8 @@ def test_rate_limits_are_per_sender(fresh, monkeypatch):
 
 
 def test_telegram_style_command_suffix_is_stripped(fresh, monkeypatch):
+    """Telegram delivers '/status@YourBot' in groups; without stripping the
+    suffix every command in a group would read as unknown."""
     remote.add_paired("telegram", "111")
 
     async def _cfg():
@@ -310,7 +386,9 @@ def test_an_empty_message_is_ignored(fresh):
     assert _run(remote.handle("discord", "111", "   ")) == ""
 
 
+
 def test_bot_secrets_reject_an_arbitrary_platform():
+    """`platform` names a file. Only the two known values may reach the path."""
     import bot_secrets
     for bad in ("../../evil", "wallet", "", "discord/../x"):
         with pytest.raises(ValueError):
@@ -331,6 +409,7 @@ def test_a_stored_token_round_trips_and_clears(tmp_path, monkeypatch):
 
 
 def test_a_token_is_not_written_in_plaintext_json(tmp_path, monkeypatch):
+    """It must not land in a file the user pastes into a support thread."""
     import bot_secrets
     import polymarket_auth as auth
     monkeypatch.setattr(auth, "_credentials_dir", lambda: tmp_path)
@@ -340,7 +419,9 @@ def test_a_token_is_not_written_in_plaintext_json(tmp_path, monkeypatch):
             assert b"SECRET-TOKEN-VALUE" not in f.read_bytes()
 
 
+
 def _tg(monkeypatch):
+    """bot_telegram with its outbound + dispatch stubbed."""
     import bot_telegram as tg
     sent, handled = [], []
 
@@ -366,6 +447,10 @@ def _update(uid, text, age_sec, user_id="7", chat_id="42"):
 
 
 def test_a_stale_command_is_acknowledged_but_never_executed(fresh, monkeypatch):
+    """Telegram queues undelivered updates for ~24h and a fresh process starts
+    from offset 0. Without a guard, a "/flatten" sent at 2am while the PC was
+    asleep EXECUTES when the machine wakes at 9am — closing positions on a
+    seven-hour-old instruction the user long since stopped meaning."""
     tg, sent, handled = _tg(monkeypatch)
     _run(tg.process_updates([_update(1, "/flatten", 7 * 3600)]))
     assert handled == [], "a seven-hour-old /flatten was executed"
@@ -373,6 +458,7 @@ def test_a_stale_command_is_acknowledged_but_never_executed(fresh, monkeypatch):
 
 
 def test_a_stale_command_still_advances_the_offset(fresh, monkeypatch):
+    """Acknowledged, so it does not come back on the next poll forever."""
     tg, _s, _h = _tg(monkeypatch)
     tg._offset = 0
     _run(tg.process_updates([_update(77, "/flatten", 9999)]))
@@ -417,7 +503,10 @@ def test_a_message_with_no_text_is_skipped(fresh, monkeypatch):
     assert handled == [] and sent == []
 
 
+
 def test_the_telegram_identity_is_the_sender_not_the_chat(fresh, monkeypatch):
+    """A group chat id is shared by everyone in it — using it as the identity
+    would hand the remote control to every current and future member."""
     tg, sent, handled = _tg(monkeypatch)
     _run(tg.process_updates(
         [_update(1, "/flatten", 3, user_id="7", chat_id="-1009")]))
@@ -426,6 +515,7 @@ def test_the_telegram_identity_is_the_sender_not_the_chat(fresh, monkeypatch):
 
 
 def test_pairing_in_a_group_pairs_the_member_not_the_group(fresh, monkeypatch):
+    """Real handle(), so the allowlist itself is exercised."""
     import bot_telegram as tg
     sent = []
 
@@ -450,13 +540,18 @@ def test_pairing_in_a_group_pairs_the_member_not_the_group(fresh, monkeypatch):
 
 
 def test_a_message_with_no_sender_id_is_dropped(fresh, monkeypatch):
+    """No identity means no authorisation — a channel post or an anonymous
+    group admin has no `from.id` to check against the allowlist."""
     tg, sent, handled = _tg(monkeypatch)
     _run(tg.process_updates([{"update_id": 4, "message": {
         "text": "/flatten", "chat": {"id": "42"}}}]))
     assert handled == [] and sent == []
 
 
+
 def _fake_service(monkeypatch, cfg=None):
+    """A stand-in for the service module. remote imports it lazily inside the
+    functions, so a sys.modules entry is all it takes."""
     import sys
     import types
     mod = types.ModuleType("service")
@@ -471,6 +566,11 @@ def _fake_service(monkeypatch, cfg=None):
 
 
 def test_pause_lands_in_the_backend_config_as_snake_case(fresh, monkeypatch):
+    """The patch is camelCase and STATE.cfg is snake_case. Merging it raw only
+    ADDED a dead `enableTrading` key, so the trading loop — which reads
+    `enable_trading` — carried on straight through a /pause. The only thing
+    that ever stopped it was an Electron round-trip whose failure is
+    swallowed."""
     remote.add_paired("discord", "111")
     svc, events = _fake_service(monkeypatch, {
         "remote_enabled": True, "enable_trading": True,
@@ -500,6 +600,7 @@ def test_resume_puts_the_snake_case_flags_back(fresh, monkeypatch):
 
 
 def test_pause_stops_the_perps_market_maker_and_resume_restores_it(fresh, monkeypatch):
+    """/pause said "every engine" but left the Perps maker quoting."""
     remote.add_paired("discord", "111")
     svc, _e = _fake_service(monkeypatch, {
         "remote_enabled": True, "perps_enabled": True})
@@ -508,6 +609,7 @@ def test_pause_stops_the_perps_market_maker_and_resume_restores_it(fresh, monkey
     assert svc.STATE.cfg["perps_enabled"] is False
     _run(remote.handle("discord", "111", "/resume"))
     assert svc.STATE.cfg["perps_enabled"] is True
+
 
 
 def _flatten_service(monkeypatch, closed=0):
@@ -525,6 +627,12 @@ def _flatten_service(monkeypatch, closed=0):
 
 def _wallet(monkeypatch, positions=0, orders=0, left=None, orders_left=None,
             flatten=None, preview=None, canceled=None):
+    """Stub the whole wallet side of the terminal.
+
+    `positions` / `orders` are what the PREVIEW sees; `left` and `orders_left`
+    are what the re-read afterwards sees, which is the case that catches a
+    reply claiming success it cannot see.
+    """
     import terminal_trade
     seen = {"portfolio": 0, "resting": 0, "canceled": []}
 
@@ -575,6 +683,8 @@ def _wallet(monkeypatch, positions=0, orders=0, left=None, orders_left=None,
 
 
 def test_flatten_previews_and_sells_nothing_until_confirm(fresh, monkeypatch):
+    """It closes every position you own, so one fat-fingered tap must not be
+    able to do it — same two-step contract as a chat order."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=1)
     seen = _wallet(monkeypatch, positions=3)
@@ -588,6 +698,8 @@ def test_flatten_previews_and_sells_nothing_until_confirm(fresh, monkeypatch):
 
 
 def test_confirm_runs_both_the_engine_and_the_wallet(fresh, monkeypatch):
+    """A user who reads "Closed 1 position" and puts the phone down must not
+    still be holding three. The confirm closes BOTH ledgers."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=1)
     seen = _wallet(monkeypatch, positions=3, left=0)
@@ -636,6 +748,8 @@ def test_a_pending_flatten_is_discarded_by_cancel(fresh, monkeypatch):
 
 
 def test_a_flatten_confirms_without_the_remote_trading_switch(fresh, monkeypatch):
+    """De-risking is available to any paired account — the second switch gates
+    ENTRIES. Getting out must never need more permission than getting in."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=0)
     seen = _wallet(monkeypatch, positions=1, left=0)
@@ -687,6 +801,8 @@ def test_flatten_reports_what_the_wallet_still_holds_after_the_confirm(
 
 
 def test_flatten_keeps_an_unreadable_wallet_unknown(fresh, monkeypatch):
+    """An unknown wallet is not an empty one — and must not stage a flatten
+    whose scope nobody can see."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=1)
     seen = _wallet(monkeypatch, positions=1, preview={
@@ -702,6 +818,7 @@ def test_flatten_keeps_an_unreadable_wallet_unknown(fresh, monkeypatch):
 
 
 def test_flatten_says_paper_mode_is_on_before_you_confirm(fresh, monkeypatch):
+    """Better said at the preview than after a /confirm that sells nothing."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=0)
     _wallet(monkeypatch, positions=1, preview={
@@ -714,6 +831,8 @@ def test_flatten_says_paper_mode_is_on_before_you_confirm(fresh, monkeypatch):
 
 
 def test_cancelall_cancels_both_ledgers(fresh, monkeypatch):
+    """The engine cancels what it placed; the terminal's own resting orders —
+    a stop that rested, a GTC left on the book — need their own cancel."""
     remote.add_paired("discord", "111")
     _flatten_service(monkeypatch, closed=1)
     seen = _wallet(monkeypatch, orders=4, orders_left=0)
@@ -735,7 +854,10 @@ def test_cancelall_never_claims_no_orders_while_some_rest(fresh, monkeypatch):
     assert "2 resting order(s) are still on the book" in reply
 
 
+
 class _FakeGatewayWS:
+    """Says HELLO, says READY, then goes silent forever — the shape of a
+    half-open TCP connection: sends still "succeed", recv() never returns."""
 
     def __init__(self, interval_ms=40):
         import json as _j
@@ -774,13 +896,16 @@ class _FakeConnect:
 
 
 def test_a_gateway_that_stops_acking_is_torn_down(fresh, monkeypatch):
+    """_OP_HEARTBEAT_ACK used to be defined and never read, and the websockets
+    library's own liveness check was disabled — so a half-open socket left the
+    bot reporting "connected" forever while every command was lost."""
     import sys
     import types
 
     import bot_discord as bd
 
     monkeypatch.setattr(bd.bot_secrets, "load_token", lambda p: "tok")
-    ws = _FakeGatewayWS(interval_ms=40)
+    ws = _FakeGatewayWS(interval_ms=200)
     mod = types.ModuleType("websockets")
     mod.connect = lambda url, **kw: _FakeConnect(ws)
     monkeypatch.setitem(sys.modules, "websockets", mod)
@@ -810,3 +935,47 @@ def test_a_gateway_that_stops_acking_is_torn_down(fresh, monkeypatch):
     assert any(m.get("op") == 1 for m in sent), "no heartbeat was ever sent"
     assert running is False, "a dead socket still reported as running"
     assert "ACK" in (err or ""), f"last_error did not name the cause: {err!r}"
+
+
+
+def _queue_agent_order(committed=5.0):
+    with db.get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO mcp_orders (created_at, network, mode, agent_id, "
+            "condition_id, title, side, action, size, price_cents, committed_usd, "
+            "ok, status) VALUES (datetime('now'),'mainnet','live','default',"
+            "'0xabc','Will it rain?','yes','buy',10,50,?,0,'pending')", (committed,))
+        return int(cur.lastrowid)
+
+
+def test_agents_lists_what_is_waiting(fresh, monkeypatch):
+    remote.add_paired("discord", "111")
+    _fake_service(monkeypatch, {"remote_enabled": True})
+    rid = _queue_agent_order()
+    reply = _run(remote.handle("discord", "111", "/agents"))
+    assert f"#{rid}" in reply and "Will it rain?" in reply and "$5.00" in reply
+
+
+def test_reject_needs_no_trading_switch_but_approve_does(fresh, monkeypatch):
+    remote.add_paired("discord", "111")
+    _fake_service(monkeypatch, {"remote_enabled": True, "remote_trading_enabled": False})
+    a, b = _queue_agent_order(), _queue_agent_order()
+    reply = _run(remote.handle("discord", "111", f"/approve {a}"))
+    assert "needs remote trading on" in reply
+    with db.get_db() as conn:
+        assert conn.execute("SELECT status FROM mcp_orders WHERE id=?", (a,)).fetchone()[0] == "pending"
+    reply = _run(remote.handle("discord", "111", f"/reject {b}"))
+    assert "Rejected" in reply
+    with db.get_db() as conn:
+        assert conn.execute("SELECT status FROM mcp_orders WHERE id=?", (b,)).fetchone()[0] == "rejected"
+
+
+def test_approve_by_phone_re_vets_and_never_sends_on_a_paper_app(fresh, monkeypatch):
+    remote.add_paired("discord", "111")
+    _fake_service(monkeypatch, {"remote_enabled": True, "remote_trading_enabled": True,
+                                "mcp_trade_mode": "paper"})
+    rid = _queue_agent_order()
+    reply = _run(remote.handle("discord", "111", f"/approve {rid}"))
+    assert "no longer passes" in reply
+    with db.get_db() as conn:
+        assert conn.execute("SELECT status FROM mcp_orders WHERE id=?", (rid,)).fetchone()[0] == "failed"

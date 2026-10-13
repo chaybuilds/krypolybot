@@ -1,3 +1,18 @@
+"""Copy entries built from the activity-websocket payload.
+
+The trade tape delivers a followed wallet's fill ~1s after it executes; the
+Data API needs several more seconds to reflect it. The tape used to be a
+WAKEUP only — the tick it triggered still re-read /positions — so a real copy
+entry landed 5-12s behind the whale. `copy_trader.on_activity_trade` now builds
+the entry from the frame and `drain_pushed_entries` runs it through
+`_entry_pass`, the SAME pipeline the poll uses.
+
+What these tests pin is the safety half of that: the push may only make an
+entry the poll would have made anyway, sooner. So a frame that is not a BUY by
+a followed wallet at a real size, or that we have already acted on, is dropped;
+every entry gate still runs; and a pushed entry followed by the poll seeing the
+same position never opens a second one.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -53,7 +68,7 @@ def _reset_push_state(monkeypatch):
 
 
 def _cfg(**over) -> dict:
-    c = merge_with_defaults({})
+    c = merge_with_defaults({"account_mode": "live"})
     c.update({
         "network": "mainnet", "copy_enabled": True, "copy_wallets": [WALLET],
         "copy_activity_ws": True, "copy_sizing_mode": "fixed",
@@ -66,6 +81,7 @@ def _cfg(**over) -> dict:
 
 
 def _frame(**over) -> dict:
+    """One `activity_ws.drain_hits()` hit: a 100-share BUY of outcome 0 at 50c."""
     f = {"wallet": WALLET, "side": "BUY", "size": 100.0, "price": 0.5,
          "conditionId": COND, "outcomeIndex": 0, "outcome": "Yes",
          "slug": "who-wins", "eventSlug": "who-wins", "title": "Who wins?",
@@ -94,6 +110,7 @@ def _patch_live(monkeypatch, ask=50):
 
 
 def _arm(cfg):
+    """What every copy tick does before the socket callback can fire."""
     copy_trader._remember_push_ctx(cfg, True)
 
 
@@ -102,6 +119,7 @@ def _copies():
         return [dict(r) for r in conn.execute(
             "SELECT * FROM bot_positions WHERE signal_source='copy'"
         ).fetchall()]
+
 
 
 def test_pushed_buy_opens_exactly_one_position(fresh_db, env_net, monkeypatch):
@@ -123,6 +141,8 @@ def test_pushed_buy_opens_exactly_one_position(fresh_db, env_net, monkeypatch):
 
 
 def test_raw_tape_payload_is_accepted(fresh_db, env_net, monkeypatch):
+    """service.py hands the frame over RAW, straight off the socket, so the
+    tape's own field names have to work as well as the drain_hits shape."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -138,6 +158,8 @@ def test_raw_tape_payload_is_accepted(fresh_db, env_net, monkeypatch):
 
 
 def test_outcome_index_one_is_the_no_side(fresh_db, env_net, monkeypatch):
+    """Side comes from outcomeIndex, the same field /positions derives its own
+    side from — never from the `outcome` label, which is per-market prose."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -147,6 +169,8 @@ def test_outcome_index_one_is_the_no_side(fresh_db, env_net, monkeypatch):
 
 
 def test_pushed_rows_ride_out_on_the_next_run_tick(fresh_db, env_net, monkeypatch):
+    """The service emits position events from run_tick's return value; a pushed
+    entry has to appear there or the UI never learns about it."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -162,6 +186,7 @@ def test_pushed_rows_ride_out_on_the_next_run_tick(fresh_db, env_net, monkeypatc
     assert copy_trader._pushed_changed == []
 
 
+
 def test_unfollowed_wallet_is_ignored(fresh_db, env_net, monkeypatch):
     cfg = _cfg()
     _arm(cfg)
@@ -173,6 +198,8 @@ def test_unfollowed_wallet_is_ignored(fresh_db, env_net, monkeypatch):
 
 
 def test_sell_is_ignored(fresh_db, env_net, monkeypatch):
+    """A SELL is an exit: it needs OUR position, not their print, so the exit
+    pass owns it — on the very tick this frame accelerates."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -182,6 +209,7 @@ def test_sell_is_ignored(fresh_db, env_net, monkeypatch):
 
 
 def test_sub_minimum_size_is_ignored(fresh_db, env_net, monkeypatch):
+    """copy_min_trade_usd is $25; a 10-share buy at 50c is $5 of their dust."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -192,6 +220,7 @@ def test_sub_minimum_size_is_ignored(fresh_db, env_net, monkeypatch):
 
 
 def test_duplicate_trade_id_opens_one_position(fresh_db, env_net, monkeypatch):
+    """The tape re-delivers on reconnect and replays history bundles."""
     cfg = _cfg()
     _arm(cfg)
     calls = _patch_live(monkeypatch)
@@ -240,6 +269,8 @@ def test_garbled_frames_are_dropped_silently(fresh_db, env_net, bad):
 
 
 def test_push_is_inert_until_a_tick_arms_it(fresh_db, env_net):
+    """`on_activity_trade` is cfg-less (it runs on the socket's read loop). It
+    stays closed until a copy tick has told it what we follow."""
     copy_trader.on_activity_trade(_frame())
     assert copy_trader.pending_pushes() == 0
 
@@ -265,6 +296,8 @@ def test_unauthed_drain_places_nothing(fresh_db, env_net, monkeypatch):
 
 
 def test_stale_queued_push_is_not_entered(fresh_db, env_net, monkeypatch):
+    """Past the stale window the poll has had several chances at it; entering
+    on a minutes-old print is chasing, not copying."""
     cfg = _cfg()
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -272,6 +305,7 @@ def test_stale_queued_push_is_not_entered(fresh_db, env_net, monkeypatch):
     copy_trader._pushed[(COND, "yes")]["at"] -= (copy_trader._PUSHED_STALE_SEC + 5)
     assert run_async(copy_trader.drain_pushed_entries(cfg)) == 0
     assert _copies() == []
+
 
 
 def test_entry_band_rejects_a_pushed_buy_above_the_cap(fresh_db, env_net, monkeypatch):
@@ -284,6 +318,8 @@ def test_entry_band_rejects_a_pushed_buy_above_the_cap(fresh_db, env_net, monkey
 
 
 def test_only_new_entries_baselines_an_unseen_wallet(fresh_db, env_net, monkeypatch):
+    """Same rule as the poll: a wallet we have not baselined yet is RECORDED,
+    not copied — otherwise following a wallet back-fills its run-up positions."""
     cfg = _cfg(copy_only_new_entries=True)
     _arm(cfg)
     _patch_live(monkeypatch)
@@ -325,6 +361,7 @@ def test_market_another_engine_holds_is_off_limits(fresh_db, env_net, monkeypatc
     assert _copies() == []
 
 
+
 def _their_pos(ticker, qty=1000.0, cur_price=0.5, cost=500.0):
     return {"ticker": ticker, "position_fp": qty,
             "market_exposure_dollars": cost, "cur_price": cur_price,
@@ -334,6 +371,8 @@ def _their_pos(ticker, qty=1000.0, cur_price=0.5, cost=500.0):
 def test_poll_after_a_push_does_not_open_a_second_position(
     fresh_db, env_net, monkeypatch,
 ):
+    """The dedupe key is the poll's own (ticker, side) open-copy key, so the
+    Data-API read that arrives seconds later finds the position already there."""
     cfg = _cfg()
     _arm(cfg)
     calls = _patch_live(monkeypatch)
@@ -353,6 +392,10 @@ def test_poll_after_a_push_does_not_open_a_second_position(
 def test_pushed_entry_leaves_the_size_anchor_to_the_poll(
     fresh_db, env_net, monkeypatch,
 ):
+    """A frame carries the TRADE's size, not the wallet's position. Anchoring
+    to it would make the next poll read their pre-existing shares as a fresh
+    scale-in and buy again; leaving it unset lets the poll record their real
+    total without buying."""
     cfg = _cfg(copy_allow_reentries=True)
     _arm(cfg)
     calls = _patch_live(monkeypatch)
@@ -370,6 +413,10 @@ def test_pushed_entry_leaves_the_size_anchor_to_the_poll(
 
 
 def test_a_real_tape_frame_reaches_the_entry_queue(fresh_db, env_net, monkeypatch):
+    """End to end from the socket's own parser: activity_ws.handle_message ->
+    the every-trade hook service.py registers -> on_activity_trade. Guards the
+    field names across the two modules, which is exactly what a wakeup-only
+    integration never had to get right."""
     import activity_ws
 
     cfg = _cfg()

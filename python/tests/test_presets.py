@@ -1,3 +1,11 @@
+"""Sanity tests for the strategy presets — and the guard that keeps the
+backend mirror in `config.py` identical to the UI list in
+`electron/system/strategies.ts`, which is the source of truth.
+
+The two drifted once (the UI routed Edge Stack's whales to crypto/exotics/
+entertainment while the backend said sports, and the UI badged a preset
+"new" whose backend description said it did not hold up). This file fails
+on the first divergent key."""
 from __future__ import annotations
 
 import json
@@ -43,6 +51,7 @@ def _ts_presets() -> list[dict]:
     return out
 
 
+
 def test_the_backend_mirror_matches_the_ui_presets_key_for_key():
     ts = _ts_presets()
     assert len(ts) >= 3, "could not parse electron/system/strategies.ts"
@@ -57,6 +66,9 @@ def test_the_backend_mirror_matches_the_ui_presets_key_for_key():
 
 
 def test_no_preset_carries_a_recommended_or_new_badge():
+    """Every preset measured negative on the full corpus (2026-09-01). A
+    badge that says otherwise is a small lie in an app built on not telling
+    small lies."""
     for p in STRATEGY_PRESETS:
         assert (p.get("badge") or "") == "", p["id"]
         assert "example configuration" in p["description"].lower(), p["id"]
@@ -91,6 +103,7 @@ def test_aggressive_preset_only_loosens_gates_and_sizing():
     assert cfg["hard_max_position_usd"] == 100.0
     assert "enable_trading" not in p["config"]
     assert cfg["enable_trading"] is False
+
 
 
 def test_crypto15m_presets_exist():

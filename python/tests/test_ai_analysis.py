@@ -1,3 +1,19 @@
+"""AI market analysis — the rules that make the panel safe to read.
+
+The interesting tests here are not "does it call the API". They are the two
+guarantees the feature rests on:
+
+  1. The model is never given anywhere to put a number. Enforced by the
+     response schema, so it is the provider's own structured-output layer
+     that refuses, not a hope expressed in a prompt.
+  2. Nothing about the user's account can reach a provider. Enforced by
+     build_payload taking a market, so there is no argument to it through
+     which a position could arrive.
+
+The scrubber tests deliberately weigh both directions. A scrubber that eats
+"CPI came in at 2.4%" would trade the panel's usefulness for a purity nobody
+asked for, so the survival cases matter as much as the removal cases.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,12 +34,18 @@ def _run(coro):
 
 
 def _fresh(host: str):
+    """The gate's lock is created lazily and then bound to whichever loop
+    first used it, so a test that reaches the lock has to start from an
+    unbound one — every _run() here is a brand new loop."""
     gate = terminal._gates[host]
     gate._lock = None
     return gate
 
 
 def test_schema_has_no_numeric_field():
+    """The whole design. If a numeric property ever appears here, the panel
+    can print a language model's fair-value estimate as though it were a
+    quote, which is the exact failure cross_venue exists to prevent."""
     for name, spec in ai._SCHEMA["properties"].items():
         assert spec.get("type") != "number", f"{name} is numeric"
         assert spec.get("type") != "integer", f"{name} is numeric"
@@ -32,6 +54,8 @@ def test_schema_has_no_numeric_field():
 
 
 def test_schema_is_closed():
+    """additionalProperties:false is what makes the guarantee structural: the
+    provider rejects an invented `probability` field before we see it."""
     assert ai._SCHEMA["additionalProperties"] is False
     assert set(ai._SCHEMA["required"]) == set(ai._SCHEMA["properties"])
 
@@ -41,6 +65,9 @@ def test_lean_is_a_closed_vocabulary():
 
 
 def test_reasoning_is_generated_before_the_conclusion():
+    """Providers generate in schema order. Every field that is an ARGUMENT
+    must come before `lean`, so the model reasons and then concludes rather
+    than concluding and then rationalising."""
     order = list(ai._SCHEMA["properties"])
     assert order.index("reasoning") < order.index("lean")
     assert order.index("unknowns") < order.index("lean")
@@ -74,12 +101,15 @@ def test_scrubber_removes_model_estimates(text):
     "Turnout was 62% in the 2024 cycle.",
 ])
 def test_scrubber_keeps_facts_about_the_world(text):
+    """The direction that matters most. These are the market's numbers, not
+    the model's guess, and a scrubber that eats them makes the panel useless."""
     cleaned, removed = ai._strip_numeric_estimates(text)
     assert removed == 0
     assert cleaned == text
 
 
 def test_scrubber_is_sentence_scoped():
+    """One bad clause must not cost the user a paragraph of good reading."""
     text = "The Fed meets on September 17. I'd put it at 70%. CPI was 2.4%."
     cleaned, removed = ai._strip_numeric_estimates(text)
     assert removed == 1
@@ -118,6 +148,9 @@ def test_payload_carries_no_account_data():
 
 
 def test_payload_reads_rules_from_the_raw_gamma_row():
+    """The rules text lives on _raw.description, the same place
+    resolution_report reads it. Getting this wrong sends the model a market
+    with no rules and it dutifully analyses the title alone."""
     payload = ai.build_payload({
         "question": "Q?", "_raw": {"description": "The real rules."},
     })
@@ -130,6 +163,7 @@ def test_payload_states_truncation_rather_than_hiding_it():
 
 
 def test_prompt_names_missing_fields_instead_of_blanking_them():
+    """A model shown a blank invents one; shown '(not available)' it does not."""
     text = ai._render_prompt(ai.build_payload({"question": "Q?"}), "2026-08-28T00:00:00Z")
     assert "(not available)" in text
     assert "(none published" in text
@@ -158,6 +192,8 @@ def test_shape_passes_a_good_response_through():
 
 
 def test_a_lean_with_no_surviving_argument_becomes_no_view():
+    """If the scrubber removed every reasoning line, the lean has nothing
+    behind it — which is precisely what this module exists not to show."""
     out = ai._shape(
         _ok_payload(reasoning=["I'd put it at 70%."]),
         "anthropic", "m", "T", False, [], 1.0)
@@ -172,6 +208,8 @@ def test_an_unknown_lean_falls_back_to_no_view():
 
 
 def test_failure_and_success_share_one_shape():
+    """The UI renders one contract. A failure that omitted keys would make
+    every field on the panel an optional-chain."""
     ok = ai._shape(_ok_payload(), "anthropic", "m", "T", False, [], 1.0)
     bad = ai._fail("anthropic", "m", "T", "No key stored.", "Add one.")
     assert set(ok) == set(bad)
@@ -180,6 +218,8 @@ def test_failure_and_success_share_one_shape():
 
 
 def test_both_providers_are_declared_hosts():
+    """A provider the offline switch does not reach would make that switch a
+    lie, and the privacy panel's claim to name every host false."""
     for p in ai.PROVIDERS:
         assert p in terminal._HOSTS
         assert p in terminal._gates
@@ -214,6 +254,11 @@ def test_a_parked_host_fails_fast():
 
 
 def test_a_cancelled_wait_does_not_strand_the_host_lock():
+    """The gap between taking the lock and returning from __aenter__ contains
+    an await. __aexit__ never runs when __aenter__ raises, so a cancellation
+    there — the panel closed, the RPC timed out — used to leave the host lock
+    held by a coroutine that no longer exists. Every later call then waited on
+    it forever and the feature was dead until restart."""
     gate = _fresh("anthropic")
     old_gap, old_last = gate.min_gap, gate.last
 
@@ -243,6 +288,7 @@ def test_a_cancelled_wait_does_not_strand_the_host_lock():
 
 
 def _fake_anthropic(monkeypatch, closed: list, *, fail: bool = False):
+    """A stand-in for the SDK, so the close is testable without the package."""
     class _Block:
         type = "text"
         text = json.dumps(_ok_payload())
@@ -273,6 +319,9 @@ def _fake_anthropic(monkeypatch, closed: list, *, fail: bool = False):
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_the_sdk_client_is_closed_on_both_paths(monkeypatch, fail):
+    """Each SDK client opens an HTTP connection pool at construction. One per
+    analysis, never closed, is a socket leak in a process the user leaves
+    running for days — and the failing path is the one that leaks fastest."""
     closed: list = []
     _fake_anthropic(monkeypatch, closed, fail=fail)
     _fresh("anthropic")
@@ -290,6 +339,10 @@ def test_the_sdk_client_is_closed_on_both_paths(monkeypatch, fail):
 
 @pytest.mark.parametrize("raw", ["null", '"just a sentence"', "[]", "42", "{oops"])
 def test_a_reply_that_is_not_an_object_fails_honestly(monkeypatch, raw):
+    """`null`, a bare string, a list and a number are all VALID JSON, so the
+    parse succeeds and only the shape is wrong. _shape reads the reply as a
+    mapping, so anything else raised straight out of analyze() — the one
+    function that promises never to raise for an expected condition."""
     async def fake_call(prompt, model, web_search):
         return {"raw": raw, "model": "claude-test", "sources": []}
 
@@ -319,19 +372,253 @@ def test_ships_off_and_keyless():
     d = config.DEFAULT_CONFIG
     assert d["ai_enabled"] is False
     assert d["ai_web_search"] is False
-    assert d["ai_openai_model"] == ""
+    assert "ai_openai_model" not in d and "ai_anthropic_model" not in d
+    assert config.merge_with_defaults({"ai_provider": "openai"})["ai_model"] == ""
+    assert d["autopilot_enabled"] is False
 
 
 def test_unknown_provider_falls_back():
+    """The provider name reaches a dispatch table, so it is clamped."""
     cfg = config._validate_config({**config.DEFAULT_CONFIG, "ai_provider": "../../etc"})
     assert cfg["ai_provider"] == "anthropic"
 
 
 def test_model_id_is_bounded():
-    cfg = config._validate_config({**config.DEFAULT_CONFIG, "ai_anthropic_model": "x" * 500})
-    assert len(cfg["ai_anthropic_model"]) <= 120
+    cfg = config._validate_config({**config.DEFAULT_CONFIG, "ai_model": "x" * 500})
+    assert cfg["ai_model"] == "claude-opus-5"
+    cfg = config._validate_config({**config.DEFAULT_CONFIG, "ai_provider": "gemini",
+                                   "ai_model": "../../v1/files"})
+    assert cfg["ai_model"] == "gemini-3.8-flash"
 
 
 def test_analysis_is_refused_while_disabled():
+    """A stored key is not consent to start sending market text to a third
+    party. Both switches have to be on."""
     out = _run(ai.analyze({"question": "Q?"}, {"ai_enabled": False}))
     assert out["ok"] is False
+
+
+import httpx  # noqa: E402
+
+import ai_providers as ap  # noqa: E402
+
+_HTTP_CHAT = {
+    "openrouter": ("POST", "/api/v1/chat/completions"),
+    "lmstudio": ("POST", "/v1/chat/completions"),
+    "ollama": ("POST", "/api/chat"),
+    "gemini": ("POST", "/v1beta/models/gemini-3.8-flash:generateContent"),
+}
+_LMS = "qwen2.5-7b-instruct"
+HTTP_PROVIDERS = ("openrouter", "gemini", "ollama", "lmstudio")
+
+
+def _http_reply(provider: str, text: str) -> dict:
+    if provider in ("openrouter", "lmstudio"):
+        return {"choices": [{"message": {"role": "assistant", "content": text},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 200}}
+    if provider == "ollama":
+        return {"message": {"role": "assistant", "content": text}, "done": True,
+                "prompt_eval_count": 900, "eval_count": 200}
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 900, "candidatesTokenCount": 200}}
+
+
+class _Net:
+    def __init__(self):
+        self.requests: list = []
+        self.routes: dict = {}
+
+    def __call__(self, request):
+        self.requests.append(request)
+        h = self.routes.get((request.method, request.url.path))
+        if h is None:
+            return httpx.Response(404, json={"error": f"no route {request.url.path}"})
+        return h(request)
+
+    def bodies(self, method, path):
+        return [json.loads(r.content or b"{}") for r in self.requests
+                if r.method == method and r.url.path == path]
+
+
+@pytest.fixture
+def net(monkeypatch):
+    n = _Net()
+    monkeypatch.setattr(ap, "_TRANSPORT", httpx.MockTransport(n))
+    ap._LISTED.clear()
+    keys = {"openrouter": "sk-" + "or-v1-" + "0f" * 32, "gemini": "AI" + "za" + "X" * 35}
+    monkeypatch.setattr(ai, "read_key", lambda p: keys.get(p))
+    n.routes[("GET", "/api/v0/models")] = lambda r: httpx.Response(200, json={"data": [
+        {"id": _LMS, "type": "llm", "state": "loaded", "loaded_context_length": 32768}]})
+    for g in HTTP_PROVIDERS:
+        terminal._gates[g].parked_until = 0.0
+    yield n
+    ap._LISTED.clear()
+
+
+def _analyze_http(net, provider: str, reply_obj, **cfg) -> dict:
+    text = reply_obj if isinstance(reply_obj, str) else json.dumps(reply_obj)
+    net.routes[_HTTP_CHAT[provider]] = lambda r: httpx.Response(
+        200, json=_http_reply(provider, text))
+    return _run(ai.analyze(
+        {"question": "Will the Fed cut in September?", "probability": 61.0,
+         "_raw": {"description": "Resolves YES if the target range is lowered."}},
+        {"ai_enabled": True, "ai_provider": provider, "ai_model": "", **cfg}))
+
+
+def _no_numeric_types(schema) -> bool:
+    if isinstance(schema, dict):
+        if schema.get("type") in ("number", "integer"):
+            return False
+        return all(_no_numeric_types(v) for v in schema.values())
+    if isinstance(schema, list):
+        return all(_no_numeric_types(v) for v in schema)
+    return True
+
+
+@pytest.mark.parametrize("provider", HTTP_PROVIDERS)
+def test_every_http_provider_is_asked_for_the_closed_schema(net, provider):
+    out = _analyze_http(net, provider, _ok_payload())
+    assert out["ok"] is True and out["lean"] == "cheap", out
+    body = net.bodies(*_HTTP_CHAT[provider])[0]
+    if provider in ("openrouter", "lmstudio"):
+        rf = body["response_format"]
+        assert rf["type"] == "json_schema" and rf["json_schema"]["strict"] is True
+        sent = rf["json_schema"]["schema"]
+        assert sent["additionalProperties"] is False
+        if provider == "openrouter":
+            assert body["provider"]["require_parameters"] is True
+    elif provider == "ollama":
+        sent = body["format"]
+        assert sent["additionalProperties"] is False
+    else:
+        gen = body["generationConfig"]
+        assert gen["responseMimeType"] == "application/json"
+        sent = gen["responseSchema"]
+        assert sent["propertyOrdering"][-2:] == ["lean", "confidence"]
+    assert _no_numeric_types(sent)
+    assert set(sent["properties"]) == set(ai._SCHEMA["properties"])
+
+
+@pytest.mark.parametrize("provider", HTTP_PROVIDERS)
+def test_an_invented_probability_field_is_rejected_on_every_provider(net, provider):
+    out = _analyze_http(net, provider, {**_ok_payload(), "probability": 0.7})
+    assert out["ok"] is False
+    assert "broke the response format" in out["reason"]
+    assert out["lean"] is None and out["summary"] is None and out["reasoning"] == []
+
+
+@pytest.mark.parametrize("provider", HTTP_PROVIDERS)
+@pytest.mark.parametrize("bad", [
+    {"summary": 70},
+    {"reasoning": ["Soft print.", 0.68]},
+    {"lean": "cheap", "confidence": 3},
+    {"unknowns": {"fairValueCents": 41}},
+    {"probability": "seventy percent"},
+])
+def test_a_number_or_extra_field_anywhere_is_rejected_on_every_provider(net, provider, bad):
+    out = _analyze_http(net, provider, {**_ok_payload(), **bad})
+    assert out["ok"] is False and "broke the response format" in out["reason"]
+    assert set(out) == set(ai._fail("x", "m", "T", "r", None))
+
+
+@pytest.mark.parametrize("provider", HTTP_PROVIDERS)
+def test_a_numeric_estimate_in_prose_is_scrubbed_on_every_provider(net, provider):
+    out = _analyze_http(net, provider, _ok_payload(
+        reasoning=["Three of the last four cuts followed a soft print.",
+                   "I'd put it at around 70%."]))
+    assert out["ok"] is True and out["redactions"] == 1
+    assert all("70%" not in r for r in out["reasoning"])
+
+
+@pytest.mark.parametrize("provider", ("ollama", "lmstudio", "openrouter"))
+def test_a_draft_number_inside_reasoning_is_not_the_answer(net, provider):
+    """A local reasoning model can think out loud with a draft object; the
+    answer is what follows the thought, and it still passes _conform."""
+    draft = json.dumps({"summary": "draft", "probability": 0.7})
+    text = (f"<think>first try: {draft}</think>\n```json\n"
+            f"{json.dumps(_ok_payload())}\n```")
+    out = _analyze_http(net, provider, text)
+    assert out["ok"] is True and out["summary"] != "draft"
+
+
+def test_gemini_with_search_skips_response_schema_but_still_rejects_numbers(net):
+    """Gemini models before 3 refuse responseSchema alongside the search tool,
+    so with search on the app's own check is the guarantee — and it holds."""
+    out = _analyze_http(net, "gemini", {**_ok_payload(), "fairValue": 55},
+                        ai_web_search=True)
+    body = net.bodies(*_HTTP_CHAT["gemini"])[0]
+    assert body["tools"] == [{"google_search": {}}]
+    assert "responseSchema" not in body["generationConfig"]
+    assert out["ok"] is False and "broke the response format" in out["reason"]
+
+
+@pytest.mark.parametrize("provider", ("ollama", "lmstudio"))
+def test_a_local_model_never_claims_it_searched(net, provider):
+    out = _analyze_http(net, provider, _ok_payload(), ai_web_search=True)
+    assert out["ok"] is True and out["webSearch"] is False
+
+
+def test_sdk_providers_pass_the_same_schema_check(monkeypatch):
+    """Anthropic and OpenAI enforce the schema themselves; the check runs
+    anyway, so a provider-side regression can never put a number on screen."""
+    async def fake_call(prompt, model, web_search):
+        return {"raw": json.dumps({**_ok_payload(), "fairValueCents": 41}),
+                "model": "m", "sources": []}
+
+    for name, prov in (("_call_anthropic", "anthropic"), ("_call_openai", "openai")):
+        monkeypatch.setattr(ai, name, fake_call)
+        out = _run(ai.analyze({"question": "Q?"},
+                              {"ai_enabled": True, "ai_provider": prov, "ai_model": "gpt-x"}))
+        assert out["ok"] is False and "broke the response format" in out["reason"]
+
+
+def test_a_cloud_http_provider_without_a_key_never_calls_out(net, monkeypatch):
+    monkeypatch.setattr(ai, "read_key", lambda p: None)
+    monkeypatch.setattr(ai.ai_secrets, "load_key", lambda p: None)
+    for provider in ("openrouter", "gemini"):
+        out = _analyze_http(net, provider, _ok_payload())
+        assert out["ok"] is False and "key" in out["reason"].lower()
+    assert [r for r in net.requests if r.method == "POST"] == []
+
+
+def test_offline_mode_stops_cloud_providers_but_not_loopback(net):
+    terminal.set_offline(True)
+    try:
+        out = _analyze_http(net, "openrouter", _ok_payload())
+        assert out["ok"] is False and "Offline mode" in out["reason"]
+        assert net.bodies(*_HTTP_CHAT["openrouter"]) == []
+        assert _analyze_http(net, "ollama", _ok_payload())["ok"] is True
+    finally:
+        terminal.set_offline(False)
+
+
+def test_legacy_model_keys_migrate_to_ai_model():
+    c = config.merge_with_defaults({"aiProvider": "openai", "aiOpenaiModel": "gpt-5.5",
+                                    "aiAnthropicModel": "claude-sonnet-5"})
+    assert c["ai_model"] == "gpt-5.5"
+    assert "ai_openai_model" not in c and "ai_anthropic_model" not in c
+    c = config.merge_with_defaults({"ai_provider": "anthropic",
+                                    "ai_anthropic_model": "claude-sonnet-5"})
+    assert c["ai_model"] == "claude-sonnet-5"
+    c = config.merge_with_defaults({"ai_provider": "openai", "ai_model": "gpt-a",
+                                    "ai_openai_model": "gpt-b"})
+    assert c["ai_model"] == "gpt-a"
+    assert config.merge_with_defaults({"ai_provider": "gemini"})["ai_model"] == "gemini-3.8-flash"
+
+
+def test_status_reports_every_provider_and_never_a_key():
+    st = ai.status(config.merge_with_defaults({"ai_provider": "ollama"}))
+    assert st["provider"] == "ollama" and st["hasKey"] is True
+    assert st["keys"]["ollama"] == {"present": False, "masked": None, "needsKey": False}
+    assert set(st["providers"]) == set(ai.PROVIDERS)
+    assert st["capabilities"]["gemini"]["webSearch"] is True
+    assert st["capabilities"]["ollama"]["webSearch"] is False
+    assert "sk-" not in json.dumps(st)
+
+
+def test_new_hosts_are_declared_for_the_privacy_panel():
+    hosts = {row["host"] for row in terminal.health()["providers"]}
+    assert {"openrouter.ai", "generativelanguage.googleapis.com",
+            "127.0.0.1:11434", "127.0.0.1:1234"} <= hosts

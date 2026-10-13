@@ -3,12 +3,13 @@ import {
   ExternalLink, Eye, EyeOff, Gift, KeyRound, RefreshCcw,
   Save, ShieldAlert, ShieldCheck, Trash2, Wallet, Wifi, WifiOff,
 } from 'lucide-react';
-import type { CredentialsState, CredentialsStatusAll } from '@shared/types';
+import type { CredentialsState, CredentialsStatusAll, RegionStatus } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Card, Page, Section } from '../components/common';
 import { cls } from '../utils/format';
 import { POLYMARKET_REFERRAL_URL } from '../utils/links';
+import { regionLine } from '../utils/goLive';
 
 const SIGNATURE_TYPE_LABELS: Record<number, string> = {
   0: 'EOA',
@@ -26,7 +27,7 @@ export function ApiKeysPage() {
     try {
       const all = await window.krypt.credentials.statusAll();
       setStatusAll(all);
-    } catch {}
+    } catch { }
   };
 
   useEffect(() => {
@@ -96,11 +97,12 @@ function ReferralBanner() {
         <Gift className="h-5 w-5 text-white" />
       </div>
       <div className="flex-1 text-sm">
-        <div className="font-medium text-white">No Polymarket account yet?</div>
+        <div className="font-medium text-white">No Polymarket account yet? Make it with our link</div>
         <div className="mt-0.5 text-xs text-krypt-muted">
-          Sign up with our link — deposit $20 and place a first trade for up to $50 in trading
-          credits (Polymarket&apos;s current new-user offer). Then fund the wallet with USDC and
-          export its private key to connect it here.
+          It&apos;s free and costs you nothing extra, and accounts made through our link are how
+          Krypt PolyBot stays free and keeps getting better — please use it. Deposit $20 and place a
+          first trade for up to $50 in trading credits (Polymarket&apos;s current new-user offer),
+          then export the wallet&apos;s private key to connect it here.
         </div>
       </div>
       <button
@@ -124,13 +126,15 @@ function WalletSlot({ status, onSaved }: SlotProps) {
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
   const [funder, setFunder] = useState('');
+  const [lastRegion, setLastRegion] = useState<RegionStatus | null>(null);
   useEffect(() => { setFunder(status?.funder || ''); }, [status?.funder]);
 
   const has = !!status?.hasWalletKey;
 
   const reportTest = (data?: {
-    balanceUsd?: number; ready?: boolean; issues?: string[];
+    balanceUsd?: number; ready?: boolean; issues?: string[]; region?: RegionStatus | null;
   }): void => {
+    setLastRegion(data?.region ?? null);
     const balStr = `$${(data?.balanceUsd ?? 0).toFixed(2)}`;
     const issues = data?.issues ?? [];
     if (data?.ready === false || issues.length) {
@@ -265,6 +269,20 @@ function WalletSlot({ status, onSaved }: SlotProps) {
                   deposit wallet address below.
                 </div>
               )}
+              {(() => {
+                const line = regionLine(lastRegion);
+                if (!line) return null;
+                return (
+                  <div
+                    data-testid="wallet-region"
+                    data-region={lastRegion?.status}
+                    className={cls('mt-0.5', line.tone === 'good' ? 'text-krypt-win'
+                      : line.tone === 'warn' ? 'text-krypt-warn' : 'text-krypt-loss')}
+                  >
+                    Region: {line.text}
+                  </div>
+                );
+              })()}
               <div className="text-[10px] text-krypt-dim">
                 Paste a new key below to replace, or click Delete to remove.
               </div>

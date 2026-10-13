@@ -1,3 +1,9 @@
+"""Perps realtime feed, fast requotes, history backfill and the backtest
+simulator.
+
+The simulator's fill rules are the whole credibility of a backtest number, so
+each rule is pinned on a hand-built tape where the right answer is obvious.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +32,7 @@ def tape_db(tmp_path, monkeypatch):
     pm.reset_state()
     yield tmp_path
     pm.reset_state()
+
 
 
 def test_parse_bbo_and_trades():
@@ -66,6 +73,7 @@ def test_feed_wakes_on_moves_and_buffers_the_tape():
     assert f.bbo(6) is None
 
 
+
 def test_fast_path_requotes_from_the_live_touch_and_tracks_acks(tape_db, monkeypatch):
     ex = FakeExchange(monkeypatch)
     feed = perps_ws.PerpsFeed()
@@ -74,11 +82,12 @@ def test_fast_path_requotes_from_the_live_touch_and_tracks_acks(tape_db, monkeyp
     cfg = _enabled_cfg()
     _run(pm.run_tick(cfg))
     assert len(ex.created) == 2
-    assert {o["order_id"] for os_ in pm._our_orders.values() for o in os_} == {0, 1}
+    first = ex.resting_ids()
+    assert sorted(o["order_id"] for os_ in pm._our_orders.values() for o in os_) == first
     feed.handle({"ch": "bbo::6", "ts": 1, "data": {"iid": 6, "bp": "86650", "ap": "86651"}})
     ex.created.clear()
     assert _run(pm.run_fast({**cfg, "perps_vol_pull_bps": 0.0}, {6})) is True
-    assert sorted(ex.cancelled) == [0, 1]
+    assert sorted(ex.cancelled) == first
     bids = [float(r[2]) for r in ex.created if r[1]]
     assert bids and bids[0] > 86600
     st = pm.status(cfg)["markets"][0]
@@ -113,6 +122,7 @@ def test_tick_records_the_live_tape(tape_db, monkeypatch):
     with db.get_db() as conn:
         assert db.perps_trades_range(conn, 6, 0, 2000) == [(1000, "long", 86391.0, 0.1)]
         assert db.perps_ticks_range(conn, 6, 0, 2000) == [(1000, 86390.0, 86391.0)]
+
 
 
 def test_missing_ranges():
@@ -186,6 +196,7 @@ def _cfg(**kw):
 
 
 def _bounce(n, *, step_ms=1000, bid=99.99, ask=100.01, qty=5.0, t0=DAY0):
+    """A flat market: alternating taker buys at the ask and sells at the bid."""
     out = []
     for i in range(n):
         side = "long" if i % 2 == 0 else "short"

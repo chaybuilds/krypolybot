@@ -1,9 +1,17 @@
+"""Does the 65c ask cap earn its keep OUT OF SAMPLE?
+
+The cap was chosen from 20 live fills (>65c lost, <50c won) — i.e. fit to the
+data used to justify it. This replays the SAME momentum gate and the SAME
+honest fill models as pmxt_backfill.simulate() over 4,751 real BTC 15m
+windows, sweeping only the cap. One pass over the archive, all caps scored
+together.
+"""
 import math
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
-DB = Path(__file__).with_name("data") / "pmxt_btc15m.db"
+DB = Path(r"C:\Users\Krypt\Desktop\kryptware\krypt-polybot\python\research\data\pmxt_btc15m.db")
 FEE_RATE = 0.07
 WINDOW_S = 900
 CAPS = [0.30, 0.40, 0.50, 0.65, 0.80, 0.95]

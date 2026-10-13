@@ -1,3 +1,27 @@
+"""Discord bot — Gateway transport for remote.py.
+
+Hand-rolled on the `websockets` dependency the CLOB feed already pulls in,
+rather than adding discord.py. The reasons are practical: this needs exactly
+two things from Discord (receive a DM, send a DM), discord.py is a large
+dependency to freeze into an installer for that, and the codebase already
+contains several hand-written websocket clients built the same way.
+
+Why the Gateway at all: the other way to receive commands is an HTTP
+interactions endpoint, which needs a public HTTPS URL. The machine running
+this is a home PC behind NAT, so an outbound websocket is the only option that
+works without a tunnel.
+
+The transport is thin. Who may speak and what they may do is remote.py's job,
+so this bot and the Telegram one cannot drift into different rules.
+
+SETUP the user has to do (surfaced in the app):
+  * create an application at discord.com/developers, add a Bot
+  * copy the bot TOKEN
+  * enable the MESSAGE CONTENT intent — without it Discord delivers empty
+    message bodies and every command silently does nothing
+  * DM the bot, or invite it to a private server
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -37,6 +61,8 @@ _dm_channels: dict[str, str] = {}
 
 
 def _task_alive() -> bool:
+    """The supervisor loop is up. Used by start() so a momentary disconnect
+    never spawns a second _run() alongside the first."""
     return _task is not None and not _task.done()
 
 
@@ -64,13 +90,16 @@ def _headers(token: str) -> dict:
 
 
 async def verify_token(token: str) -> dict:
+    """Check a token before saving it. Also the only place that can tell the
+    user their token is fine but the MESSAGE CONTENT intent is not — which is
+    otherwise an invisible failure."""
     t = (token or "").strip()
     if not t:
         return {"ok": False, "message": "No token given."}
     try:
         client = await _client()
         r = await client.get(f"{API}/users/@me", headers=_headers(t), timeout=15.0)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"Could not reach Discord: {e}"}
     if r.status_code == 401:
         return {"ok": False, "message": "Discord rejected that token."}
@@ -103,6 +132,8 @@ async def _dm_channel(user_id: str) -> Optional[str]:
 
 
 async def send(user_id: str, text: str) -> None:
+    """Outbound, always as a DM. Chunked to Discord's 2000-character limit —
+    a long position list would otherwise be rejected wholesale."""
     token = bot_secrets.load_token("discord")
     if not token:
         return
@@ -123,6 +154,8 @@ async def send(user_id: str, text: str) -> None:
 
 
 async def _send_to_channel(channel_id: str, text: str) -> None:
+    """Reply where the message came from, so a command sent in a private
+    server is answered there rather than in a DM the user is not looking at."""
     token = bot_secrets.load_token("discord")
     if not token:
         return
@@ -140,6 +173,15 @@ async def _send_to_channel(channel_id: str, text: str) -> None:
 
 
 async def _heartbeat(ws, interval_ms: int, state: dict) -> None:
+    """Discord closes the socket if we miss heartbeats. `seq` is shared with
+    the receive loop through `state`, which is why it is a dict and not a
+    local — sending a stale sequence number makes Discord invalidate the
+    session.
+
+    It is also the liveness check. A TCP connection can go half-open: sends
+    keep succeeding into a socket nobody is reading and recv() simply never
+    returns, so a missing ACK is the ONLY evidence the link is dead.
+    """
     interval = max(0.001, interval_ms / 1000.0)
     try:
         while True:
@@ -151,23 +193,31 @@ async def _heartbeat(ws, interval_ms: int, state: dict) -> None:
             await ws.send(json.dumps({"op": _OP_HEARTBEAT, "d": state.get("seq")}))
     except asyncio.CancelledError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         state["fatal"] = str(e)
         logger.info("discord heartbeat: %s", e)
         try:
             await ws.close()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
 
 def _wanted() -> bool:
+    """Does the user still want this bot on?
+
+    Checked on the reconnect path only. The supervisor stops a bot it can SEE
+    running, and is_running() is now false while we are disconnected — so a
+    "turn Discord off" that lands mid-reconnect would otherwise leave this
+    loop retrying forever. An unreadable config means keep trying: a bad read
+    must never silently switch the bot off.
+    """
     try:
         import service
         from config import merge_with_defaults
         cfg = merge_with_defaults(dict(service.STATE.cfg or {}))
         return bool(cfg.get("remote_enabled")) and bool(
             cfg.get("remote_discord_enabled"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 
@@ -273,11 +323,11 @@ async def _run() -> None:
                             "discord", uid, text, label=label)
                         if reply and channel_id:
                             await _send_to_channel(channel_id, reply)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.debug("discord handler failed: %s", e, exc_info=True)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             _last_error = str(state.get("fatal") or e)[:200]
             logger.info("discord gateway error: %s", _last_error)
         finally:
@@ -302,7 +352,7 @@ async def start() -> bool:
         _last_error = "No bot token saved."
         return False
     try:
-        import websockets
+        import websockets  # noqa: F401
     except Exception:
         _last_error = "The websockets library is missing from this build."
         return False

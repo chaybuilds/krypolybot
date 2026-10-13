@@ -1,3 +1,10 @@
+"""Retry-idempotency guard for the authenticated CLOB request layer.
+
+A POST /order is a non-idempotent mutation: if the response is lost to a timeout
+or 5xx, the order may already have reached the CLOB. Blindly re-firing it would
+risk a DOUBLE FILL, so place_limit_order calls `_authed_request(..., idempotent=
+False)` and that path must NOT retry on an ambiguous failure. Reads stay retried.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -89,6 +96,7 @@ def test_idempotent_get_still_retries_on_5xx(monkeypatch):
     with pytest.raises(pa.PolymarketAPIError):
         _run(pa._authed_request("GET", "/markets"))
     assert client.calls == pa.MAX_RETRIES
+
 
 
 class _RResp:

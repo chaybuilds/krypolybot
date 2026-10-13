@@ -1,3 +1,14 @@
+"""Authed startup must not walk its independent REST calls in single file.
+
+Boot used to be: cancel-all-resting → reconcile positions → refresh balance,
+each awaited in turn — three serial round trips before the loop's first tick
+(measured as the bulk of the pre-tick startup cost).
+
+The cancel is a genuine prerequisite (it takes stale GTC orders off the book
+and releases their collateral, which both of the others read), so it stays
+first. The reconcile and the balance read consume nothing of each other's
+results, so they go out together.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +18,8 @@ import service
 
 
 def _stub_trader(monkeypatch, delay=0.05, *, fail=None):
+    """Three stubbed round trips that each cost `delay` and record when they
+    ran, so a test can see the shape of the call graph, not just its duration."""
     calls: list[str] = []
     spans: dict[str, tuple[float, float]] = {}
 
@@ -53,6 +66,10 @@ def _stub_trader(monkeypatch, delay=0.05, *, fail=None):
 
 
 def test_the_independent_startup_calls_overlap(monkeypatch):
+    """Reconcile + balance must be in flight AT THE SAME TIME, behind the one
+    call they both depend on. Overlap is the structural property; the wall clock
+    below is the budget (kept loose because a 50ms `asyncio.sleep` on Windows
+    rounds up to the ~15.6ms scheduler tick)."""
     calls, spans = _stub_trader(monkeypatch, delay=0.05)
 
     t0 = time.perf_counter()

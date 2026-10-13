@@ -1,15 +1,32 @@
+"""The one-click position exit, pinned.
+
+This exists because of one sentence from the first live test: "selling is a
+little wack… it technically works but I tried to sell at the same price I
+bought at". A limit at your entry price does not cross a bid, so it RESTS —
+an offer, not an exit. The panel this file guards prices a marketable
+fill-and-kill instead, and every test here pins one way that could quietly
+stop being true:
+
+* the limit escaping the slippage cap the user picked,
+* an order being sized past what the book can absorb, leaving a resting
+  remainder the user thinks is an exit,
+* a settled market being "sold" into a book that does not exist,
+* an unreadable book or an unreadable wallet being treated as "nothing",
+* a paper sell touching the real exchange,
+* the confirmed dollar figure not being the one that leaves.
+"""
 from __future__ import annotations
 
 import asyncio
 
 import pytest
 
-import db
+import db  # noqa: F401 — the paper_db fixture needs the module patched
 import terminal_paper as tp
 import terminal_trade as tt
 
-from test_terminal_paper import _mock_market, _order, paper_db
-from test_terminal_honesty import _seed_fills
+from test_terminal_paper import _mock_market, _order, paper_db  # noqa: E402,F401
+from test_terminal_honesty import _seed_fills  # noqa: E402
 
 CID = "0xdead"
 
@@ -20,11 +37,16 @@ def _run(coro):
 
 @pytest.fixture(autouse=True)
 def _no_background_reconcile(monkeypatch):
+    """`place()` fires a reconcile 3 s later. In a test that task outlives the
+    loop and does nothing useful, so it never starts."""
     monkeypatch.setattr(tt, "_spawn", lambda coro: (coro.close(), None)[1])
 
 
 def _wallet(monkeypatch, *, size=100.0, side="yes", cur_price=0.60,
             avg_price=None, outcome="Up"):
+    """The live wallet stub — same shape as `test_terminal_honesty`'s
+    `_fake_portfolio`, with the size and the venue's own average exposed so
+    the basis tests can turn them on and off."""
     raw: dict = {"outcome": outcome}
     if avg_price is not None:
         raw["avgPrice"] = avg_price
@@ -43,7 +65,11 @@ def _wallet(monkeypatch, *, size=100.0, side="yes", cur_price=0.60,
 
 
 def _tradable(monkeypatch):
+    """Everything `place()` needs that is not the book: a funded wallet and a
+    venue that accepts, on a Live account (the backend's raw default config
+    reads Paper). The order itself is captured, never sent."""
     sent: list[dict] = []
+    monkeypatch.setattr(tt, "_paper_mode_on", lambda: False)
 
     monkeypatch.setattr(tt.api, "_deposit_wallet_issue", lambda: None)
 
@@ -59,6 +85,7 @@ def _sell(**kw) -> dict:
     base = {"conditionId": CID, "side": "yes", "paper": False}
     base.update(kw)
     return base
+
 
 
 def test_a_whole_position_that_fits_the_cap_sells_at_the_walked_average(
@@ -107,6 +134,9 @@ def test_a_zero_cent_cap_sells_only_at_the_best_bid(paper_db, monkeypatch):
 
 
 def test_the_order_is_sized_to_what_fits_so_nothing_rests(paper_db, monkeypatch):
+    """The whole point. An FAK sized past the book kills the remainder, which
+    is fine — but an order sized past the CAP would fill below it, and a GTC
+    sized past the book would rest. Neither is an exit."""
     _mock_market(monkeypatch, bids=[(60.0, 10), (50.0, 100)])
     _wallet(monkeypatch, size=40.0)
     sent = _tradable(monkeypatch)
@@ -120,6 +150,7 @@ def test_the_order_is_sized_to_what_fits_so_nothing_rests(paper_db, monkeypatch)
     assert sent[0]["action"] == "sell"
     assert sent[0]["price_cents"] == 60
     assert r["sentSize"] == 10.0
+
 
 
 def test_an_unreadable_book_refuses_rather_than_guessing(paper_db, monkeypatch):
@@ -177,6 +208,9 @@ def test_a_lost_settled_market_says_there_is_nothing_to_sell(
 
 
 def test_a_sub_minimum_holding_refuses_with_the_reason(paper_db, monkeypatch):
+    """`preview()` only WARNS on a sub-minimum sell, because a hand-typed one
+    may be worth attempting. A one-click exit is a promise that it will go
+    through, so the refusal has to arrive here with the reason attached."""
     async def _market(cid, include_raw=False):
         m = {
             "conditionId": cid, "title": "T", "slug": "t", "category": "crypto",
@@ -213,6 +247,7 @@ def test_a_missing_confirmation_refuses(paper_db, monkeypatch):
     sent = _tradable(monkeypatch)
     r = _run(tt.sell_position(_sell()))
     assert r["ok"] is False and sent == []
+
 
 
 def _fees_on(monkeypatch, rate=0.07, exponent=1.0):
@@ -268,6 +303,7 @@ def test_the_venues_own_average_is_used_and_stamped(paper_db, monkeypatch):
     assert pv["basisSource"] == "data-api"
 
 
+
 def test_a_paper_sell_reduces_the_paper_position_and_sends_nothing_live(
         paper_db, monkeypatch):
     _mock_market(monkeypatch, asks=[(50.0, 100)], bids=[(60.0, 100)])
@@ -302,6 +338,8 @@ def test_a_paper_sell_reduces_the_paper_position_and_sends_nothing_live(
 
 
 def test_a_paper_sell_reads_the_paper_book_not_the_wallet(paper_db, monkeypatch):
+    """Paper and live are never mixed. With a real wallet position and an
+    empty paper ledger, a paper sell must find nothing."""
     _mock_market(monkeypatch, bids=[(60.0, 100)])
     _wallet(monkeypatch, size=100.0)
     pv = _run(tt.sell_position_preview(_sell(paper=True)))
@@ -309,6 +347,9 @@ def test_a_paper_sell_reads_the_paper_book_not_the_wallet(paper_db, monkeypatch)
 
 
 def test_paper_mode_still_refuses_a_live_sell(paper_db, monkeypatch):
+    """`place()` reads the PAPER switch from the live config, so a live sell
+    while paper mode is on is refused inside the module — not only at the RPC
+    handler that the chat bots and the standing tick bypass."""
     _mock_market(monkeypatch, bids=[(60.0, 100)])
     _wallet(monkeypatch, size=40.0)
     sent = _tradable(monkeypatch)
@@ -318,6 +359,7 @@ def test_paper_mode_still_refuses_a_live_sell(paper_db, monkeypatch):
     assert r["ok"] is False
     assert "paper mode" in r["message"].lower()
     assert sent == []
+
 
 
 def test_asking_for_more_than_you_hold_is_capped_not_shorted(

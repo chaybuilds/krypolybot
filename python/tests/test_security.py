@@ -1,3 +1,4 @@
+"""Tests for config validation/clamping and at-rest credential encryption."""
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +7,7 @@ import pytest
 
 import polymarket_auth as ka
 from config import DEFAULT_CONFIG, merge_with_defaults
+
 
 
 def test_oversized_fraction_is_clamped():
@@ -59,6 +61,7 @@ def test_crypto15m_maker_and_hours_knobs_clamped():
 
 def test_camelcase_keys_still_clamped():
     assert merge_with_defaults({"maxSizeFraction": 9.0})["max_size_fraction"] == 1.0
+
 
 
 def test_dpapi_roundtrip():

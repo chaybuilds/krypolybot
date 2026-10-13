@@ -1,3 +1,16 @@
+"""Current-state survey of the MAIN engine's whale + momentum signals.
+
+Follower economics over the recorded, resolved signal history (whale_trades +
+alerts): entry at signal price + slippage, category-aware fee-v2 taker fee,
+outcome from the recorded resolution — the same convention as replay_main.
+Sliced by source x category x week with per-EVENT clustered t-stats (one game
+prints many correlated signals; naive t overstates).
+
+Two views: UNGATED (raw signal quality) and GATED (what the live engine would
+accept under the app's current settings.json config via trader.should_trade).
+
+    python research/whale_momentum_survey.py [--days 60] [--slippage 1.0]
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ.setdefault("KRYPT_POLYBOT_USERDATA", os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Krypt PolyBot"))
+os.environ.setdefault("KRYPT_POLYBOT_USERDATA", r"C:\Users\maxwe\AppData\Roaming\Krypt PolyBot")
 
 import backtest as bt
 import db as dbmod
@@ -27,6 +40,8 @@ def app_config() -> dict:
 
 
 def follower_pnl(sig: dict, source: str, slippage_c: float) -> tuple[float, float] | None:
+    """(cost, net_pnl_per_contract) for following this signal, or None if the
+    signal has no usable price/outcome."""
     price = sig.get("price")
     if price is None:
         return None
@@ -53,6 +68,7 @@ def clustered_t(by_event: dict[str, list[float]]) -> float | None:
 
 
 def summarize(rows: list[tuple[dict, float]]) -> dict:
+    """rows: [(signal, pnl_ct)] -> stats with per-event clustering."""
     if not rows:
         return {"n": 0}
     pnls = [p for _s, p in rows]

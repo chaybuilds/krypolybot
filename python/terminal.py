@@ -1,3 +1,35 @@
+"""Terminal provider layer — read side.
+
+The bot answers "should I act, right now, on this one thing I am watching?".
+The terminal answers "what is going on, and what should I do about it?" — for
+ANY market the user names, not just the ones an engine happened to watch.
+
+Three rules govern everything below.
+
+1. THE ONE RULE. A value nobody could produce is ``None``. It is never
+   coerced to 0, to a default, or to a plausible-looking guess. Where a value
+   is missing the row also carries WHY, and what would fix it.
+
+2. PROVENANCE PER FIELD. Every number carries which provider produced it and
+   when WE received it. The merge priority is:
+     1. our own authoritative read (the authed CLOB, for our own orders)
+     2. our own live feed (clob_ws, stamped on local arrival)
+     3. the source that is best at that specific field
+     4. None
+   A provider returning ``None`` must NEVER erase a better provider's answer,
+   which is why the merge goes through ``_Row.put`` and not a dict spread.
+
+3. COST DISCIPLINE. A bot makes a handful of requests; a terminal polls four
+   columns, a chart, a book and a portfolio forever. Every outbound call goes
+   through a per-host gate that spaces request STARTS by a minimum gap and
+   bounds how many may be in flight at once, a TTL cache sized to how fast
+   that field actually changes, single-flight coalescing so two identical
+   concurrent requests cost one, and a 429 park that fails FAST rather than
+   holding the queue while a doomed call retries.
+
+Trading lives in ``terminal_trade.py``. This module never spends money.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -102,6 +134,26 @@ OFFLINE_REASON = (
 
 
 class _Gate:
+    """Per-host pacing: a minimum gap between request STARTS, a bound on how
+    many requests may be in flight at once, and a 429 park.
+
+    The two controls are separate on purpose, and the split is what makes a
+    terminal usable. The lock covers ONLY the spacing decision — work out the
+    next allowed start, sleep the gap, stamp the start — and is released
+    before the HTTP call. Holding it across the round trip as well made every
+    request to a host strictly serial, so a Discover load needing ~20 Gamma
+    calls cost 20 × (RTT + min_gap): five to eight seconds of staring at
+    skeletons for work that overlaps almost perfectly. The semaphore is what
+    keeps "not serial" from becoming "unbounded"; ``min_gap`` still governs
+    the starts, so the cost discipline is unchanged — we simply stop waiting
+    for each answer before asking the next question.
+
+    Parking is checked BEFORE either primitive is taken. A parked host
+    therefore fails instantly instead of queueing behind a retry — the bug
+    this exists to prevent is a Discover refresh 429ing the provider and
+    starving the chart, which then renders blank while a plain curl to the
+    same endpoint returns 200.
+    """
 
     def __init__(self, key: str, min_gap: float, concurrency: int = 1) -> None:
         self.key = key
@@ -189,8 +241,15 @@ def _cache_put(key: str, value: Any, ttl: float) -> str:
 
 async def _fetch(
     host: str, path: str, params: Optional[dict] = None, *,
-    ttl: float = TTL_MARKET, timeout: float = 10.0,
+    ttl: float = TTL_MARKET, timeout: float = 10.0, json_body: Any = None,
 ) -> tuple[Any, Optional[str]]:
+    """GET through the cache + per-host gate — or a POST of `json_body`, for
+    the CLOB's batch reads, which take their token list as a body.
+
+    Returns ``(data, observed_at_iso)``. ``data`` is ``None`` on every failure
+    mode — parked host, network error, 4xx, 5xx — and the caller turns that
+    into an honest ``None`` field with a reason, never into a zero.
+    """
     spec = _HOSTS.get(host)
     gate = _gates.get(host)
     if not spec or not gate:
@@ -199,7 +258,8 @@ async def _fetch(
     if _offline:
         return None, None
 
-    key = _cache_key(host, path, params)
+    key = _cache_key(host, path, params if json_body is None
+                     else {"params": params, "body": json_body})
     hit = _cache_get(key)
     if hit is not None:
         gate.cache_hits += 1
@@ -215,7 +275,8 @@ async def _fetch(
         return await asyncio.shield(pending)
 
     task: asyncio.Future = asyncio.ensure_future(
-        _fetch_now(gate, spec, host, path, params, key, ttl=ttl, timeout=timeout))
+        _fetch_now(gate, spec, host, path, params, key, ttl=ttl, timeout=timeout,
+                   json_body=json_body))
     _inflight[key] = task
 
     def _finished(done: "asyncio.Future") -> None:
@@ -231,8 +292,13 @@ async def _fetch(
 
 async def _fetch_now(
     gate: _Gate, spec: dict, host: str, path: str, params: Optional[dict],
-    key: str, *, ttl: float, timeout: float,
+    key: str, *, ttl: float, timeout: float, json_body: Any = None,
 ) -> tuple[Any, Optional[str]]:
+    """One real request: pace it, make it, count it, cache it.
+
+    The caller has already resolved the cache, the offline switch and the
+    park. This is the only place that touches the network.
+    """
     async with gate.slot():
         if gate.parked():
             return None, None
@@ -252,8 +318,11 @@ async def _fetch_now(
         url = f"{spec['base']}{path}"
         try:
             client = await api._get_client()
-            resp = await client.get(url, params=params, timeout=timeout)
-        except Exception as e:
+            if json_body is not None:
+                resp = await client.post(url, params=params, json=json_body, timeout=timeout)
+            else:
+                resp = await client.get(url, params=params, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — every transport failure is a None field
             gate.errors += 1
             logger.debug("terminal fetch %s%s failed: %s", host, path, e)
             return None, None
@@ -279,6 +348,11 @@ async def _fetch_now(
 
 def note_external_call(host_key: str, *, ok: bool = True,
                        ms: Optional[float] = None) -> None:
+    """Count a request made OUTSIDE _fetch (the chat bots).
+
+    Without this the privacy panel would list Discord and Telegram at zero
+    calls forever while cheerfully relaying positions to both.
+    """
     g = _gates.get(host_key)
     if not g:
         return
@@ -290,6 +364,8 @@ def note_external_call(host_key: str, *, ok: bool = True,
 
 
 def health() -> dict:
+    """Live per-host call/error/latency counts. Powers the privacy panel: the
+    user can see exactly which hosts this machine talks to and how often."""
     out = []
     for k, spec in _HOSTS.items():
         g = _gates[k]
@@ -316,7 +392,9 @@ def health() -> dict:
     }
 
 
+
 def num(v: Any) -> Optional[float]:
+    """float(v), or None. An unparseable value is UNKNOWN, not zero."""
     if v is None or v == "" or isinstance(v, bool):
         return None
     try:
@@ -329,6 +407,7 @@ def num(v: Any) -> Optional[float]:
 
 
 def cents(v: Any) -> Optional[float]:
+    """A 0..1 probability as 0..100 cents, or None."""
     f = num(v)
     if f is None:
         return None
@@ -336,6 +415,15 @@ def cents(v: Any) -> Optional[float]:
 
 
 def _sentinel_free(c: Optional[float]) -> Optional[float]:
+    """Drop the 0¢ / 100¢ placeholders Gamma emits for an empty book.
+
+    Polymarket only accepts orders between 1¢ and 99¢ (place_limit_order
+    enforces it), so neither extreme is ever a real quote — they are the
+    provider's way of saying "nothing is resting here". Passing them through
+    produced a specific, confident lie on every unlisted market: bid 0¢, ask
+    100¢, and a 100¢ spread presented as fact. Caught by the live check, not
+    by any unit test, because it needed a market that genuinely has no book.
+    """
     if c is None:
         return None
     if c <= 0.0 or c >= 100.0:
@@ -381,6 +469,12 @@ PRIO_FALLBACK = 3
 
 
 class _Row:
+    """Accumulates a market row with per-field provenance.
+
+    ``put`` is the only way in. It drops ``None`` (so a failed provider cannot
+    blank a good answer) and drops a worse-priority write (so Gamma's stale
+    indicative mid cannot stomp our own live top-of-book).
+    """
 
     def __init__(self) -> None:
         self.vals: dict[str, Any] = {}
@@ -407,6 +501,8 @@ class _Row:
         return self.vals.get(field)
 
     def unknown(self, field: str, reason: str) -> None:
+        """Record WHY a field is missing. 'No data' is useless; write the
+        sentence that tells the user what would fix it."""
         if field in self.vals:
             return
         if any(u["field"] == field for u in self.unknowns):
@@ -424,7 +520,15 @@ def _age_sec(observed_at: Optional[str]) -> Optional[float]:
     return round((datetime.now(timezone.utc) - dt).total_seconds(), 1)
 
 
+
 def summary_from_gamma(raw: dict, observed_at: Optional[str] = None) -> Optional[dict]:
+    """Build a MarketSummary from one Gamma market object, preserving nulls.
+
+    Deliberately NOT ``polymarket_api._normalize_market``: that one is the
+    engine's normaliser and coerces every missing number to 0.0, which is
+    exactly the lie this whole module exists to avoid. We do call it for its
+    side effect (it warms the tradable-meta cache the order path reads).
+    """
     if not isinstance(raw, dict):
         return None
     condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
@@ -605,6 +709,8 @@ _micro_task: Optional[asyncio.Task] = None
 
 
 def subscribe(condition_id: str, yes_token: Optional[str], no_token: Optional[str]) -> None:
+    """Name the tokens the open screen cares about. Idempotent and cheap —
+    call it on every poll; only a genuinely new token costs anything."""
     try:
         import clob_ws
     except Exception:
@@ -621,7 +727,7 @@ def subscribe(condition_id: str, yes_token: Optional[str], no_token: Optional[st
             entry["last_named"] = now
     clob_ws.feed.observe(yes_token, no_token)
     try:
-        import websockets
+        import websockets  # noqa: F401
     except Exception:
         return
     clob_ws.feed.start()
@@ -638,6 +744,12 @@ def _ensure_recorder() -> None:
 
 
 async def _record_loop() -> None:
+    """Sample the live top-of-book once a second for every named token.
+
+    Never invents a sample. When the feed has no fresh quote for a token the
+    period simply produces nothing — a flat synthetic level in an illiquid
+    market is how somebody buys a corpse.
+    """
     while True:
         await asyncio.sleep(_MICRO_PERIOD)
         if not _micro:
@@ -662,6 +774,9 @@ async def _record_loop() -> None:
 
 
 async def stop_recorder() -> None:
+    """Cancel the microstructure sampler. Everything else the backend starts is
+    cancelled on shutdown; this was not, so a clean exit left a task running on
+    a closing loop."""
     global _micro_task
     t, _micro_task = _micro_task, None
     _micro.clear()
@@ -674,6 +789,9 @@ async def stop_recorder() -> None:
 
 
 def micro_series(condition_id: str, side: str = "yes") -> dict:
+    """Our own microstructure for one market: spread over time, built from
+    locally-timestamped quotes. Empty until the screen has been open a moment,
+    and it says so rather than pretending."""
     for tok, entry in _micro.items():
         if entry["condition"] == condition_id and entry["side"] == side:
             samples = list(entry["samples"])
@@ -705,6 +823,16 @@ def micro_series(condition_id: str, side: str = "yes") -> dict:
 
 
 def _live_quote(token_id: Optional[str]) -> Optional[dict]:
+    """Top-of-book from our own feed, or None when it is stale/absent.
+
+    The SAME 0¢/100¢ sentinel scrub Gamma needs applies here. Caught by
+    driving the real app: on a market whose book had no asks at all, the feed
+    reported an ask of 100¢, which produced a confident "spread 1.0¢" in the
+    header AND a 1.0¢ median in our own microstructure panel — while the book
+    right next to it correctly said "no resting asks". Scrubbing here rather
+    than at each call site means no future reader of the feed can reintroduce
+    it.
+    """
     if not token_id:
         return None
     try:
@@ -725,6 +853,12 @@ def _live_quote(token_id: Optional[str]) -> Optional[dict]:
 
 
 def _overlay_live(summary: dict) -> dict:
+    """Let our own feed win over Gamma's indicative price where it is fresh.
+
+    This is merge priority 2 beating priority 3 — and it is the one place the
+    terminal shows a number a hosted competitor using the same public REST
+    cannot: a quote stamped when we received it, with no indexer lag.
+    """
     q = _live_quote(summary.get("yesTokenId"))
     if not q:
         return summary
@@ -765,6 +899,12 @@ _NUMERIC_FILTERS: list[tuple[str, str, str]] = [
 
 
 def apply_filters(rows: list[dict], filters: Optional[dict]) -> tuple[list[dict], int, int]:
+    """→ (kept, skipped_for_unknown, excluded).
+
+    The two counters are surfaced in the UI. A filter that silently drops rows
+    it could not evaluate reads as "there is nothing here", which is a lie
+    about the market rather than about our data.
+    """
     if not filters:
         return list(rows), 0, 0
 
@@ -827,6 +967,14 @@ async def _gamma_markets(params: dict, ttl: float = TTL_DISCOVER) -> tuple[list[
 
 async def discover(column: str, limit: int = 40,
                    filters: Optional[dict] = None) -> dict:
+    """One Discover column, honestly filtered.
+
+    Sorting note (a trap that cost real time on the crypto build): asking a
+    provider to sort by a stored metric returns stale garbage — year-old dead
+    listings reporting huge numbers. So every column here sorts by an ACTIVITY
+    field the venue keeps current, then we re-rank locally on the metric the
+    column is actually about.
+    """
     limit = max(1, min(int(limit or 40), 100))
     note: Optional[str] = None
     rows: list[dict] = []
@@ -945,6 +1093,14 @@ async def discover(column: str, limit: int = 40,
 
 
 async def _summaries_for(condition_ids: Iterable[str]) -> list[dict]:
+    """Fetch several markets by condition id, concurrently but gated.
+
+    Gamma's /markets defaults to ``closed=false``, so a plain condition_ids
+    lookup returns NOTHING once a market has resolved. Left unhandled that
+    silently deletes a settled market from the watchlist — the entry is still
+    stored, it just stops rendering, which reads as "you never starred it".
+    So: whatever the first pass misses is retried including closed markets.
+    """
     ids = [str(c) for c in condition_ids if c]
     if not ids:
         return []
@@ -973,6 +1129,11 @@ async def _summaries_for(condition_ids: Iterable[str]) -> list[dict]:
 
 
 async def search(query: str, limit: int = 30) -> dict:
+    """Search by text, or resolve a pasted condition id directly.
+
+    A user who pastes a 0x… condition id means that market, not a text match,
+    so try the exact lookup first.
+    """
     q = str(query or "").strip()
     if not q:
         return {"column": "new", "rows": [], "fetchedAt": _now_iso(),
@@ -1043,7 +1204,35 @@ async def search(query: str, limit: int = 30) -> dict:
     }
 
 
+
+_LAST_MARKET_MAX = 500
+_LAST_MARKET_TTL = 600.0
+_last_market: dict[str, tuple[float, dict]] = {}
+
+
+def _last_market_put(cid: str, s: dict) -> None:
+    if len(_last_market) >= _LAST_MARKET_MAX and cid not in _last_market:
+        for k in list(_last_market)[: _LAST_MARKET_MAX // 3]:
+            _last_market.pop(k, None)
+    _last_market[cid] = (time.monotonic(), dict(s))
+
+
+def _last_market_get(cid: str) -> Optional[dict]:
+    hit = _last_market.get(cid)
+    if not hit:
+        return None
+    age = time.monotonic() - hit[0]
+    if age > _LAST_MARKET_TTL:
+        _last_market.pop(cid, None)
+        return None
+    s = dict(hit[1])
+    s["metaStaleSec"] = round(age, 1)
+    return s
+
+
 async def market(condition_id: str, *, include_raw: bool = False) -> Optional[dict]:
+    """One market, fully assembled. Also names its tokens to the live feed so
+    the microstructure series starts recording while the page is open."""
     cid = str(condition_id or "").strip()
     if not cid:
         return None
@@ -1055,8 +1244,13 @@ async def market(condition_id: str, *, include_raw: bool = False) -> Optional[di
         if isinstance(data, list) and data:
             s = summary_from_gamma(data[0], observed)
             rows = [s] if s else []
-    if not rows:
-        return None
+    if rows:
+        _last_market_put(cid, rows[0])
+    else:
+        stale = _last_market_get(cid)
+        if stale is None:
+            return None
+        rows = [stale]
     s = rows[0]
     subscribe(cid, s.get("yesTokenId"), s.get("noTokenId"))
     _overlay_live(s)
@@ -1064,6 +1258,11 @@ async def market(condition_id: str, *, include_raw: bool = False) -> Optional[di
 
 
 def _levels(raw_levels: Any, *, descending: bool) -> list[dict]:
+    """Normalise one side of a CLOB book into cumulative levels.
+
+    Providers emit duplicate price levels in a single response; collapse them
+    (sum the size) and sort, or every cumulative figure downstream is wrong.
+    """
     by_price: dict[float, float] = {}
     for lvl in raw_levels or []:
         try:
@@ -1090,6 +1289,12 @@ def _levels(raw_levels: Any, *, descending: bool) -> list[dict]:
 
 
 async def book(condition_id: str, side: str = "yes") -> dict:
+    """Full depth for one outcome token.
+
+    ``available: false`` means the venue returned nothing. That is NOT an empty
+    book, and the UI has to be able to tell them apart — a market with no
+    resting orders and a market we could not read look identical otherwise.
+    """
     side = "no" if str(side).lower() == "no" else "yes"
     empty = {
         "conditionId": condition_id, "tokenSide": side,
@@ -1150,6 +1355,88 @@ async def book(condition_id: str, side: str = "yes") -> dict:
     }
 
 
+_BOOKS_BATCH = 20
+
+
+async def _clob_tops(tokens: list[str]) -> dict[str, tuple]:
+    """token → (best bid ¢, best ask ¢, observedAt) from the CLOB, for every
+    token it returned a book for. A side with no resting orders is None."""
+    out: dict[str, tuple] = {}
+    for i in range(0, len(tokens), _BOOKS_BATCH):
+        chunk = tokens[i:i + _BOOKS_BATCH]
+        data, observed = await _fetch("clob", "/books", ttl=TTL_BOOK,
+                                      json_body=[{"token_id": t} for t in chunk])
+        books = [(b, observed) for b in data] if isinstance(data, list) else None
+        if books is None:
+            got = await asyncio.gather(*[
+                _fetch("clob", "/book", {"token_id": t}, ttl=TTL_BOOK) for t in chunk])
+            books = [(d, o) for d, o in got if isinstance(d, dict)]
+        for b, obs in books:
+            if not isinstance(b, dict) or str(b.get("asset_id") or "") not in chunk:
+                continue
+            bids = _levels(b.get("bids"), descending=True)
+            asks = _levels(b.get("asks"), descending=False)
+            out[str(b["asset_id"])] = (bids[0]["priceCents"] if bids else None,
+                                       asks[0]["priceCents"] if asks else None,
+                                       obs or _now_iso())
+    return out
+
+
+def _put_quote(row: dict, bid: Optional[float], ask: Optional[float],
+               source: str, observed: str) -> None:
+    """Overwrite a row's quote with a read of the book. An empty side is an
+    answer (nobody is resting there), so it replaces Gamma's number with
+    None rather than leaving a price nobody would trade at."""
+    sources = row.setdefault("sources", {})
+    unknowns = row.setdefault("unknowns", [])
+    stamp = {"source": source, "observedAt": observed, "ageSec": _age_sec(observed)}
+    row["bid"], row["ask"] = bid, ask
+    for field, v in (("bid", bid), ("ask", ask)):
+        sources[field] = dict(stamp)
+        if v is None and not any(u["field"] == field for u in unknowns):
+            unknowns.append({"field": field, "reason": (
+                f"The live book has no resting {'bids' if field == 'bid' else 'offers'} "
+                f"on this market.")})
+    if bid is not None and ask is not None:
+        row["spread"] = round(ask - bid, 2)
+        row["mid"] = round((ask + bid) / 2.0, 2)
+        row["probability"] = row["mid"]
+        for field in ("spread", "mid", "probability"):
+            sources[field] = dict(stamp)
+    else:
+        row["spread"] = row["mid"] = None
+
+
+async def clob_quotes(rows: list[dict]) -> list[dict]:
+    """Re-quote MarketSummary rows from the live CLOB, in place.
+
+    Our own feed first when it is fresh (no request at all), then ONE batched
+    book read for every remaining market, so a portfolio of N markets is not
+    N round trips. A row the CLOB cannot price keeps its Gamma quote, whose
+    `sources` entry says it is Gamma's and how old it is. Settled rows are
+    left alone: their price is the payout."""
+    need: dict[str, list[dict]] = {}
+    for r in rows:
+        tok = r.get("yesTokenId")
+        if not tok or r.get("resolvedOutcome") is not None:
+            continue
+        q = _live_quote(str(tok))
+        if q and q.get("bid_cents") is not None and q.get("ask_cents") is not None:
+            _put_quote(r, q["bid_cents"], q["ask_cents"], "clob-ws", _now_iso())
+            continue
+        need.setdefault(str(tok), []).append(r)
+    if need:
+        for tok, (bid, ask, observed) in (await _clob_tops(list(need))).items():
+            for r in need.get(tok, []):
+                _put_quote(r, bid, ask, "clob", observed)
+    return rows
+
+
+async def marked_summaries(condition_ids: Iterable[str]) -> list[dict]:
+    """`_summaries_for`, re-quoted from the live book — for marks."""
+    return await clob_quotes(await _summaries_for(condition_ids))
+
+
 _INTERVAL_SPEC = {
     "1h": ("1h", 1),
     "6h": ("6h", 5),
@@ -1160,6 +1447,12 @@ _INTERVAL_SPEC = {
 
 
 def _dedupe_points(points: list[dict]) -> list[dict]:
+    """Sort ascending and collapse duplicate timestamps.
+
+    Providers really do emit the same bucket twice in one response, and every
+    charting library throws on a non-ascending series. Normalise at the source
+    so no downstream renderer has to know.
+    """
     by_t: dict[int, float] = {}
     for p in points:
         t = p.get("t")
@@ -1175,6 +1468,14 @@ def _dedupe_points(points: list[dict]) -> list[dict]:
 
 async def price_history(condition_id: str, side: str = "yes",
                         interval: str = "1d") -> dict:
+    """Probability over time, 0..100.
+
+    Falls back to our OWN tape when the venue index has nothing. The rule that
+    matters: *any* real data beats none. A threshold that discards our own
+    samples because there are only two of them, then reports "no data" while
+    holding the only tape that exists, is the worst possible outcome — so a
+    thin series is returned and LABELLED thin.
+    """
     side = "no" if str(side).lower() == "no" else "yes"
     iv = interval if interval in _INTERVAL_SPEC else "1d"
     clob_iv, fidelity = _INTERVAL_SPEC[iv]
@@ -1247,10 +1548,14 @@ async def price_history(condition_id: str, side: str = "yes",
 
 
 async def tape(condition_id: str, limit: int = 40) -> dict:
+    """Recent public trades for one market."""
     limit = max(1, min(int(limit or 40), 200))
-    data, observed = await _fetch(
-        "data", "/trades",
-        {"market": str(condition_id), "limit": limit}, ttl=TTL_TAPE)
+    body, observed = await _fetch(
+        "data", "/v2/trades",
+        {"condition": str(condition_id), "limit": limit}, ttl=TTL_TAPE)
+    data = None
+    if isinstance(body, dict) and isinstance(body.get("data"), list):
+        data = [api.v2_row_to_v1(r) for r in body["data"]]
 
     if not isinstance(data, list):
         g = _gates["data"]
@@ -1268,11 +1573,10 @@ async def tape(condition_id: str, limit: int = 40) -> dict:
     for t in data:
         if not isinstance(t, dict):
             continue
-        idx = t.get("outcomeIndex")
-        try:
-            side = "yes" if int(idx) == 0 else "no"
-        except (TypeError, ValueError):
-            side = "yes"
+        idx = api.outcome_index_of(t)
+        if idx is None:
+            continue
+        side = "yes" if idx == 0 else "no"
         price = cents(t.get("price"))
         size = num(t.get("size"))
         ts = t.get("timestamp")
@@ -1324,6 +1628,7 @@ def _check(cid: str, label: str, level: str, detail: str, resolved: bool = True)
 
 
 async def resolution_report(condition_id: str) -> dict:
+    """Eleven checks on how this market will actually settle."""
     s = await market(condition_id, include_raw=True)
     if not s:
         return {
@@ -1593,6 +1898,14 @@ async def _sibling_check(s: dict) -> dict:
 
 
 async def related(condition_id: str, limit: int = 25) -> dict:
+    """The other markets in this market's event, priced.
+
+    The resolution report already computes these to look for a contradiction
+    and then throws the list away. Surfacing it is nearly free and it is the
+    closest thing to cross-venue arbitrage available inside one venue: a
+    sibling asking a near-identical question at a very different price means
+    one of the two is wrong, and it might be the one you are about to trade.
+    """
     s = await market(condition_id, include_raw=True)
     if not s:
         return {"conditionId": condition_id, "eventSlug": None, "rows": [],
@@ -1670,6 +1983,12 @@ _POLARITY_DOWN = {
 
 
 def polarity(text: str) -> Optional[str]:
+    """'up' | 'down' | None — the direction a question claims.
+
+    None when the text carries BOTH directions ("Bitcoin Up or Down") or
+    neither: in both cases there is no directional claim to contradict, and
+    guessing one would create false opposites.
+    """
     w = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
     up, down = w & _POLARITY_UP, w & _POLARITY_DOWN
     if up and not down:
@@ -1680,6 +1999,14 @@ def polarity(text: str) -> Optional[str]:
 
 
 def _are_opposites(a: str, b: str) -> bool:
+    """True when two titles differ by an opposing term.
+
+    Caught live: the related-markets panel flagged "increase by 25 bps" as
+    contradicting "decrease by 25 bps" at a 33c gap. They are mutually
+    exclusive legs of one event — the gap is the market working correctly, not
+    a mispricing, and calling it a contradiction is a confident wrong claim in
+    exactly the panel that exists to be trusted.
+    """
     pa, pb = polarity(a), polarity(b)
     if pa and pb and pa != pb:
         return True
@@ -1693,6 +2020,11 @@ def _are_opposites(a: str, b: str) -> bool:
 
 
 def _title_overlap(a: str, b: str) -> float:
+    """Crude token-overlap similarity, 0..1. Good enough to spot two phrasings
+    of the same question inside one event; deliberately not a fuzzy matcher.
+
+    Returns 0 for titles that are OPPOSITES, so a mutually-exclusive pair is
+    never read as two phrasings of the same question."""
     if _are_opposites(a, b):
         return 0.0
     wa = {w for w in re.findall(r"[a-z0-9]+", a.lower()) if len(w) > 2}

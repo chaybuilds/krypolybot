@@ -61,7 +61,7 @@ export function listAccounts(): AccountEntry[] {
         }
       }
     }
-  } catch {}
+  } catch { }
   return out;
 }
 

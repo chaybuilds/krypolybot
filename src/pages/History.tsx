@@ -31,7 +31,7 @@ export function HistoryPage() {
       try {
         const r = await window.krypt.data.botRuns(config?.network ?? null, 100);
         if (mounted) setRuns(r.runs);
-      } catch {}
+      } catch { }
     };
     void load();
     const i = window.setInterval(load, 15000);

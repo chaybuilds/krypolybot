@@ -44,7 +44,7 @@ export function OfficialPnlCard() {
         <Kv label="Economic P&L" value={signed(data?.economic_pnl)} tone={data?.economic_pnl} big />
         <Kv label="Realized" value={signed(data?.realized_pnl)} tone={data?.realized_pnl} />
         <Kv label="Unrealized (now)" value={signed(data?.unrealized_pnl)} tone={data?.unrealized_pnl} />
-        <Kv label="Fees paid" value={data?.fees_paid != null ? fmtUsd(data.fees_paid) : '—'} />
+        <Kv label="Fees paid" value={data?.fees_paid != null ? fmtUsd(Math.abs(data.fees_paid)) : '—'} />
         <Kv label="Rebates" value={signed(rebates)} tone={rebates} title={`maker ${signed(data?.maker_rebate)} · taker ${signed(data?.taker_rebate)}`} />
         <Kv label="Rewards + referrals" value={signed((data?.reward_income ?? 0) + (data?.referral_income ?? 0))} />
         <Kv label="Volume" value={data?.volume_usdc != null ? fmtUsd(data.volume_usdc) : '—'} />

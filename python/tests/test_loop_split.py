@@ -1,3 +1,21 @@
+"""The copy and crypto15m engines run on their OWN tasks.
+
+Both used to be two of ~19 blocks the master loop awaited in sequence, so a
+copy push (a followed wallet just sold) or a crypto tick (a 15-minute window
+about to close) waited behind the whale scan, the momentum scan, the position
+poll and the market sync — a 0–10 s variable delay in front of the only two
+engines where latency IS the edge.
+
+What is pinned here:
+  1. the loops tick INDEPENDENTLY — a blocked master iteration does not stop
+     the copy loop,
+  2. the cross-engine order lock — two engines racing one shared cap place
+     exactly one order,
+  3. a crashed engine loop restarts itself, heartbeat and all,
+  4. the watchdog restarts only the loop that stalled,
+  5. disabling an engine in config idles its loop instead of needing a restart,
+  6. shutdown reaps every engine task (nothing left pending).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +34,9 @@ import trader
 
 @pytest.fixture(autouse=True)
 def _fresh_order_lock():
+    """Every test here drives its own `asyncio.run`, and an asyncio.Lock binds
+    to the loop that first CONTENDS it. Hand each test a clean one so the order
+    gate isn't testing an artefact of test ordering."""
     trader.ORDER_LOCK = asyncio.Lock()
     yield
     trader.ORDER_LOCK = asyncio.Lock()
@@ -26,6 +47,7 @@ async def _quiet_emit(_name, _data=None):
 
 
 def _silence_master(monkeypatch):
+    """Neuter everything the master loop would reach for over the network."""
     async def _zero(*a, **k):
         return 0
 
@@ -37,6 +59,7 @@ def _silence_master(monkeypatch):
     monkeypatch.setattr(service.scanner, "sync_events", _zero)
     monkeypatch.setattr(service.scanner, "scan_whales", _no_signals)
     monkeypatch.setattr(service.scanner, "scan_momentum", _no_signals)
+    monkeypatch.setattr(service.crypto15m_record, "record_tick", _zero)
     for mod in (activity_ws, spot_ws, rtds_ws):
         monkeypatch.setattr(mod, "start", lambda *a, **k: None)
         monkeypatch.setattr(mod, "stop", _zero)
@@ -50,6 +73,8 @@ def _silence_master(monkeypatch):
 
 @contextlib.contextmanager
 def _loop_globals():
+    """Save/restore the module globals these tests drive directly, so a failure
+    can never leak a live task or a stale heartbeat into another test."""
     keep = {
         k: getattr(service, k)
         for k in ("_loop_task", "_copy_task", "_crypto_task", "_perps_task",
@@ -83,6 +108,8 @@ async def _reap(*tasks) -> None:
 
 
 def test_the_copy_loop_keeps_ticking_while_the_master_loop_is_blocked(monkeypatch):
+    """A slow master block used to be dead time for copy trading. The whale
+    scan here takes 2 s; the copy loop must tick right through it."""
     _silence_master(monkeypatch)
 
     scanning = asyncio.Event()
@@ -188,6 +215,8 @@ def test_the_crypto_loop_keeps_ticking_while_the_master_loop_is_blocked(monkeypa
 
 
 def test_each_loop_reports_its_own_blocks_namespaced(monkeypatch):
+    """`loopBlocksMs` is the "which block is expensive" diagnostic. With three
+    loops it has to say WHICH loop, or the numbers are meaningless."""
     _silence_master(monkeypatch)
     monkeypatch.setattr(service.STATE, "auth_ok", True, raising=False)
 
@@ -238,6 +267,8 @@ def test_each_loop_reports_its_own_blocks_namespaced(monkeypatch):
 
 
 def test_two_engines_racing_one_shared_cap_place_exactly_one_order():
+    """Interleaved, both engines read the same headroom before either row
+    exists. `trader.order_gate` is what stops both from placing."""
     placed: list[str] = []
     exposure = {"usd": 0.0}
     cap = 10.0
@@ -271,6 +302,8 @@ def test_two_engines_racing_one_shared_cap_place_exactly_one_order():
 
 
 def test_the_order_gate_fails_open_rather_than_blocking_trading(monkeypatch):
+    """A lock that could wedge every engine would be worse than the race it
+    fixes, so a waiter that times out proceeds unserialised."""
     monkeypatch.setattr(trader, "ORDER_LOCK_TIMEOUT_SEC", 0.05)
     ran = {"n": 0}
 
@@ -317,6 +350,9 @@ def _seed_position(n: int, *, contracts: int, cents: int, status: str) -> int:
 
 
 def test_the_headroom_recheck_sees_the_other_engines_fresh_order(fresh_db):
+    """Copy and crypto snapshot their budget once per tick. The re-check inside
+    the gate reads exposure from the DB at the moment of placement, so an order
+    the other engine inserted a millisecond ago already counts against it."""
     env = trader.get_env()
     cfg = {"max_total_exposure_fraction": 0.5, "min_cash_reserve_fraction": 0.0}
 
@@ -329,6 +365,9 @@ def test_the_headroom_recheck_sees_the_other_engines_fresh_order(fresh_db):
 
 
 def test_the_headroom_recheck_never_clamps_on_an_unknown_balance(fresh_db):
+    """Every engine treats balance<=0 as "unknown, don't clamp" (a failed read
+    must not look like an empty wallet). This guard must not be the one place
+    that changes that."""
     env = trader.get_env()
     cfg = {"max_total_exposure_fraction": 0.01, "min_cash_reserve_fraction": 0.9}
     assert trader.headroom_blocks(cfg, env, 0.0, 500.0) == ""
@@ -369,6 +408,8 @@ def test_a_crashed_copy_loop_restarts_and_its_heartbeat_resumes(monkeypatch):
 
 
 def test_the_supervisor_keeps_the_heartbeat_fresh_across_its_backoff(monkeypatch):
+    """The backoff sleep must not look like a stall, or the watchdog would
+    restart a loop that is already deliberately waiting."""
     async def _always_crashes():
         raise RuntimeError("nope")
     monkeypatch.setattr(service, "_copy_loop_body", _always_crashes)
@@ -461,6 +502,8 @@ def test_the_watchdog_restarts_only_the_stalled_loop(monkeypatch):
 
 
 def test_the_watchdog_respawns_a_loop_whose_task_simply_ended(monkeypatch):
+    """A task that ran to completion (an unhandled BaseException outside the
+    per-block try/except) leaves that engine dead forever with no recovery."""
     monkeypatch.setattr(service, "_WATCHDOG_CHECK_SEC", 0.02)
     monkeypatch.setattr(service, "_ENGINE_STALL_SEC", 999.0)
     monkeypatch.setattr(service, "emit_event", _quiet_emit)
@@ -508,6 +551,8 @@ def test_the_watchdog_respawns_a_loop_whose_task_simply_ended(monkeypatch):
 
 
 def test_disabling_copy_idles_its_loop_without_cancelling_it(monkeypatch):
+    """Turning copy off in Settings must not need a backend restart — and
+    turning it back on must resume mirroring on the next tick."""
     _silence_master(monkeypatch)
     ticks = {"n": 0}
 
@@ -586,6 +631,8 @@ def test_the_crypto_loop_idles_without_auth_and_resumes_when_it_lands(monkeypatc
 
 
 def test_an_activity_push_wakes_the_copy_loop_immediately(monkeypatch):
+    """The socket used to set a flag the master loop noticed on its next pass.
+    Now it wakes the copy loop directly."""
     async def _run():
         service._copy_wake = asyncio.Event()
         t0 = asyncio.get_event_loop().time()
@@ -622,6 +669,9 @@ def test_an_unfollowed_wallets_trade_does_not_wake_the_copy_loop():
 
 
 def test_stop_loop_reaps_every_engine_task(monkeypatch):
+    """`_stop_loop` runs on factory reset, clear-history and shutdown. A task
+    still pending at process exit is what prints 'Task was destroyed but it is
+    pending!' — and, worse, keeps trading through a factory reset."""
     async def _idle():
         while not (service._loop_stop and service._loop_stop.is_set()):
             await asyncio.sleep(0.02)
@@ -654,6 +704,7 @@ def test_stop_loop_reaps_every_engine_task(monkeypatch):
 
 
 def test_stop_loop_cancels_a_loop_that_ignores_the_stop_event(monkeypatch):
+    """A wedged loop must not hold shutdown open past its grace window."""
     async def _wedged():
         await asyncio.sleep(300)
     monkeypatch.setattr(service, "_scanner_and_trader_loop", _wedged)

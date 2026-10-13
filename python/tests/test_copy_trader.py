@@ -1,3 +1,8 @@
+"""Copy-trading engine tests (paper mode, fully hermetic).
+
+Pins the stateless mirror logic: ENTER a followed wallet's holding we don't
+have, don't double-enter, and EXIT once no followed wallet holds it anymore.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +44,7 @@ def run_async(coro):
 
 
 def _cfg(**over) -> dict:
-    c = merge_with_defaults({})
+    c = merge_with_defaults({"account_mode": "live"})
     c["network"] = "mainnet"
     c["copy_enabled"] = True
     c["copy_wallets"] = ["0x" + "a" * 40]
@@ -79,6 +84,8 @@ def _patch_positions(monkeypatch, holder):
 
 
 def _patch_live(monkeypatch, ask=50, bid=48, category="politics"):
+    """Mock the real order path (no paper mode): place_limit_order + get_quote,
+    and a deterministic sell confirmation."""
     calls = {"place": []}
 
     async def _place(**kw):
@@ -185,10 +192,13 @@ def test_copy_books_gone_when_wallet_genuinely_empty(fresh_db, env_net, monkeypa
     assert len(_open_copies()) == 0
     closed = [r for r in _all_copies() if r["resolved"]]
     assert len(closed) == 1 and closed[0]["closed_early"] == 1
-    assert closed[0]["pnl_usd"] == pytest.approx(1.51)
+    assert closed[0]["pnl_usd"] == pytest.approx(1.75)
 
 
 def _patch_positions_split(monkeypatch, *, followed, ours):
+    """Followed-wallet reads pass user=<their addr>; our own holdings read passes
+    user=None — return different lists so a position can be 'gone from our wallet'
+    while the wallet still holds OTHER positions (the realistic case)."""
     async def _gp(limit=500, user=None, **kw):
         return ours if user is None else followed
     monkeypatch.setattr(polymarket_api, "get_positions", _gp)
@@ -208,7 +218,40 @@ def test_copy_books_gone_position_without_reselling(fresh_db, env_net, monkeypat
     assert calls["place"] == []
     closed = [r for r in _all_copies() if r["resolved"]]
     assert len(closed) == 1 and closed[0]["closed_early"] == 1
-    assert closed[0]["pnl_usd"] == pytest.approx(1.51)
+    assert closed[0]["pnl_usd"] == pytest.approx(1.75)
+
+
+@pytest.mark.parametrize("rest, want_pnl", [
+    ({"type": "TRADE", "side": "SELL", "size": 10, "price": 0.60, "usdcSize": 5.88}, 1.51),
+    ({"type": "REDEEM", "size": 10, "price": 0, "usdcSize": 10.0}, 5.63),
+])
+def test_gone_copy_after_a_reduction_charges_each_exit_fee_once(
+        fresh_db, env_net, monkeypatch, rest, want_pnl):
+    pid = _seed_filled_copy("T-A", contracts=20, cost=10.0)
+    slice_fee = 0.05 * 0.6 * 0.4 * 10
+    with db.get_db() as conn:
+        db.update_bot_position(conn, pid, filled_contracts=10, cost_usd=5.0,
+                               fees_usd=0.25,
+                               pnl_usd=round(6.0 - 5.0 - slice_fee, 4),
+                               settlement_usd=6.0)
+    _patch_positions_split(monkeypatch, followed=[], ours=[_their_pos("OTHER", qty=5.0)])
+    calls = _patch_live(monkeypatch, bid=60)
+    later = 9_999_999_999
+    rows = [
+        {"conditionId": "T-A", "outcomeIndex": 0, "timestamp": later, "type": "TRADE",
+         "side": "SELL", "size": 10, "price": 0.60, "usdcSize": 5.88},
+        {"conditionId": "T-A", "outcomeIndex": 0, "timestamp": later, **rest},
+    ]
+
+    async def _activity(limit=1000, **kw):
+        return rows
+    monkeypatch.setattr(polymarket_api, "get_activity", _activity)
+
+    run_async(copy_trader.run_tick(_cfg(), authed=True))
+    assert calls["place"] == []
+    closed = [r for r in _all_copies() if r["resolved"]]
+    assert len(closed) == 1
+    assert closed[0]["pnl_usd"] == pytest.approx(want_pnl, abs=1e-4)
 
 
 def test_copy_gone_without_evidence_stays_open_no_order(fresh_db, env_net, monkeypatch):
@@ -329,6 +372,7 @@ def test_copy_skips_below_min_size(fresh_db, env_net, monkeypatch):
     assert len(_open_copies()) == 0
 
 
+
 def test_a_copied_entry_records_the_markets_category(fresh_db, env_net, monkeypatch):
     _patch_positions(monkeypatch, {"v": [_their_pos("T-CAT", cur_price=0.5)]})
     _patch_live(monkeypatch, ask=50, category="sports")
@@ -342,6 +386,7 @@ def test_a_copied_entry_records_the_markets_category(fresh_db, env_net, monkeypa
 
 def test_the_local_markets_row_answers_without_a_gamma_call(fresh_db, env_net,
                                                             monkeypatch):
+    """The scanner already keeps `markets` fresh; only a miss costs a fetch."""
     with db.get_db() as conn:
         db.upsert_market(conn, {"ticker": "T-LOC", "title": "t", "slug": "t",
                                 "status": "open", "category": "finance"})
@@ -361,12 +406,28 @@ def test_the_local_markets_row_answers_without_a_gamma_call(fresh_db, env_net,
 
 
 def test_an_unknown_category_is_rated_at_the_non_crypto_default(fresh_db):
+    """Genuinely unreadable → "" is stored, and "" must NOT mean crypto:
+    bot_positions never holds a 15m window, so the fallback is 'other'
+    (0.05), the modal non-crypto rate."""
     import backtest
     pos = {"category": "", "filled_contracts": 10, "cost_usd": 5.0,
            "avg_fill_price_cents": 50}
     assert trader._fee_coeff_for(pos) == backtest.CATEGORY_TAKER_FEE["other"]
     assert trader._position_fee_usd(pos) == pytest.approx(0.05 * 0.25 * 10)
-    assert trader._fee_coeff_for(dict(pos, category="crypto")) is None
+    assert trader._fee_coeff_for(dict(pos, category="crypto")) == \
+        backtest.CATEGORY_TAKER_FEE["crypto"]
     assert trader._position_fee_usd(dict(pos, category="crypto")) == \
         pytest.approx(0.07 * 0.25 * 10)
     assert trader._sell_fee_usd(pos, 10, 50.0) == pytest.approx(0.05 * 0.25 * 10)
+
+
+def test_copy_sends_nothing_from_a_paper_account(fresh_db, env_net, monkeypatch):
+    """Account mode gate: the user's copy switch stays ON, the account is in
+    Paper, and nothing goes to the venue (config.engine_on)."""
+    _patch_positions(monkeypatch, {"v": [_their_pos("T-A", cur_price=0.5)]})
+    calls = _patch_live(monkeypatch, ask=50)
+    cfg = _cfg(account_mode="paper")
+    assert cfg["copy_enabled"] is True
+    run_async(copy_trader.run_tick(cfg, authed=True))
+    assert calls["place"] == [] and _open_copies() == []
+    assert run_async(copy_trader.status(cfg, authed=True))["trading"] is False

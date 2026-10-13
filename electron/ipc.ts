@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
@@ -22,6 +22,12 @@ import * as accounts from './system/accounts';
 import * as mcpClients from './system/mcp-clients';
 import * as store from './system/settings-store';
 import { findStrategy, listStrategies } from './system/strategies';
+import {
+  cleanAgentIdArg, cleanAiKeyProvider, cleanAiProvider, cleanApiKey, cleanClientId,
+  cleanConfigPatch, cleanHealthArgs, isPersonalKey, omitForShare, omitPersonal, removedAgentIds,
+} from './system/sanitize';
+import { agentsOf } from '../shared/agents';
+import { ONBOARDING_REVISION } from '../shared/onboarding';
 
 const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
   ok: true,
@@ -71,7 +77,7 @@ function activeKeyFor(scope: ProfileScope): keyof AppState {
 function scopedApplyPatch(cfg: TraderConfig, scope: ProfileScope): Partial<TraderConfig> {
   const patch: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(cfg)) {
-    if (scopeOfKey(k) === scope) patch[k] = v;
+    if (scopeOfKey(k) === scope && !isPersonalKey(k)) patch[k] = v;
   }
   if (scope === 'main') {
     delete patch.enableTrading;
@@ -86,13 +92,25 @@ function scopedApplyPatch(cfg: TraderConfig, scope: ProfileScope): Partial<Trade
   return patch as Partial<TraderConfig>;
 }
 
-async function pushConfigToBackend(): Promise<void> {
+async function pushConfigToBackend(opts: { pruneAgentTokens?: boolean } = {}): Promise<void> {
   if (!pythonBackend.isRunning()) return;
   const state = store.get();
   try {
-    await pythonBackend.request('setConfig', { config: state.config });
+    await pythonBackend.request('setConfig', {
+      config: state.config,
+      ...(opts.pruneAgentTokens === true ? { pruneAgentTokens: true } : {}),
+    });
   } catch (e) {
   }
+}
+
+function rpcMessage(e: unknown, unsupported: string): string {
+  const m = String((e as Error)?.message ?? e ?? '');
+  return /unknown method|no handler|not found: rpc/i.test(m) ? unsupported : (m || unsupported);
+}
+
+function backendDown(what: string): never {
+  throw new Error(`The trading backend is not running, so ${what}. Start it from the status bar.`);
 }
 
 export function registerIpc(): void {
@@ -104,6 +122,23 @@ export function registerIpc(): void {
   });
   ipcMain.handle('app:showItemInFolder', async (_e, p: string) => {
     shell.showItemInFolder(p);
+  });
+  ipcMain.handle('app:saveVideo', async (e, args?: { bytes?: Uint8Array; ext?: string; name?: string }) => {
+    const bytes = args?.bytes;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return err('Nothing was recorded.');
+    if (bytes.byteLength > 1024 * 1024 * 1024) return err('The recording is over 1 GB.');
+    const ext = args?.ext === 'mp4' ? 'mp4' : 'webm';
+    const safe = String(args?.name || 'krypt-polybot-trailer').replace(/[^\w.-]+/g, '-').slice(0, 80);
+    const win = BrowserWindow.fromWebContents(e.sender) ?? undefined;
+    const res = await dialog.showSaveDialog(win!, {
+      title: 'Save the trailer',
+      defaultPath: join(app.getPath('videos'), `${safe}.${ext}`),
+      filters: [{ name: ext === 'mp4' ? 'MP4 video' : 'WebM video', extensions: [ext] }],
+    });
+    if (res.canceled || !res.filePath) return err('canceled');
+    writeFileSync(res.filePath, Buffer.from(bytes));
+    shell.showItemInFolder(res.filePath);
+    return ok(res.filePath);
   });
   ipcMain.handle('app:getUserDataPath', () => app.getPath('userData'));
 
@@ -148,16 +183,28 @@ export function registerIpc(): void {
     broadcastState(next);
     return ok();
   });
+  ipcMain.handle('state:markOnboardingSeen', () => {
+    const cur = store.get();
+    if ((cur.onboardingSeen ?? 0) >= ONBOARDING_REVISION) return ok();
+    const next = store.save({ ...cur, onboardingSeen: ONBOARDING_REVISION });
+    broadcastState(next);
+    return ok();
+  });
 
   ipcMain.handle('config:get', () => store.get().config);
-  ipcMain.handle('config:update', async (_e, patch: Partial<TraderConfig>) => {
+  ipcMain.handle('config:update', async (_e, raw: Partial<TraderConfig>) => {
+    const patch = cleanConfigPatch(raw as Record<string, unknown>) as Partial<TraderConfig>;
+    const before = store.get().config.mcpAgents;
     const next = store.patchConfig(patch);
     broadcastState(next);
-    await pushConfigToBackend();
+    await pushConfigToBackend({
+      pruneAgentTokens: 'mcpAgents' in patch && removedAgentIds(before, next.config.mcpAgents).length > 0,
+    });
     return next.config;
   });
   ipcMain.handle('config:replace', async (_e, cfg: TraderConfig) => {
-    const next = store.replaceConfig(cfg);
+    const patch = cleanConfigPatch(omitPersonal(cfg ?? {}) as Record<string, unknown>) as Partial<TraderConfig>;
+    const next = store.patchConfig(patch);
     broadcastState(next);
     await pushConfigToBackend();
     return next.config;
@@ -173,7 +220,10 @@ export function registerIpc(): void {
     const s = findStrategy(id);
     if (!s) return store.get().config;
     const cur = store.get();
-    const PRESERVE_PREFIXES = ['crypto15m', 'copy', 'script', 'ai', 'remote', 'terminal', 'mcp', 'perps'];
+    const PRESERVE_PREFIXES = [
+      'crypto15m', 'copy', 'script', 'ai', 'remote', 'terminal', 'mcp', 'perps',
+      'account', 'autopilot',
+    ];
     const PRESERVE_KEYS = new Set([
       'statsChartWindowHours',
       'lifetimeLossLimitPct',
@@ -209,7 +259,7 @@ export function registerIpc(): void {
       scope: sc,
       createdAt: now,
       updatedAt: now,
-      config: structuredClone(cur.config),
+      config: store.mergeConfigPublic(omitPersonal(structuredClone(cur.config)) as Partial<TraderConfig>),
     };
     const next = store.save({
       ...cur,
@@ -288,7 +338,7 @@ export function registerIpc(): void {
     const p = cur.customProfiles.find((x) => x.id === id);
     if (!p) return err('Profile not found');
     const json = JSON.stringify(
-      { kryptTraderProfile: 1, profile: p },
+      { kryptTraderProfile: 1, profile: { ...p, config: omitForShare(p.config) } },
       null,
       2,
     );
@@ -297,7 +347,9 @@ export function registerIpc(): void {
   ipcMain.handle('profiles:import', (_e, json: string) => {
     try {
       const parsed = JSON.parse(json);
-      const norm = store.mergeProfile(parsed?.profile);
+      const src = parsed?.profile;
+      const norm = store.mergeProfile(src && typeof src === 'object' && src.config && typeof src.config === 'object'
+        ? { ...src, config: omitForShare(src.config) } : src);
       if (!norm) return err('Not a valid Krypt PolyBot profile');
       const cur = store.get();
       const dup: Profile = {
@@ -809,13 +861,8 @@ export function registerIpc(): void {
   );
   ipcMain.handle('ai:status', async () =>
     term('aiStatus', {}, {
-      enabled: false, provider: 'anthropic' as const, webSearch: false,
-      offline: false,
-      models: { anthropic: '', openai: '' },
-      keys: {
-        anthropic: { present: false, masked: null },
-        openai: { present: false, masked: null },
-      },
+      enabled: false, provider: 'anthropic' as const, model: '', webSearch: false,
+      offline: false, models: {}, keys: {},
     }),
   );
   ipcMain.handle(
@@ -834,20 +881,46 @@ export function registerIpc(): void {
   );
   ipcMain.handle(
     'ai:setKey',
-    async (_e, args?: { provider?: string; key?: string }) =>
-      term('aiSetKey', args, {
-        ok: false,
-        message: 'The trading backend is not running, so the key could not be verified.',
-      }),
+    async (_e, args?: { provider?: string; key?: string }) => {
+      if (!pythonBackend.isRunning()) {
+        return { ok: false, message: 'The trading backend is not running, so the key could not be verified.' };
+      }
+      const provider = cleanAiKeyProvider(args?.provider);
+      if (!provider) return { ok: false, message: 'That AI provider does not take a key.' };
+      const key = cleanApiKey(args?.key);
+      if (key === null) return { ok: false, message: 'That does not look like an API key — nothing was saved.' };
+      const res = await pythonBackend.request('aiSetKey', { provider, key }, 30_000);
+      appendLog({ ts: new Date().toISOString(), level: 'INFO', source: 'app',
+        msg: `${provider} API key ${key ? 'saved' : 'cleared'}` });
+      return res;
+    },
   );
   ipcMain.handle(
     'ai:listModels',
-    async (_e, args?: { provider?: string }) =>
-      term('aiListModels', args, {
+    async (_e, args?: { provider?: string }) => {
+      const provider = cleanAiProvider(args?.provider);
+      if (!provider) return { ok: false, models: [], message: 'Unknown AI provider.' };
+      return term('aiListModels', { provider }, {
         ok: false, models: [],
         message: termDown('the model list'),
-      }),
+      });
+    },
   );
+  ipcMain.handle('ai:checkProvider', async (_e, args?: { provider?: string }) => {
+    const provider = cleanAiProvider(args?.provider);
+    if (!provider) return { ok: false, provider: 'anthropic', message: 'Unknown AI provider.' };
+    if (!pythonBackend.isRunning()) return { ok: false, provider, message: termDown('the provider check') };
+    try {
+      return await pythonBackend.request('aiCheckProvider', { provider }, 45_000);
+    } catch (e) {
+      return { ok: false, provider, message: rpcMessage(e, 'This version of the engine cannot test a provider yet.') };
+    }
+  });
+  ipcMain.handle('ai:scoreboard', async (_e, args?: { recent?: number }) => {
+    if (!pythonBackend.isRunning()) backendDown('the forecast scoreboard could not be read');
+    const recent = Math.min(200, Math.max(1, Math.floor(Number(args?.recent) || 40)));
+    return await pythonBackend.request('aiScoreboard', { recent }, 20_000);
+  });
 
   ipcMain.handle('terminal:health', async () =>
     term('terminalHealth', {}, {
@@ -1048,23 +1121,166 @@ export function registerIpc(): void {
   const mcpDown = (): McpStatus => ({
     enabled: false, running: false, port: 0, url: '', lastError: termDown('the AI agent server'),
     hasToken: false, tokenMasked: null, sessions: [], toolCount: 0,
-    spentTodayUsd: null, audit: [], fetchedAt: new Date().toISOString(),
+    spentTodayUsd: null, audit: [], agents: [], pendingApprovals: [],
+    fetchedAt: new Date().toISOString(),
   });
+  const agentFor = (raw: unknown): { id: string; name: string } | null => {
+    const id = cleanAgentIdArg(raw);
+    if (!id) return null;
+    const a = agentsOf(store.get().config).find((x) => x.id === id);
+    return a ? { id: a.id, name: a.name } : null;
+  };
+  const noAgent = { ok: false, message: 'Unknown agent. Refresh the page and try again.' };
+
   ipcMain.handle('mcp:status', async () => term('mcpStatus', {}, mcpDown()));
   ipcMain.handle('mcp:sync', async () => term('mcpSync', {}, mcpDown()));
-  ipcMain.handle('mcp:rotateToken', async () => term('mcpRotateToken', {}, mcpDown()));
-  ipcMain.handle('mcp:revealToken', async () => term('mcpRevealToken', {}, { token: '' }));
-  ipcMain.handle('mcp:paper', async (_e, args?: { reset?: boolean }) =>
-    term('mcpPaper', { reset: !!args?.reset }, { portfolio: null, orders: null }));
-  const mcpUrl = () => `http://127.0.0.1:${store.get().config.mcpPort ?? 47615}/mcp`;
-  ipcMain.handle('mcp:clients', async () =>
-    mcpClients.listClients(pythonBackend.relaySpec(), mcpUrl()));
-  ipcMain.handle('mcp:install', async (_e, args?: { id?: McpClientId }) =>
-    args?.id
-      ? mcpClients.install(args.id, pythonBackend.relaySpec())
-      : { ok: false, message: 'No client selected.' });
-  ipcMain.handle('mcp:uninstall', async (_e, args?: { id?: McpClientId }) =>
-    args?.id ? mcpClients.uninstall(args.id) : { ok: false, message: 'No client selected.' });
+  ipcMain.handle('mcp:rotateToken', async (_e, args?: { agentId?: string }) => {
+    const a = agentFor(args?.agentId);
+    if (!a) throw new Error(noAgent.message);
+    return term('mcpRotateToken', { agentId: a.id }, mcpDown());
+  });
+  ipcMain.handle('mcp:paper', async (_e, args?: { agentId?: string; reset?: boolean; limit?: number }) => {
+    const id = cleanAgentIdArg(args?.agentId ?? 'default');
+    if (!id) return { portfolio: null, orders: null };
+    const limit = Math.min(200, Math.max(1, Math.floor(Number(args?.limit) || 50)));
+    return term('mcpPaper', { agentId: id, reset: args?.reset === true, limit }, { portfolio: null, orders: null });
+  });
+  ipcMain.handle('mcp:decide', async (_e, args?: { id?: number; approve?: boolean }) => {
+    if (!pythonBackend.isRunning()) return { ok: false, message: termDown('the approval') };
+    const id = Math.floor(Number(args?.id));
+    if (!Number.isFinite(id) || id <= 0) return { ok: false, message: 'No such agent order.' };
+    return await pythonBackend.request('mcpDecide', { id, approve: args?.approve === true }, 60_000);
+  });
+  ipcMain.handle('mcp:settleUnknown', async (_e, args?: { id?: number }) => {
+    if (!pythonBackend.isRunning()) return { ok: false, message: termDown('the check') };
+    const id = Math.floor(Number(args?.id));
+    if (!Number.isFinite(id) || id <= 0) return { ok: false, message: 'No such agent order.' };
+    return await pythonBackend.request('mcpSettleUnknown', { id }, 60_000);
+  });
+  ipcMain.handle('mcp:activity', async (_e, args?: { limit?: number }) => {
+    const limit = Math.min(500, Math.max(1, Math.floor(Number(args?.limit) || 100)));
+    return term('mcpActivity', { limit }, { orders: [], pending: [] });
+  });
+  ipcMain.handle('mcp:seen', async () => {
+    if (!pythonBackend.isRunning()) return { clients: [] };
+    try {
+      return await pythonBackend.request('mcpSeen', {}, 10_000);
+    } catch {
+      return { clients: [] };
+    }
+  });
+  ipcMain.handle('mcp:copyHttpSnippet', async (_e, args?: { agentId?: string }) => {
+    const a = agentFor(args?.agentId);
+    if (!a) return noAgent;
+    if (!pythonBackend.isRunning()) return { ok: false, message: termDown('the HTTP snippet') };
+    try {
+      const res = await pythonBackend.request<{ text?: string }>('mcpHttpSnippet', { agentId: a.id }, 20_000);
+      if (!res?.text) return { ok: false, message: 'The backend returned no snippet.' };
+      clipboard.writeText(res.text);
+      return { ok: true, message: `Copied the HTTP examples for ${a.name} — they include its token, so paste them only where you mean to.` };
+    } catch (e) {
+      return { ok: false, message: rpcMessage(e, 'This version of the engine cannot build the HTTP snippet yet.') };
+    }
+  });
+  ipcMain.handle('mcp:clients', async (_e, args?: { agentId?: string }) => {
+    const a = agentFor(args?.agentId ?? 'default');
+    if (!a) return [];
+    return mcpClients.listClients(pythonBackend.relaySpec(), a);
+  });
+  ipcMain.handle('mcp:install', async (_e, args?: { clientId?: string; agentId?: string }) => {
+    const client = cleanClientId(args?.clientId);
+    if (!client) return { ok: false, message: 'No client selected.' };
+    const a = agentFor(args?.agentId);
+    if (!a) return noAgent;
+    const out = mcpClients.install(client, pythonBackend.relaySpec(), a);
+    appendLog({ ts: new Date().toISOString(), level: out.ok ? 'INFO' : 'WARN', source: 'app',
+      msg: `${client} config for agent ${a.id} ${out.ok ? `written: ${(out.files ?? []).join(', ')}` : 'not written'}`
+        + (out.backups?.length ? ` (backup: ${out.backups.join(', ')})` : '') });
+    return out;
+  });
+  ipcMain.handle('mcp:uninstall', async (_e, args?: { clientId?: string; agentId?: string }) => {
+    const client = cleanClientId(args?.clientId);
+    if (!client) return { ok: false, message: 'No client selected.' };
+    const id = cleanAgentIdArg(args?.agentId);
+    if (!id) return noAgent;
+    const a = agentFor(id) ?? { id, name: '' };
+    return mcpClients.uninstall(client, a);
+  });
+  ipcMain.handle('mcp:copyConfig', async (_e, args?: { clientId?: string; agentId?: string }) => {
+    const client = cleanClientId(args?.clientId);
+    if (!client) return { ok: false, message: 'No client selected.' };
+    const a = agentFor(args?.agentId);
+    if (!a) return noAgent;
+    const spec = pythonBackend.relaySpec();
+    if (!spec) return { ok: false, message: 'The backend binary could not be located.' };
+    clipboard.writeText(mcpClients.snippetFor(client, spec, a));
+    return { ok: true, message: 'Copied. It holds no token: the app hands the agent its token itself.' };
+  });
+  ipcMain.handle('mcp:openConfigFolder', async (_e, args?: { clientId?: string }) => {
+    const client = cleanClientId(args?.clientId);
+    if (!client) return { ok: false, message: 'No client selected.' };
+    const dir = mcpClients.configFolder(client, mcpClients.systemPathEnv());
+    if (!dir || !existsSync(dir)) {
+      return { ok: false, message: 'That app has not created its settings folder yet. Open it once first, or use Add.' };
+    }
+    const fail = await shell.openPath(dir);
+    return fail ? { ok: false, message: fail } : { ok: true };
+  });
+  ipcMain.handle('agents:closePaper', async (_e, args?: { agentId?: string }) => {
+    const id = cleanAgentIdArg(args?.agentId);
+    if (!id) return noAgent;
+    if (!pythonBackend.isRunning()) return { ok: false, message: termDown('its paper positions') };
+    try {
+      return await pythonBackend.request('mcpAgentClosePaper', { agentId: id }, 60_000);
+    } catch (e) {
+      return { ok: false, message: rpcMessage(e, 'This version of the engine cannot close an agent\'s paper positions yet.') };
+    }
+  });
+
+  ipcMain.handle('health:check', async (_e, args?: unknown) => {
+    if (!pythonBackend.isRunning()) return null;
+    const { deep } = cleanHealthArgs(args);
+    try {
+      return await pythonBackend.request('healthCheck', { deep }, deep ? 90_000 : 20_000);
+    } catch {
+      return null;
+    }
+  });
+
+  ipcMain.handle('autopilot:status', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    try {
+      return await pythonBackend.request('autopilotStatus', {}, 20_000);
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('autopilot:runNow', async () => {
+    if (!pythonBackend.isRunning()) return { ok: false, message: termDown('Autopilot') };
+    try {
+      return await pythonBackend.request('autopilotRunNow', {}, 20_000);
+    } catch (e) {
+      return { ok: false, message: rpcMessage(e, 'This version of the engine has no Autopilot yet.') };
+    }
+  });
+
+  ipcMain.handle('paper:status', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    try {
+      return await pythonBackend.request('paperStatus', {}, 20_000);
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('paper:reset', async () => {
+    if (!pythonBackend.isRunning()) return err('Backend not running');
+    try {
+      const r = await pythonBackend.request('paperReset', {}, 30_000);
+      return ok(r, 'Paper account reset to its starting balance.');
+    } catch (e: any) {
+      return err(rpcMessage(e, 'The paper account could not be reset.'));
+    }
+  });
 
   ipcMain.handle('logs:tail', async (_e, _limit?: number) => {
     return logsBuffer.slice(-1 * (_limit || 500));
@@ -1092,6 +1308,10 @@ export function registerIpc(): void {
   });
   ipcMain.handle('window:isMaximized', (e) => {
     return BrowserWindow.fromWebContents(e.sender)?.isMaximized() ?? false;
+  });
+  ipcMain.handle('window:isVisible', (e) => {
+    const w = BrowserWindow.fromWebContents(e.sender);
+    return !!w && w.isVisible() && !w.isMinimized();
   });
 }
 

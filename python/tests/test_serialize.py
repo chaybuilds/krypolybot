@@ -1,3 +1,10 @@
+"""Tests for service._iso_utc — the SQLite-naive-UTC -> ISO 8601 fixer.
+
+Regression guard for the "every Started/Resolved time shows up 7 hours
+off in PT" bug: SQLite writes naive "YYYY-MM-DD HH:MM:SS" which JS parses
+as LOCAL time. _iso_utc must tag a real Z onto naive strings while leaving
+already-zoned strings untouched.
+"""
 from __future__ import annotations
 
 import service
@@ -19,6 +26,7 @@ def test_offset_timestamp_is_not_double_tagged():
 def test_empty_and_none_pass_through():
     assert service._iso_utc("") == ""
     assert service._iso_utc(None) is None
+
 
 
 def test_live_pnl_open_position_gains():

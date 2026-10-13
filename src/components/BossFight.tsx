@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { X, Swords } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
+import { onAmbientTick } from '../state/ambient';
 import spriteUrl from '../assets/spritebluey.png';
 
 const MIL = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
@@ -149,17 +150,14 @@ export function BossWidget() {
   useEffect(() => {
     if (!sprite) return;
     const ctx = canvasRef.current?.getContext('2d'); if (!ctx) return;
-    let raf = 0, last = 0, frame = 0, cancelled = false;
-    const loop = (t: number) => {
-      if (cancelled) return;
-      if (document.hidden) { window.setTimeout(() => { if (!cancelled) raf = requestAnimationFrame(loop); }, 500); return; }
+    let last = 0, frame = 0, off: (() => void) | null = null, cancelled = false;
+    const draw = (t: number) => {
       if (t - last > 110) { frame = (frame + 1) % 8; last = t; }
       drawScene(ctx, WW, WH, sprite, frame, gRef.current, t, true);
-      raf = requestAnimationFrame(loop);
     };
-    const start = () => { if (!cancelled) raf = requestAnimationFrame(loop); };
+    const start = () => { if (!cancelled) { draw(performance.now()); off = onAmbientTick(draw); } };
     if (document.fonts?.ready) document.fonts.ready.then(start).catch(start); else start();
-    return () => { cancelled = true; cancelAnimationFrame(raf); };
+    return () => { cancelled = true; off?.(); };
   }, [sprite]);
 
   return (

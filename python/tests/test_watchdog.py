@@ -1,3 +1,5 @@
+"""Trading-loop watchdog: a stalled loop (stale heartbeat) must be force-
+restarted so open positions never stop being managed."""
 import asyncio
 
 import pytest
@@ -87,6 +89,7 @@ def test_loop_watchdog_leaves_healthy_loop_alone(monkeypatch):
     same = asyncio.run(_run())
     assert same
     assert spawned["n"] == 0
+
 
 
 def test_block_ceiling_skips_hung_block_and_next_block_still_runs():

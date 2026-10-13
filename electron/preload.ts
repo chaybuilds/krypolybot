@@ -4,6 +4,7 @@ import type {
   CredentialsState, KryptApi, LogEntry, PnlPoint, PositionFilter, Profile,
   ScannerStats, SignalFilter, SignalRow, StrategyPreset, TraderConfig,
 } from '../shared/types';
+import type { McpOrderEvent, McpToolCallEvent } from '../shared/market';
 
 const sub = <T>(channel: string, cb: (val: T) => void): (() => void) => {
   const handler = (_e: unknown, val: T) => cb(val);
@@ -16,10 +17,14 @@ const api: KryptApi = {
     version: () => ipcRenderer.invoke('app:version'),
     openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
     showItemInFolder: (p) => ipcRenderer.invoke('app:showItemInFolder', p),
+    saveVideo: (bytes, ext, name) => ipcRenderer.invoke('app:saveVideo', { bytes, ext, name }),
     getUserDataPath: () => ipcRenderer.invoke('app:getUserDataPath'),
     factoryReset: () => ipcRenderer.invoke('app:factoryReset'),
     clearHistory: () => ipcRenderer.invoke('app:clearHistory'),
     onDataReset: (cb) => sub<unknown>('data:reset', cb),
+    markOnboardingSeen: () => ipcRenderer.invoke('state:markOnboardingSeen'),
+    isVisible: () => ipcRenderer.invoke('window:isVisible'),
+    onVisibility: (cb) => sub<boolean>('window:visibility', cb),
   },
   accounts: {
     current: () => ipcRenderer.invoke('accounts:current'),
@@ -36,6 +41,7 @@ const api: KryptApi = {
     acceptDisclaimer: () => ipcRenderer.invoke('state:acceptDisclaimer'),
     setUiMode: (v: 'simple' | 'advanced') => ipcRenderer.invoke('state:setUiMode', v),
     resetOnboarding: () => ipcRenderer.invoke('state:resetOnboarding'),
+    markOnboardingSeen: () => ipcRenderer.invoke('state:markOnboardingSeen'),
   },
   config: {
     get: (): Promise<TraderConfig> => ipcRenderer.invoke('config:get'),
@@ -187,6 +193,19 @@ const api: KryptApi = {
     analyze: (conditionId) => ipcRenderer.invoke('ai:analyze', { conditionId }),
     setKey: (provider, key) => ipcRenderer.invoke('ai:setKey', { provider, key }),
     listModels: (provider) => ipcRenderer.invoke('ai:listModels', { provider }),
+    checkProvider: (provider) => ipcRenderer.invoke('ai:checkProvider', { provider }),
+    scoreboard: (recent) => ipcRenderer.invoke('ai:scoreboard', { recent }),
+  },
+  autopilot: {
+    status: () => ipcRenderer.invoke('autopilot:status'),
+    runNow: () => ipcRenderer.invoke('autopilot:runNow'),
+  },
+  paper: {
+    status: () => ipcRenderer.invoke('paper:status'),
+    reset: () => ipcRenderer.invoke('paper:reset'),
+  },
+  health: {
+    check: (deep) => ipcRenderer.invoke('health:check', { deep: deep === true }),
   },
   remote: {
     status: () => ipcRenderer.invoke('remote:status'),
@@ -201,12 +220,21 @@ const api: KryptApi = {
   mcp: {
     status: () => ipcRenderer.invoke('mcp:status'),
     sync: () => ipcRenderer.invoke('mcp:sync'),
-    rotateToken: () => ipcRenderer.invoke('mcp:rotateToken'),
-    revealToken: () => ipcRenderer.invoke('mcp:revealToken'),
-    paper: (reset) => ipcRenderer.invoke('mcp:paper', { reset: !!reset }),
-    clients: () => ipcRenderer.invoke('mcp:clients'),
-    install: (id) => ipcRenderer.invoke('mcp:install', { id }),
-    uninstall: (id) => ipcRenderer.invoke('mcp:uninstall', { id }),
+    rotateToken: (agentId) => ipcRenderer.invoke('mcp:rotateToken', { agentId }),
+    paper: (agentId, reset) => ipcRenderer.invoke('mcp:paper', { agentId, reset: reset === true }),
+    decide: (id, approve) => ipcRenderer.invoke('mcp:decide', { id, approve: approve === true }),
+    settleUnknown: (id) => ipcRenderer.invoke('mcp:settleUnknown', { id }),
+    activity: (limit) => ipcRenderer.invoke('mcp:activity', { limit }),
+    seen: () => ipcRenderer.invoke('mcp:seen'),
+    copyHttpSnippet: (agentId) => ipcRenderer.invoke('mcp:copyHttpSnippet', { agentId }),
+    clients: (agentId) => ipcRenderer.invoke('mcp:clients', { agentId }),
+    install: (clientId, agentId) => ipcRenderer.invoke('mcp:install', { clientId, agentId }),
+    uninstall: (clientId, agentId) => ipcRenderer.invoke('mcp:uninstall', { clientId, agentId }),
+    copyConfig: (clientId, agentId) => ipcRenderer.invoke('mcp:copyConfig', { clientId, agentId }),
+    openConfigFolder: (clientId) => ipcRenderer.invoke('mcp:openConfigFolder', { clientId }),
+    closeAgentPaper: (agentId) => ipcRenderer.invoke('agents:closePaper', { agentId }),
+    onOrder: (cb) => sub<McpOrderEvent>('mcp:order', cb),
+    onToolCall: (cb) => sub<McpToolCallEvent>('mcp:toolCall', cb),
   },
   logs: {
     tail: (limit?: number): Promise<LogEntry[]> => ipcRenderer.invoke('logs:tail', limit),
@@ -220,6 +248,8 @@ const api: KryptApi = {
     close: () => ipcRenderer.send('window:close'),
     isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
     onMaximizeChange: (cb) => sub<boolean>('window:maximizeChange', cb),
+    isVisible: () => ipcRenderer.invoke('window:isVisible'),
+    onVisibility: (cb) => sub<boolean>('window:visibility', cb),
   },
 };
 

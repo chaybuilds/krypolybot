@@ -1,3 +1,11 @@
+"""The volatility column, and the honest-null rule that governs its ranking.
+
+The trap this file exists to pin: Gamma omits `oneDayPriceChange` on roughly a
+quarter of live rows. Reading a missing figure as 0.0 would rank those markets
+as the CALMEST on the board — a confident claim ("this market barely moved")
+made about markets nobody measured. So an unknown move sorts to the end,
+stays readable, and is counted out loud in the note.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +20,7 @@ def _run(coro):
 
 
 def _gamma(**over):
+    """A minimal Gamma market row. Only the fields this file cares about."""
     row = {
         "conditionId": over.pop("cid", "0x01"),
         "question": over.pop("q", "Will something happen?"),
@@ -25,12 +34,14 @@ def _gamma(**over):
 
 
 def test_price_change_is_converted_to_cents():
+    """Gamma reports a 0..1 fraction; every price in this module is cents."""
     s = t.summary_from_gamma(_gamma(oneDayPriceChange=0.5645, oneHourPriceChange=-0.25))
     assert s["priceChange24h"] == pytest.approx(56.45)
     assert s["priceChange1h"] == pytest.approx(-25.0)
 
 
 def test_price_change_keeps_its_sign():
+    """A fall is as real as a rise. Only the RANKING takes an absolute value."""
     s = t.summary_from_gamma(_gamma(oneDayPriceChange=-0.63))
     assert s["priceChange24h"] == pytest.approx(-63.0)
 
@@ -42,6 +53,7 @@ def test_missing_change_is_none_not_zero():
 
 
 def test_missing_change_says_why():
+    """The em-dash rule: a blank must carry its reason."""
     s = t.summary_from_gamma(_gamma())
     reasons = {u["field"]: u["reason"] for u in s["unknowns"]}
     assert "priceChange24h" in reasons
@@ -54,6 +66,8 @@ def test_change_carries_provenance():
 
 
 def test_zero_change_is_a_real_measurement():
+    """A reported 0.0 is a market that genuinely did not move, and is NOT the
+    same as an absent field — so it must not acquire an `unknowns` entry."""
     s = t.summary_from_gamma(_gamma(oneDayPriceChange=0.0))
     assert s["priceChange24h"] == 0.0
     assert not any(u["field"] == "priceChange24h" for u in s["unknowns"])
@@ -68,6 +82,7 @@ def _discover_volatility(monkeypatch, rows):
 
 
 def test_ranked_by_absolute_move(monkeypatch):
+    """A market that fell 40c is exactly as interesting as one that rose 40c."""
     out = _discover_volatility(monkeypatch, [
         _gamma(cid="0xa", q="small riser", oneDayPriceChange=0.05),
         _gamma(cid="0xb", q="big faller", oneDayPriceChange=-0.40),
@@ -96,12 +111,15 @@ def test_note_counts_the_unrankable(monkeypatch):
 
 
 def test_no_movers_at_all_blames_the_data_not_the_board(monkeypatch):
+    """The failure mode this whole module exists to prevent: a confident claim
+    about Polymarket made after measuring nothing."""
     out = _discover_volatility(monkeypatch, [_gamma(cid="0xa"), _gamma(cid="0xb")])
     assert "gap in Gamma's data" in out["note"]
     assert "not a calm board" in out["note"]
 
 
 def test_zero_movers_rank_below_real_movers(monkeypatch):
+    """A genuine 0.0 is rankable and belongs above an unknown, not below it."""
     out = _discover_volatility(monkeypatch, [
         _gamma(cid="0xa", q="unknown"),
         _gamma(cid="0xb", q="flat", oneDayPriceChange=0.0),

@@ -1,3 +1,31 @@
+"""Real-time Polymarket Perps market data (public WebSocket).
+
+Keeps a live best-bid/offer cache and a trade tape for the instruments the
+market maker quotes, and wakes the engine the moment a market's mid moves —
+so quotes are re-centred within milliseconds of a move instead of at the next
+poll. That latency is most of a maker's adverse selection.
+
+Protocol (verified live 2026-10-05):
+  url    wss://ws.perpetuals.polymarket.com/v1/ws            (public)
+  sub    {"id": n, "req": "sub",   "chs": ["bbo::<iid>", "trades::<iid>"]}
+  unsub  {"id": n, "req": "unsub", "chs": [...]}   — no reconnect needed
+  ack    {"id": n, "data": [{"status": "ok"}, ...]}
+  bbo    {"ch": "bbo::34", "ts", "ets", "sq",
+          "data": {"iid": 34, "bp": "3.8289", "bq": "720.24", "ap": "3.8317", "aq": "1043.9"}}
+  trades {"ch": "trades::6", "ts", "sq",
+          "data": [{"tid", "iid", "side": "long", "p": "85884", "qty": "0.01327",
+                    "settlement": false, "ts", "hash"}]}
+  ping   {"id": 0, "req": "post", "op": {"type": "ping"}} every ~25s; the
+         connection is stale after ~65s without any message.
+
+STRICT ACCELERATOR (like clob_ws): every reader falls back to REST whenever
+the socket is down, an instrument isn't subscribed yet, or a quote is stale.
+The engine is never MORE fragile than pure polling — only faster.
+
+The trade tape and periodic BBO samples are also buffered for the recorder
+(perps_record), which is what makes the backtester's data denser than the
+REST trade history alone.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +46,7 @@ _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 30.0
 _SAMPLE_EVERY = 5.0
 _BUFFER_MAX = 20_000
+
 
 
 def parse_bbo(msg: dict) -> Optional[dict]:
@@ -58,6 +87,7 @@ def _f(v) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
 
 
 class PerpsFeed:
@@ -109,6 +139,7 @@ class PerpsFeed:
         return out
 
     def drain(self) -> tuple[list[dict], list[dict]]:
+        """(trades, bbo samples) buffered since the last drain."""
         tr, sm = list(self.trades), list(self.samples)
         self.trades.clear()
         self.samples.clear()

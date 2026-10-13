@@ -1,10 +1,11 @@
+# -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import copy_metadata
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
-hiddenimports = ['db', 'scanner', 'trader', 'polymarket_api', 'polymarket_auth', 'categorize', 'config', 'crypto15m', 'crypto15m_trader', 'crypto15m_record', 'backtest', 'indicators', 'clob_ws', 'rules', 'copy_trader', 'spot_ws', 'rtds_ws', 'replay', 'parlay_generator', 'ws_ssl', 'script_sandbox', 'script_engine', 'script_backtest', 'script_docs', 'script_audit', 'statistics', 'activity_ws', 'terminal', 'terminal_trade', 'terminal_paper', 'kalshi', 'cross_venue', 'remote', 'bot_secrets', 'bot_telegram', 'bot_discord', 'ai_analysis', 'ai_secrets', 'mcp_server', 'mcp_tools', 'mcp_stdio', 'perps_api', 'perps_board', 'perps_maker', 'perps_ws', 'perps_backtest', 'binance_ref', 'user_ws', 'data_v2']
+hiddenimports = ['db', 'scanner', 'trader', 'polymarket_api', 'polymarket_auth', 'categorize', 'config', 'crypto15m', 'crypto15m_trader', 'crypto15m_record', 'backtest', 'indicators', 'clob_ws', 'rules', 'copy_trader', 'spot_ws', 'rtds_ws', 'replay', 'parlay_generator', 'ws_ssl', 'script_sandbox', 'script_engine', 'script_backtest', 'script_docs', 'script_audit', 'statistics', 'activity_ws', 'terminal', 'terminal_trade', 'terminal_paper', 'kalshi', 'cross_venue', 'remote', 'bot_secrets', 'bot_telegram', 'bot_discord', 'ai_analysis', 'ai_secrets', 'ai_providers', 'autopilot', 'mcp_server', 'mcp_tools', 'mcp_stdio', 'mcp_agents', 'mcp_rails', 'forecast_ledger', 'logscrub', 'health', 'perps_api', 'perps_board', 'perps_maker', 'perps_ws', 'perps_backtest', 'binance_ref', 'user_ws', 'data_v2', 'script_backtest_child']
 datas += collect_data_files('eth_account')
 datas += copy_metadata('eth_account')
 datas += copy_metadata('eth_utils')

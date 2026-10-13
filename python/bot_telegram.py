@@ -1,3 +1,15 @@
+"""Telegram bot — long-polling transport for remote.py.
+
+Long polling, not webhooks, and that is the whole reason this works: a
+webhook needs a public HTTPS endpoint, and the machine running this app is a
+home PC behind NAT. `getUpdates` is an outbound request, so it needs no port
+forwarding, no tunnel and no third-party relay.
+
+The transport is deliberately thin. It knows how to read messages and send
+text; every decision about WHO may speak and WHAT they may do lives in
+remote.py, so the two bots cannot drift into different security rules.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -59,7 +71,7 @@ async def _call(method: str, params: Optional[dict] = None,
         data = r.json()
         terminal.note_external_call(
             "telegram", ok=True, ms=(time.monotonic() - started) * 1000)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         terminal.note_external_call("telegram", ok=False)
         raise RuntimeError(f"{type(e).__name__}: {e}") from e
     if not isinstance(data, dict) or not data.get("ok"):
@@ -69,6 +81,8 @@ async def _call(method: str, params: Optional[dict] = None,
 
 
 async def send(chat_id: str, text: str) -> None:
+    """Outbound. Chunked because Telegram hard-caps a message at 4096 chars and
+    a long position list would otherwise silently fail to send."""
     body = text or ""
     while body:
         chunk, body = body[:3900], body[3900:]
@@ -79,12 +93,14 @@ async def send(chat_id: str, text: str) -> None:
 
 
 async def verify_token(token: str) -> dict:
+    """Check a token before saving it, so the setup screen can fail loudly
+    instead of leaving a bot that silently never connects."""
     import polymarket_api as api
     try:
         client = await api._get_client()
         r = await client.get(f"{API}/bot{(token or '').strip()}/getMe", timeout=15.0)
         data = r.json()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"Could not reach Telegram: {e}"}
     if not isinstance(data, dict) or not data.get("ok"):
         return {"ok": False,
@@ -96,6 +112,12 @@ async def verify_token(token: str) -> dict:
 
 
 def is_stale(msg: dict) -> tuple[bool, float]:
+    """→ (stale, age_seconds) for one Telegram message.
+
+    A message with NO date is not assumed stale: an unknown age is unknown,
+    and refusing on it would make the bot unusable against any payload shape
+    that omits the field.
+    """
     sent_at = float(msg.get("date") or 0)
     if not sent_at:
         return False, 0.0
@@ -104,6 +126,9 @@ def is_stale(msg: dict) -> tuple[bool, float]:
 
 
 async def process_updates(updates: list) -> None:
+    """Handle one batch. Extracted from the poll loop so the staleness rule —
+    the one that decides whether a seven-hour-old /flatten runs — is testable
+    without spinning a network loop."""
     global _offset
     warned_stale: set[str] = set()
 
@@ -138,7 +163,7 @@ async def process_updates(updates: list) -> None:
             reply = await remote.handle("telegram", user_id, text, label=label)
             if reply:
                 await send(chat_id, reply)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug("telegram handler failed: %s", e, exc_info=True)
             try:
                 await send(chat_id, f"That failed: {type(e).__name__}")
@@ -167,7 +192,7 @@ async def _poll_loop() -> None:
             await process_updates(updates or [])
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             _last_error = str(e)[:200]
             logger.info("telegram poll error: %s", _last_error)
             await asyncio.sleep(backoff)

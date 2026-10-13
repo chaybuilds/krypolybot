@@ -79,4 +79,4 @@ export function listStrategies(): StrategyPreset[] {
 
 export function findStrategy(id: string): StrategyPreset | undefined {
   return BUILTIN_STRATEGIES.find((s) => s.id === id);
-}
+}

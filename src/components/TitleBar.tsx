@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react';
 import { Minus, Square, Copy as Restore, X } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { cls } from '../utils/format';
+import { GlassPanel } from './glass/GlassPanel';
+import { GLASS_TINTS } from './glass/glassPresets';
 
 export function TitleBar() {
-  const { backend } = useApp();
+  const { backend, config, appVersion } = useApp();
   const [maxed, setMaxed] = useState(false);
 
   useEffect(() => {
@@ -24,25 +26,44 @@ export function TitleBar() {
     backend.status === 'starting' ? 'bg-krypt-warn' :
     backend.status === 'crashed' || backend.status === 'restarting' ? 'bg-krypt-loss' :
     'bg-krypt-dim';
+  const live = config?.accountMode === 'live';
 
   return (
-    <div className="titlebar-drag relative z-30 flex h-9 select-none items-center justify-between border-b border-krypt-border bg-krypt-void/95 px-3 backdrop-blur">
+    <GlassPanel
+      preset="chrome"
+      display="flex"
+      tint={GLASS_TINTS.chrome}
+      className="titlebar-drag relative z-30 h-9 shrink-0 select-none items-center justify-between border-b border-white/[0.06] px-3"
+    >
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-2">
+          <div className="h-[18px] w-[18px] rounded-md bg-gradient-to-br from-sky-400 via-blue-500 to-blue-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.45),0_0_14px_-2px_rgba(59,130,246,0.85)]" />
           <span className="font-pixel text-[10px] uppercase tracking-[0.2em] text-white/90">
             Krypt PolyBot
           </span>
+          {appVersion && (
+            <span className="rounded-full border border-krypt-purple/30 bg-krypt-purple/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-krypt-purple shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+              v{appVersion}
+            </span>
+          )}
         </div>
         <div className="hidden items-center gap-2 text-[11px] text-krypt-muted lg:flex">
           <span className={cls('h-2 w-2 rounded-full', dot, backend.status === 'running' && 'shadow-[0_0_8px_currentColor]')} />
           <span className="capitalize">{backend.status}</span>
-          {backend.authOk ? (
+          {!live ? (
+            <span
+              className="krypt-pill border-krypt-warn/40 bg-krypt-warn/10 text-krypt-warn"
+              title="Paper: real Polymarket order books, imaginary money. No wallet needed."
+            >
+              paper
+            </span>
+          ) : backend.authOk ? (
             <span className="krypt-pill border-krypt-win/40 bg-krypt-win/10 text-krypt-win">
-              auth ok
+              wallet ok
             </span>
           ) : (
-            <span className="krypt-pill border-krypt-warn/40 bg-krypt-warn/10 text-krypt-warn">
-              auth needed
+            <span className="krypt-pill border-krypt-loss/40 bg-krypt-loss/10 text-krypt-loss">
+              wallet needed
             </span>
           )}
         </div>
@@ -52,25 +73,25 @@ export function TitleBar() {
         <button
           onClick={() => window.krypt.window.minimize()}
           aria-label="Minimize"
-          className="grid h-9 w-11 place-items-center text-krypt-muted hover:bg-white/5 hover:text-white"
+          className="grid h-9 w-11 place-items-center text-krypt-muted transition-colors hover:bg-white/[0.06] hover:text-white"
         >
           <Minus className="h-3.5 w-3.5" />
         </button>
         <button
           onClick={() => window.krypt.window.maximize()}
           aria-label={maxed ? 'Restore' : 'Maximize'}
-          className="grid h-9 w-11 place-items-center text-krypt-muted hover:bg-white/5 hover:text-white"
+          className="grid h-9 w-11 place-items-center text-krypt-muted transition-colors hover:bg-white/[0.06] hover:text-white"
         >
           {maxed ? <Restore className="h-3 w-3" /> : <Square className="h-3 w-3" />}
         </button>
         <button
           onClick={() => window.krypt.window.close()}
           aria-label="Close"
-          className="grid h-9 w-11 place-items-center text-krypt-muted hover:bg-krypt-loss hover:text-white"
+          className="grid h-9 w-11 place-items-center text-krypt-muted transition-colors hover:bg-krypt-loss hover:text-white"
         >
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
-    </div>
+    </GlassPanel>
   );
 }

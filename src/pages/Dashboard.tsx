@@ -7,6 +7,7 @@ import { useToast } from '../state/ToastProvider';
 import { Card, Empty, Page, ShareableStat, StatCard } from '../components/common';
 import { cls, fmtPct, fmtRelative, fmtUsd } from '../utils/format';
 import { WhyNotTrading } from '../components/WhyNotTrading';
+import { PAPER_BADGE_TITLE } from '../utils/balance';
 import type { PageId } from '../App';
 
 interface DashboardProps {
@@ -40,7 +41,7 @@ export function DashboardPage({ onNav }: DashboardProps) {
       try {
         const s = await window.krypt.data.pnlSeries(168);
         if (mounted) setSeries(s);
-      } catch {}
+      } catch { }
     };
     void load();
     const i = window.setInterval(load, 30000);
@@ -61,12 +62,19 @@ export function DashboardPage({ onNav }: DashboardProps) {
 
   const issues: { label: string; tone: 'warn' | 'bad' | 'good'; cta?: { label: string; page: PageId } }[] = [];
   const walletConnected = !!credentials?.hasWalletKey;
+  const paperAccount = config?.accountMode !== 'live';
   if (!walletConnected) {
-    issues.push({
-      label: 'No wallet connected — bot can only run in DRY-RUN mode',
-      tone: 'bad',
-      cta: { label: 'Connect Wallet', page: 'api' },
-    });
+    issues.push(paperAccount
+      ? {
+        label: 'Paper: no wallet needed. Connect one before you go live.',
+        tone: 'warn',
+        cta: { label: 'Connect Wallet', page: 'api' },
+      }
+      : {
+        label: 'Live, but no wallet is connected — nothing can trade until one is',
+        tone: 'bad',
+        cta: { label: 'Connect Wallet', page: 'api' },
+      });
   } else if (!backend.authOk) {
     issues.push({
       label: 'Saved wallet could not connect to Polymarket',
@@ -76,7 +84,7 @@ export function DashboardPage({ onNav }: DashboardProps) {
   }
   if (config && !config.enableTrading && walletConnected) {
     issues.push({
-      label: 'Auto-trading is paused — flip the switch in the top bar to enable',
+      label: 'The main engine is paused — switch it on from its own page',
       tone: 'warn',
     });
   }
@@ -123,18 +131,31 @@ export function DashboardPage({ onNav }: DashboardProps) {
           </button>
         </div>
       )}
-      {account?.tradingGeoblocked && (
+      {(account?.tradingGeoblocked || account?.tradingRegion?.status === 'blocked') && (
         <div className="mb-4 flex flex-col gap-3 rounded-xl border border-krypt-bad/50 bg-krypt-bad/10 p-4 sm:flex-row sm:items-center">
           <AlertTriangle className="h-6 w-6 shrink-0 text-krypt-bad" />
           <div className="flex-1">
             <div className="text-sm font-semibold text-krypt-bad">
-              Polymarket is blocking orders from your region
+              Polymarket doesn’t allow trading from your region
             </div>
             <div className="mt-0.5 text-xs text-krypt-muted">
-              Every recent order was rejected with Polymarket’s region-restriction error.
-              Market data still flows, so everything else looks normal — but no trade can
-              fill until your connection exits the blocked region (e.g. your VPN reconnects).
-              This clears automatically once orders go through again.
+              {account?.tradingGeoblocked
+                ? 'Recent orders were refused with Polymarket’s region restriction. '
+                : 'Polymarket’s region check says this connection is in a blocked region. '}
+              Market data still flows, so everything else looks normal, but no order can fill
+              from here. Trading on Polymarket is only allowed where it is legal for you.
+            </div>
+          </div>
+        </div>
+      )}
+      {!account?.tradingGeoblocked && account?.tradingRegion?.status === 'close_only' && (
+        <div className="mb-4 flex flex-col gap-3 rounded-xl border border-krypt-warn/50 bg-krypt-warn/10 p-4 sm:flex-row sm:items-center">
+          <AlertTriangle className="h-6 w-6 shrink-0 text-krypt-warn" />
+          <div className="flex-1">
+            <div className="text-sm font-semibold text-krypt-warn">Close-only region</div>
+            <div className="mt-0.5 text-xs text-krypt-muted">
+              Polymarket lets this region close existing positions but not open new ones, so the
+              app refuses new buys here. Selling what you hold still works.
             </div>
           </div>
         </div>
@@ -159,7 +180,18 @@ export function DashboardPage({ onNav }: DashboardProps) {
       <div className="grid gap-4 md:grid-cols-3">
         <ShareableStat
           label="Total Balance"
-          value={fmtUsd(account?.totalUsd)}
+          value={config && config.accountMode !== 'live' ? (
+            <span className="inline-flex items-center gap-2">
+              {fmtUsd(account?.totalUsd)}
+              <span
+                data-testid="paper-pill"
+                title={PAPER_BADGE_TITLE}
+                className="rounded-full border border-krypt-warn/50 bg-krypt-warn/10 px-2 py-0.5 font-sans text-[10px] font-semibold uppercase tracking-wider text-krypt-warn"
+              >
+                Paper
+              </span>
+            </span>
+          ) : fmtUsd(account?.totalUsd)}
           hint={account?.balanceSyncing
             ? '⏳ syncing — an order just filled or settled; the venue reflects it in a moment'
             : `cash ${fmtUsd(account?.cashUsd)} · port ${fmtUsd(account?.portfolioUsd)}`}

@@ -1,3 +1,29 @@
+"""Polymarket RTDS `activity` WebSocket — push notifications for copy trading.
+
+The same free RTDS endpoint the app already uses for Chainlink prices
+(`wss://ws-live-data.polymarket.com`) also streams EVERY platform trade on
+the `activity` topic (~1s after execution) with the trader's proxy wallet,
+side, size, and market. Subscribing filterless and filtering client-side on
+the followed wallets turns copy trading from a 30s poll into a push: the
+instant a followed wallet BUYS or SELLS, the service loop fires a copy tick
+instead of waiting out the poll interval.
+
+Payload shape (verified live 2026-07-21):
+  {"topic":"activity","type":"trades","payload":{
+      "proxyWallet":"0x…","side":"BUY"|"SELL","size":27.94,"price":0.84,
+      "conditionId":"0x…","slug":"…","eventSlug":"…","outcome":"Up",
+      "outcomeIndex":0,"name":"…", …}}
+  (some frames carry only {"connection_id":…,"payload":{…}} — detection is
+  by payload fields, not the envelope.)
+
+STRICT ACCELERATOR: hits only make the copy engine tick SOONER. The engine
+still re-reads the followed wallets' real holdings (Data API) and mirrors
+those — a missed/garbled event costs latency (the poll catches it), never
+correctness. Same connection contract as rtds_ws: text "PING" keep-alive,
+silent-link timeout, exponential backoff with a clamped exponent.
+
+Opt out with KRYPT_ACTIVITY_WS=0 (env) or the `copy_activity_ws` config key.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,10 +38,10 @@ from typing import Optional
 logger = logging.getLogger("activity_ws")
 
 try:
-    import websockets
+    import websockets  # type: ignore
     _WS_IMPORT_OK = True
-except Exception:
-    websockets = None
+except Exception:  # pragma: no cover - websockets missing
+    websockets = None  # type: ignore
     _WS_IMPORT_OK = False
 
 _URL = os.environ.get("KRYPT_ACTIVITY_WS_URL") or "wss://ws-live-data.polymarket.com"
@@ -74,6 +100,8 @@ class _Client:
         return self._task is not None and not self._task.done()
 
     def set_watch(self, wallets) -> None:
+        """Update the watched-wallet set (lowercased). Cheap to call every
+        tick — filterless subscription means no resubscribe on change."""
         try:
             self.watch = {
                 str(w).strip().lower() for w in (wallets or [])
@@ -143,9 +171,19 @@ class _Client:
         self._ws = None
 
     def set_trade_hook(self, fn) -> None:
+        """Register (or clear, with None) the every-trade sink. Idempotent —
+        the service re-registers it on each lifecycle pass."""
         self._trade_cb = fn
 
     def handle_message(self, m) -> None:
+        """Record trades by watched wallets. Detection is by payload fields
+        (proxyWallet + side) — some frames omit the topic envelope. History
+        bundles (payload as a list) are scanned the same way.
+
+        Every well-formed trade ALSO goes to `_trade_cb` if one is registered
+        (the whale detector wants the whole tape, not just followed wallets).
+        A raising hook is swallowed: this is an accelerator, and a bad frame
+        must never kill the socket that copy trading rides on."""
         if not isinstance(m, dict):
             return
         p = m.get("payload")
@@ -228,6 +266,8 @@ def set_trade_hook(fn) -> None:
 
 
 def handle_message(m) -> None:
+    """Feed one decoded frame in (the socket's own read loop path). Exposed so
+    the whale/copy wiring can be driven in tests without a live socket."""
     _client.handle_message(m)
 
 

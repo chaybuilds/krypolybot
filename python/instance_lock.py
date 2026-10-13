@@ -1,3 +1,21 @@
+"""Cross-process advisory lock keyed by the trading wallet address.
+
+Krypt PolyBot supports multiple accounts, each launched as its own process with
+its own data dir + credentials. If a user imports the SAME wallet private key
+into two accounts, two backends would trade ONE on-chain wallet at once —
+racing orders and double exposure that neither side's risk caps can see (each
+reads only its own DB). This module lets each backend claim the wallet by
+address; a second live backend on the same address backs off NEW entries until
+the first exits.
+
+Time-based heartbeat (no fragile cross-platform PID-liveness needed): the holder
+re-stamps the lock every scan, and a lock whose stamp is older than `_STALE_SEC`
+is treated as abandoned (a crashed holder) and reclaimable.
+
+Fail-OPEN by design: any lock I/O problem returns "you hold it", so a filesystem
+quirk can never BLOCK real-money trading. The worst case is the pre-existing
+no-mutual-exclusion behavior — never a lockout that strands open positions.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -26,6 +44,10 @@ def _lock_file(key: str) -> Path:
 
 
 def claim(key: str, *, stale_sec: float = _STALE_SEC) -> bool:
+    """Try to hold the lock for `key` (the trading wallet address). Returns True
+    if we now hold it (freshly acquired or heartbeat-refreshed) — safe to trade —
+    or False if another LIVE process currently holds it. Fail-open (True) on any
+    I/O error so a lock glitch never blocks trading."""
     if not key:
         return True
     try:
@@ -56,6 +78,8 @@ def claim(key: str, *, stale_sec: float = _STALE_SEC) -> bool:
 
 
 def foreign_holder(key: str, *, stale_sec: float = _STALE_SEC) -> str:
+    """If another live process holds `key`, return its pid (for logging); else "".
+    Read-only — never claims."""
     if not key:
         return ""
     try:
@@ -73,6 +97,9 @@ def foreign_holder(key: str, *, stale_sec: float = _STALE_SEC) -> str:
 
 
 def release(key: str) -> None:
+    """Best-effort release on clean shutdown / account switch, so a sibling can
+    claim immediately instead of waiting out the staleness window. Only removes a
+    lock we actually hold."""
     if not key:
         return
     try:
