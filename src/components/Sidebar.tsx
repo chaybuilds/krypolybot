@@ -47,6 +47,7 @@ export const NAV_GROUPS: { title: string | null; label: string; hint?: string; i
     hint: 'You decide, and you place the order',
     items: [
       { id: 'discover', label: 'Discover', icon: Compass, tier: 'simple' },
+      { id: 'usdesk', label: 'Polymarket US', icon: Bitcoin, tier: 'simple' },
       { id: 'market', label: 'Market', icon: LineChart, tier: 'simple' },
       { id: 'track', label: 'Track', icon: Receipt, tier: 'simple' },
     ],

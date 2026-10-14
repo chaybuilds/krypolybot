@@ -1032,7 +1032,46 @@ export interface AccountInfo {
   isDefault: boolean;
 }
 
+export interface USExchangeStatus {
+  venue: string;
+  connected: boolean;
+  keyIdPreview: string | null;
+  liveConfigured: boolean;
+  armed: boolean;
+  armedSecondsRemaining: number;
+  maxOrderUsd: string;
+  maxSessionUsd: string;
+  maxDailyUsd: string;
+  sessionGrossUsd: string;
+  autoTrading: boolean;
+  mode: 'READ_ONLY' | 'LIVE_ARMED';
+}
+export interface USOrderInput {
+  marketSlug: string;
+  intent: 'ORDER_INTENT_BUY_LONG' | 'ORDER_INTENT_SELL_LONG';
+  price: string;
+  quantity: number;
+  requestId?: string;
+}
+
 export interface KryptApi {
+  us: {
+    status: () => Promise<USExchangeStatus>;
+    markets: (query: string) => Promise<any>;
+    market: (slug: string) => Promise<any>;
+    book: (slug: string) => Promise<any>;
+    account: () => Promise<any>;
+    activities: () => Promise<any>;
+    journal: () => Promise<any>;
+    preview: (order: USOrderInput) => Promise<any>;
+    saveKeys: (keyId: string, secretKey: string) => Promise<any>;
+    clearKeys: () => Promise<any>;
+    arm: (confirmation: string) => Promise<USExchangeStatus>;
+    disarm: () => Promise<any>;
+    place: (order: USOrderInput) => Promise<any>;
+    cancel: (orderId: string, marketSlug: string) => Promise<any>;
+    reconcile: () => Promise<any>;
+  };
   app: {
     version: () => Promise<string>;
     openExternal: (url: string) => Promise<void>;

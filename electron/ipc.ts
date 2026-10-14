@@ -416,6 +416,30 @@ export function registerIpc(): void {
     }
   });
 
+  // Official Polymarket US integration. These channels are explicitly
+  // allowlisted: never expose arbitrary backend RPC execution to the renderer.
+  const usRequest = (method: string, params: Record<string, unknown> = {}) => {
+    if (!pythonBackend.isRunning()) throw new Error('Python backend is not running');
+    return pythonBackend.request(method, params, 28000);
+  };
+  ipcMain.handle('us:status', () => usRequest('usStatus'));
+  ipcMain.handle('us:markets', (_e, query: string) => usRequest('usMarkets', { query }));
+  ipcMain.handle('us:market', (_e, marketSlug: string) => usRequest('usMarket', { marketSlug }));
+  ipcMain.handle('us:book', (_e, marketSlug: string) => usRequest('usBook', { marketSlug }));
+  ipcMain.handle('us:account', () => usRequest('usAccount'));
+  ipcMain.handle('us:activities', () => usRequest('usActivities'));
+  ipcMain.handle('us:journal', () => usRequest('usJournal'));
+  ipcMain.handle('us:preview', (_e, order: Record<string, unknown>) => usRequest('usPreview', order));
+  ipcMain.handle('us:saveKeys', (_e, keyId: string, secretKey: string) =>
+    usRequest('usCredentialsSave', { keyId, secretKey }));
+  ipcMain.handle('us:clearKeys', () => usRequest('usCredentialsClear'));
+  ipcMain.handle('us:arm', (_e, confirmation: string) => usRequest('usArm', { confirmation }));
+  ipcMain.handle('us:disarm', () => usRequest('usDisarm'));
+  ipcMain.handle('us:place', (_e, order: Record<string, unknown>) => usRequest('usPlace', order));
+  ipcMain.handle('us:cancel', (_e, orderId: string, marketSlug: string) =>
+    usRequest('usCancel', { orderId, marketSlug }));
+  ipcMain.handle('us:reconcile', () => usRequest('usReconcile'));
+
   ipcMain.handle('backend:info', () => pythonBackend.info());
   ipcMain.handle('backend:start', async () => {
     await pythonBackend.start();

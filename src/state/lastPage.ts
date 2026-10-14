@@ -3,7 +3,7 @@ import type { PageId } from '../App';
 export const PAGE_IDS: readonly PageId[] = [
   'dashboard', 'main', 'positions', 'signals', 'history', 'profiles', 'settings', 'api', 'logs',
   'guide', 'about', 'visualizer', 'crypto15m', 'perps', 'copy', 'accounts', 'backtest',
-  'terminal', 'scripts', 'strategies', 'discover', 'market', 'track', 'remote', 'agents',
+  'terminal', 'scripts', 'strategies', 'discover', 'market', 'track', 'remote', 'agents', 'usdesk',
 ];
 
 export const LAST_PAGE_KEY = 'krypt.polybot.lastPage';

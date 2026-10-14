@@ -25,6 +25,9 @@ hiddenimports += collect_submodules('toolz')
 hiddenimports += collect_submodules('parsimonious')
 hiddenimports += collect_submodules('bitarray')
 hiddenimports += collect_submodules('websockets')
+hiddenimports += ['polymarket_us_adapter']
+hiddenimports += collect_submodules('polymarket_us')
+hiddenimports += collect_submodules('nacl')
 hiddenimports += ['certifi']
 datas += collect_data_files('certifi')
 

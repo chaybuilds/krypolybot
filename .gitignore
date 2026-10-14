@@ -39,3 +39,6 @@ docs/KRYPTRADER_PORT.md
 simulation/
 
 .claude/
+
+# Locally packaged unsigned US pilot builds
+release-us/

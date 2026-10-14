@@ -38,6 +38,7 @@ import { MarketPage } from './pages/Market';
 import { TrackPage } from './pages/Track';
 import { RemotePage } from './pages/Remote';
 import { AiAgentsPage } from './pages/AiAgents';
+import { USDeskPage } from './pages/USDesk';
 import { CommandPalette, useTerminalHotkeys } from './components/terminal/CommandPalette';
 
 export type PageId =
@@ -45,12 +46,12 @@ export type PageId =
   | 'profiles' | 'settings' | 'api' | 'logs' | 'guide' | 'about'
   | 'visualizer' | 'crypto15m' | 'perps' | 'copy' | 'accounts' | 'backtest'
   | 'terminal' | 'scripts' | 'strategies'
-  | 'discover' | 'market' | 'track' | 'remote' | 'agents';
+  | 'discover' | 'market' | 'track' | 'remote' | 'agents' | 'usdesk';
 
 export const SIMPLE_PAGES: readonly PageId[] = [
   'agents', 'visualizer',
   'dashboard', 'strategies', 'positions', 'api', 'settings',
-  'discover', 'market', 'track', 'remote', 'guide',
+  'discover', 'market', 'track', 'remote', 'guide', 'usdesk',
 ];
 
 export default function App() {
@@ -159,6 +160,7 @@ function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => v
     case 'discover': return <DiscoverPage onNav={setPage} />;
     case 'market': return <MarketPage onNav={setPage} />;
     case 'track': return <TrackPage onNav={setPage} />;
+    case 'usdesk': return <USDeskPage />;
     case 'remote': return <RemotePage />;
     case 'agents': return <AiAgentsPage onNav={setPage} />;
     default: return <AiAgentsPage onNav={setPage} />;
