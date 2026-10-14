@@ -31,6 +31,9 @@ export const TOUR_STEPS: TourStep[] = [
   nav('discover', 'Terminal', 'Discover',
     'Browse and search every Polymarket market by volume, closing time or newness. '
     + 'A good first stop if you want to look around before automating anything.'),
+  nav('usdesk', 'Terminal', 'Polymarket US',
+    'Official US market data, account access and limit-order execution. '
+    + 'Live orders remain disabled until a separately authorized session is armed.'),
   nav('market', 'Terminal', 'Market',
     'One market in depth: chart, order book, tape and resolution rules, and a ticket to trade it by hand.'),
   nav('track', 'Terminal', 'Track',

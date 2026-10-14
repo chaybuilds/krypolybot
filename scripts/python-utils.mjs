@@ -105,7 +105,7 @@ export function ensureVenv({ force = false } = {}) {
   if (!existsSync(VENV_PY)) {
     throw new Error(`venv created but no interpreter at ${VENV_PY}`);
   }
-  if (!force && tryCmd(VENV_PY, ['-c', 'import httpx, cryptography, eth_account, py_clob_client_v2, websockets, keyring'])) {
+  if (!force && tryCmd(VENV_PY, ['-c', 'import httpx, cryptography, eth_account, py_clob_client_v2, websockets, keyring, polymarket_us'])) {
     return;
   }
   console.log('>> Installing Python deps into venv (one-time, ~30s)');

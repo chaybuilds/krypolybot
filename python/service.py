@@ -4167,6 +4167,37 @@ async def _h_autopilot_run_now(_p: dict) -> dict:
     return {"ok": True, "message": "Autopilot run started."}
 
 
+async def _us_invoke(name: str, p: dict) -> dict:
+    """Isolated US venue RPC surface; backend never prints US credentials."""
+    import polymarket_us_adapter as us
+    methods = {
+        "usStatus": (us.status, ()),
+        "usMarkets": (us.markets, (p.get("query", "bitcoin"),)),
+        "usMarket": (us.market, (p.get("marketSlug"),)),
+        "usBook": (us.book, (p.get("marketSlug"),)),
+        "usAccount": (us.account, ()),
+        "usActivities": (us.activities, ()),
+        "usJournal": (us.journal, ()),
+        "usPreview": (us.preview, (p,)),
+        "usCredentialsSave": (us.set_credentials, (p.get("keyId"), p.get("secretKey"))),
+        "usCredentialsClear": (us.clear_credentials, ()),
+        "usArm": (us.arm, (p.get("confirmation", ""),)),
+        "usDisarm": (us.disarm, ()),
+        "usPlace": (us.place, (p,)),
+        "usCancel": (us.cancel, (p.get("orderId"), p.get("marketSlug"))),
+        "usReconcile": (us.reconcile, ()),
+    }
+    fn, args = methods[name]
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except us.USExchangeError:
+        raise
+    except Exception as e:
+        # SDK errors and tracebacks can contain authentication headers:
+        # reject with a generic message rather than serializing exception text.
+        raise us.USExchangeError("Polymarket US API request failed; inspect account status") from None
+
+
 _HANDLERS = {
     "ping": _h_ping,
     "aiStatus": _h_ai_status,
@@ -4282,6 +4313,17 @@ _HANDLERS = {
     "clearHistory": _h_clearHistory,
 }
 
+# Native US venue is a separate namespace; existing Polygon controls never
+# accidentally enable US order execution.
+_US_RPC_NAMES = (
+    "usStatus", "usMarkets", "usMarket", "usBook", "usAccount",
+    "usActivities", "usJournal", "usPreview", "usCredentialsSave",
+    "usCredentialsClear", "usArm", "usDisarm", "usPlace",
+    "usCancel", "usReconcile",
+)
+_HANDLERS.update({name: (lambda p, method=name: _us_invoke(method, p))
+                  for name in _US_RPC_NAMES})
+
 
 def _sync_terminal_offline() -> None:
     """Push the user's offline-mode switch into the terminal provider layer.
@@ -4301,7 +4343,7 @@ def _sync_terminal_offline() -> None:
 _SECRET_CHANGING_RPCS = frozenset({
     "setCredentials", "clearCredentials", "testCredentials", "aiSetKey",
     "remoteSetToken", "mcpRotateToken", "mcpHttpSnippet", "perpsLink",
-    "perpsUnlink", "factoryReset",
+    "perpsUnlink", "factoryReset", "usCredentialsSave", "usCredentialsClear",
 })
 
 
@@ -4625,6 +4667,8 @@ def _selftest_checks() -> int:
 
     _try("import eth_account", lambda: __import__("eth_account"))
     _try("import httpx", lambda: __import__("httpx"))
+    _try("official Polymarket US SDK import", lambda: __import__("polymarket_us"))
+    _try("native US adapter import", lambda: __import__("polymarket_us_adapter"))
     _try("import cryptography", lambda: __import__("cryptography"))
     _try("sign EOA + POLY_1271 orders = known vectors (offline)", polymarket_auth.verify_signer)
 

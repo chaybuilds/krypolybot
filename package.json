@@ -31,7 +31,6 @@
     "py:live": "node scripts/live-check.mjs",
     "py:backtest": "node scripts/backtest.mjs",
     "py:backtest15m": "node scripts/backtest.mjs --c15",
-    "py:volume": "node scripts/volume-farm.mjs",
     "test:unit": "node --experimental-strip-types --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test e2e/*.test.mjs",
     "test:e2e": "npm run build && node e2e/arming.e2e.mjs",
     "py:dist": "node scripts/build-python.mjs",

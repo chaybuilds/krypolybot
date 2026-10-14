@@ -13,6 +13,23 @@ const sub = <T>(channel: string, cb: (val: T) => void): (() => void) => {
 };
 
 const api: KryptApi = {
+  us: {
+    status: () => ipcRenderer.invoke('us:status'),
+    markets: (query) => ipcRenderer.invoke('us:markets', query),
+    market: (slug) => ipcRenderer.invoke('us:market', slug),
+    book: (slug) => ipcRenderer.invoke('us:book', slug),
+    account: () => ipcRenderer.invoke('us:account'),
+    activities: () => ipcRenderer.invoke('us:activities'),
+    journal: () => ipcRenderer.invoke('us:journal'),
+    preview: (order) => ipcRenderer.invoke('us:preview', order),
+    saveKeys: (keyId, secretKey) => ipcRenderer.invoke('us:saveKeys', keyId, secretKey),
+    clearKeys: () => ipcRenderer.invoke('us:clearKeys'),
+    arm: (confirmation) => ipcRenderer.invoke('us:arm', confirmation),
+    disarm: () => ipcRenderer.invoke('us:disarm'),
+    place: (order) => ipcRenderer.invoke('us:place', order),
+    cancel: (orderId, marketSlug) => ipcRenderer.invoke('us:cancel', orderId, marketSlug),
+    reconcile: () => ipcRenderer.invoke('us:reconcile'),
+  },
   app: {
     version: () => ipcRenderer.invoke('app:version'),
     openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),

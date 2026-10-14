@@ -6,3 +6,4 @@ websockets>=12,<14
 keyring>=24
 anthropic>=1.0.0
 openai>=1.0.0
+polymarket-us==2.4.1

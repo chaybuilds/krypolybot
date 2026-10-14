@@ -746,12 +746,9 @@ def test_escalate_partial_fak_books_only_the_part(fresh_db, env_net, cfg, monkey
     assert r["cost_usd"] == pytest.approx(3.52)
 
 
-def test_order_parsers_do_not_read_unmatched_as_a_fill():
-    import volume_farm
+def test_trader_order_parser_does_not_read_unmatched_as_a_fill():
     assert trader._parse_polymarket_order({"status": "unmatched", "size_matched": "0", "original_size": "5"})["status"] == "canceled"
     assert trader._parse_polymarket_order({"status": "ORDER_STATUS_MATCHED", "size_matched": "5", "original_size": "5"})["status"] == "executed"
-    assert volume_farm._parse_order({"status": "unmatched"})[2] == "canceled"
-    assert volume_farm._parse_order({"status": "matched", "size_matched": "3"})[2] == "filled"
 
 
 def test_maker_full_fill_404_does_not_double_buy(fresh_db, env_net, cfg, monkeypatch):
