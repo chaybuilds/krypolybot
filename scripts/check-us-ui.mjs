@@ -5,12 +5,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const exe = process.platform === 'win32'
+const packaged = Boolean(process.env.ORACLE_SMOKE_EXE);
+const exe = process.env.ORACLE_SMOKE_EXE || (process.platform === 'win32'
   ? join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
-  : join(root, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron');
+  : join(root, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron'));
 const app = await electron.launch({
   executablePath: exe,
-  args: [root, '--account=OracleUSUISmoke'],
+  args: packaged ? ['--account=OracleUSUISmokePackaged'] : [root, '--account=OracleUSUISmoke'],
   env: { ...process.env, ORACLE_US_ALLOW_LIVE: '0' },
   timeout: 45000,
 });
